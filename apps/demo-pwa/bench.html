@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https: wss: ws://127.0.0.1:* ws://localhost:*; style-src 'self' 'unsafe-inline'" />
+    <title>wasm bench</title>
+  </head>
+  <body style="font: 14px system-ui; padding: 16px">
+    <h1 style="font-size: 16px">Confidential client: wasm benchmark against a local bench-node</h1>
+    <p>Runs the 2PC (client side) and the proof channel in a Web Worker against <code>bench-node serve</code>. Query: <code>?node=ws://127.0.0.1:7450&amp;runs=2</code></p>
+    <pre id="out">running…</pre>
+    <script type="module" src="./src/bench.ts"></script>
+  </body>
+</html>
