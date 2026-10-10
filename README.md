@@ -4,6 +4,9 @@ Routstr **confidential mode in the browser**: chat with an LLM through a
 routstr node that never sees your prompt or the answer, and never gives you its
 provider API key, with every check done by the page itself.
 
+Introduction: [Confidential inference on Routstr without trusted hardware](https://juraj.bednar.io/en/blog-en/2026/10/10/confidential-inference-on-routstr-without-trusted-hardware/)
+(blog post).
+
 - The TypeScript library at the repository root (`@routstr/confidential-web`, ESM),
   `createConfidentialClient(...)` → `client.chat.completions.create({...,
   stream: true})`, OpenAI-style. It is "routstrd as a library" for confidential
