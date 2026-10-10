@@ -34,7 +34,7 @@ import {
 import { matchHostname } from "./hosts.js";
 import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams } from "./params.js";
 import { WasmProverBackend } from "./prover.js";
-import { feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt.js";
+import { checkAttestationBinding, feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt.js";
 import {
   canonicalSuffix,
   disclosureTailLens,
@@ -326,6 +326,9 @@ export class ConfidentialSession {
   private zkChan?: ProofChannel;
   private proofTimes: Record<string, ProofOutcome> = {};
   private ap?: TwoPcApplicationSecrets;
+  /** Handshake transcript hashes (ClientHello..ServerHello, ..server Finished). */
+  private thSH?: Uint8Array;
+  private thSF?: Uint8Array;
   private tKeyShare = 0;
   private tPhaseA = 0;
   private tPhaseB = 0;
@@ -660,6 +663,7 @@ export class ConfidentialSession {
     this.makeTls({
       keyShare,
       onServerHello: async (serverShare, thSH) => {
+        this.thSH = thSH;
         const t = Date.now();
         const out = await twoPc.handshake(serverShare, thSH, this.timeouts.handshakeV2);
         this.tPhaseA = Date.now() - t;
@@ -668,6 +672,7 @@ export class ConfidentialSession {
         return out;
       },
       onServerFinished: async (thSF) => {
+        this.thSF = thSF;
         const t = Date.now();
         this.ap = await twoPc.application(thSF, this.timeouts.handshakeV2);
         this.tPhaseB = Date.now() - t;
@@ -817,6 +822,7 @@ export class ConfidentialSession {
     const attOk = verifySchnorrSignature(attJson, att.sig, this.ready.pubkey);
     this.event({ ev: "attestation", sig_ok: attOk });
     if (!attOk) throw new ReceiptVerificationError("attestation signature invalid");
+    checkAttestationBinding(attJson, { sid: this.sid, thSH: this.thSH, thSF: this.thSF });
 
     await this.settleFlush();
     await c2Promise;

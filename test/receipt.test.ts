@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { canonicalJson } from "../src/canonical.js";
 import { bytesToHex } from "@noble/hashes/utils";
 import { ReceiptVerificationError } from "../src/errors.js";
-import { feeOnlyChargeOk, maxChargeMsats, parseSignedReceipt, verifyReceipt } from "../src/receipt.js";
+import {
+  checkAttestationBinding,
+  feeOnlyChargeOk,
+  maxChargeMsats,
+  parseSignedReceipt,
+  verifyReceipt,
+} from "../src/receipt.js";
 import { hex, sha256 } from "../src/bytes.js";
 import { makeKey, sign } from "./helpers.js";
 
@@ -76,5 +82,20 @@ describe("receipt verification", () => {
       /attestation/,
     );
     expect(bytesToHex(new Uint8Array([1, 255]))).toBe(hex(new Uint8Array([1, 255])));
+  });
+
+  it("accepts only an attestation naming this session and handshake", () => {
+    const thSH = new Uint8Array(32).fill(7);
+    const thSF = new Uint8Array(32).fill(9);
+    const own = { sid: "s1", thSH, thSF };
+    const att = (o: Record<string, unknown>) =>
+      canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: null, ...o });
+    expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    expect(() => checkAttestationBinding(att({ sid: "s2" }), own)).toThrow(/not s1/);
+    expect(() => checkAttestationBinding(att({ th_sh: "00".repeat(32) }), own)).toThrow(/handshake/);
+    expect(() => checkAttestationBinding(att({ th_sf: null }), own)).toThrow(/handshake/);
+    expect(() => checkAttestationBinding(att({}), { sid: "s1" })).toThrow(ReceiptVerificationError);
+    expect(() => checkAttestationBinding("null", own)).toThrow(ReceiptVerificationError);
+    expect(() => checkAttestationBinding("{", own)).toThrow(/JSON/);
   });
 });
