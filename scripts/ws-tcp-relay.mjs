@@ -1,5 +1,5 @@
 // Test-only WebSocket→TCP relay: ws://127.0.0.1:7451 → api.venice.ai:443
-// (used by the TLS diagnostic in bench.html?tls=…). Not part of the protocol.
+// (used by the TLS diagnostic in harness/index.html?tls=…). Not part of the protocol.
 import { createServer, connect } from "node:net";
 import { WebSocketServer } from "ws";
 const [, , port = "7451", target = "api.venice.ai:443"] = process.argv;

@@ -4,7 +4,7 @@ Routstr **confidential mode in the browser**: chat with an LLM through a
 routstr node that never sees your prompt or the answer, and never gives you its
 provider API key, with every check done by the page itself.
 
-- `packages/confidential-web`: a TypeScript library (ESM),
+- The TypeScript library at the repository root (`@routstr/confidential-web`, ESM),
   `createConfidentialClient(...)` → `client.chat.completions.create({...,
   stream: true})`, OpenAI-style. It is "routstrd as a library" for confidential
   inference.
@@ -12,9 +12,11 @@ provider API key, with every check done by the page itself.
   `wasm32-unknown-unknown`. It runs the 2PC handshake (`cu-2pc`) and the
   proof channel (`cu-prover --channel`: verify π_NK, prove π_C2S/π_C3S), plus
   the per-proof fallback.
-- `apps/demo-pwa`: a static PWA with a streaming chat, a wallet (Lightning,
-  Cashu, refund), signed prices, pre-warming, and a panel that shows what your
-  browser verified.
+- The demo app is a separate repository,
+  [routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa)
+  ([live](https://jooray.github.io/routstr-confidential-pwa/)): a streaming
+  chat, a wallet (Lightning, Cashu, refund), signed prices, pre-warming, and a
+  panel that shows what your browser verified.
 
 It speaks protocol v2 of
 [routstr-confidential](https://github.com/jooray/routstr-confidential), the
@@ -174,31 +176,33 @@ wasm asset support, and `optimizeDeps.exclude` for the package in Vite.
 
 ## Build
 
-Requirements: rustup (the toolchain is pinned in `rust-toolchain.toml`, 1.97.1
-with `wasm32-unknown-unknown`; mpz2 needs rustc ≥ 1.95), `wasm-bindgen-cli`
-matching `Cargo.lock`, and Node ≥ 20 with npm.
+The library is consumed as built ESM (`dist/`: JS + `.d.ts`) plus the wasm in
+`wasm/pkg/`. **`wasm/pkg/` is committed**, so a git dependency
+(`"@routstr/confidential-web": "github:jooray/routstr-confidential-web#<commit>"`)
+works without a Rust toolchain. npm runs `prepare` (`tsc` → `dist/`) on install.
 
 ```bash
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
-npm install
-npm run build          # wasm (scripts/build-wasm.sh, wasm-opt from the binaryen devDependency), typecheck, demo
-# static output: apps/demo-pwa/dist/ (index.html, sw.js, version.json, assets/)
-npm run dev            # Vite dev server on :5173 (no service worker in dev)
+npm install            # also builds dist/ (prepare)
+npm run build          # dist/ again (tsc + the vendored TLS client)
+npm run build:wasm     # rebuild wasm/pkg from crates/client-wasm (needs Rust, see below)
 ```
 
-`.cargo/config.toml` selects the getrandom `wasm_js` backend and enables
-`simd128`, which every evergreen browser supports (Safari ≥ 16.4). The wasm is
-5.98 MB, 1.82 MB gzipped.
+Rebuilding the wasm needs rustup (the toolchain is pinned in
+`rust-toolchain.toml`, 1.97.1 with `wasm32-unknown-unknown`; mpz2 needs rustc
+≥ 1.95) and `wasm-bindgen-cli` matching `Cargo.lock`
+(`cargo install wasm-bindgen-cli --version 0.2.129 --locked`). `wasm-opt`
+comes from the `binaryen` devDependency. `.cargo/config.toml` selects the
+getrandom `wasm_js` backend and enables `simd128`, which every evergreen
+browser supports (Safari ≥ 16.4). The wasm is 5.98 MB, 1.81 MB gzipped. Commit
+`wasm/pkg/` after rebuilding.
 
-**Releases and updates** (a PWA must never need a hard refresh): set
-`apps/demo-pwa/package.json` `version` for every release. The build writes
-`dist/version.json` (`version`, `build`, `assets_sha256`) and a per-release
-`dist/sw.js`, whose cache is named after the version and which precaches the
-exact asset list. The page checks `version.json` (no-store) on load, when it
-becomes visible and every 5 minutes. On a new version it updates the service
-worker, which activates at once (`skipWaiting`, `clients.claim`). The page then
-reloads, waiting until an in-flight answer finishes, and shows "Updated to vX".
-Serve `sw.js` and `version.json` with `Cache-Control: no-store`.
+**Using it from a bundler.** The worker (`new URL("./worker.js",
+import.meta.url)`) and the `.wasm` (`new URL("client_wasm_bg.wasm",
+import.meta.url)` in the wasm-bindgen glue) are resolved by the bundler. In
+Vite, set `worker: { format: "es" }` and
+`optimizeDeps: { exclude: ["@routstr/confidential-web"] }` (see the demo
+app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
+`worker-src 'self'`, and `connect-src` for the node (`https:` and `wss:`).
 
 ## Dependencies on routstr-confidential
 
@@ -212,7 +216,7 @@ can become a git dependency on that repository. mpz2 is pinned at the same rev
 `params.ts`, `suffix.ts`, `hosts.ts`, `canonical.ts`, `errors.ts` and the TLS
 fork come from routstr-sdk (`confidential-2pc`, commit `2f4aacf`) with
 node-only imports replaced. The browser changes to the TLS fork are listed in
-`packages/confidential-web/src/tls-fork/FORK-NOTES.md`.
+`src/tls-fork/FORK-NOTES.md`.
 
 ## Tests
 
@@ -227,16 +231,17 @@ CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 cargo build --release -p bench-node && target/release/bench-node serve --port 7450 &
 target/release/bench-node client --runs 3            # native client
 node scripts/wasm-node-bench.mjs                     # wasm in Node (V8)
-node scripts/browser-bench.mjs chromium,firefox,webkit 2   # wasm in headless browsers (Worker)
+npm run harness:build && node scripts/browser-bench.mjs chromium,firefox,webkit 2   # wasm in headless browsers (Worker)
 
 # Browser TLS stack against the real provider via a test-only WS→TCP relay:
 node scripts/ws-tcp-relay.mjs 7451 & node scripts/tls-check.mjs
 
-# Production node (no money): offer, models, PWA, a refused setup
-node scripts/e2e-prod.mjs smoke
-# Production node with a funded key (read from the environment only):
-CONF_TEST_KEY=sk-… node scripts/e2e-prod.mjs live 2
 ```
+
+`node scripts/browser-bench.mjs` and `scripts/tls-check.mjs` serve the test
+harness (`harness/`, `npm run harness:build`, built from `dist/`). End-to-end
+tests against the production node, including the live test with a funded key,
+live in the demo app's repository (`scripts/e2e-prod.mjs`).
 
 ## Measured timings (M2 Max laptop, loopback, against `bench-node`)
 
@@ -245,7 +250,21 @@ Web Worker). Network time is excluded (loopback): these are compute-bound
 numbers. On a real link, preprocessing is dominated by downloading 22 MB of
 tables.
 
-TIMINGS_TABLE
+| step | native driver | Chrome 153 | Firefox 155 | WebKit 26.6 | Node 26 (V8) |
+|---|---|---|---|---|---|
+| 2PC preprocessing + key share (cold only) | 0.46 s | 3.0 s | 3.2 s | 3.0 s | 3.2 s |
+| phase A (ECtF + GC evaluation + check) | 21 ms | 630 ms | 650 ms | 620 ms | 630 ms |
+| phase B (GC evaluation + check) | 25 ms | 750 ms | 780 ms | 740 ms | 756 ms |
+| proof channel preprocessing (in parallel with the 2PC) | 0.19 s | 2.9 s | 2.8 s | 2.6–2.9 s | 1.9 s |
+| π_NK verify (on the channel) | 64 ms | 82 ms | 95 ms | 85 ms | 85 ms |
+| π_C2S prove | 29 ms | 44 ms | 56 ms | 47 ms | 46 ms |
+| π_C3S prove | 60 ms | 93 ms | 113 ms | 92 ms | 93 ms |
+| wasm instantiate (5.98 MB, cached) | — | 26 ms | 120 ms | 29 ms | — |
+
+Traffic per 2PC session: 1.21 MB up, 22.1 MB down. simd128 gave about −20 %
+preprocessing and −30 % proof time; phases A/B are bound by software AES
+(no AES instructions in wasm) and did not change. Without simd128
+(Node): preprocessing 3.8 s, proofs 80–160 ms.
 
 What this means for a request: in a pre-warmed session, the browser adds about
 1.4 s to the request path (phases A + B) compared with native's ~50 ms, plus
@@ -255,16 +274,19 @@ about 0.2 s for the three proofs. A cold request also pays the preprocessing
 ## Layout
 
 ```
-crates/client-wasm      wasm-bindgen crate: TwoPcClient, ProofChannelClient, ProverJob (+ native driver tests)
+src/                    the TypeScript library (client, session, offer/receipt/params, wasm hosts, TLS fork)
+test/                   vitest unit tests
+wasm/pkg/               wasm-bindgen output (committed)
+dist/                   built library (npm prepare; not committed)
+crates/client-wasm      wasm-bindgen crate: TwoPcClient, ProofChannelClient, ProverJob (+ native and wasm tests)
 crates/bench-node       local node-side peer for benchmarks/tests (native)
 crates/vendor/*         routstr-confidential crates (pristine + wasm32 patch)
-packages/confidential-web  the TypeScript library (src/, test/, wasm/pkg after build)
-apps/demo-pwa           the PWA (Vite), bench.html (benchmarks, TLS diagnostic)
-scripts/                build-wasm.sh, benches, e2e, test relay
+harness/                browser benchmark + TLS diagnostic page (tests only)
+scripts/                build-wasm.sh, build-lib.mjs, benches, test relay
 patches/                the wasm32 patch for upstream
 ```
 
 ## License
 
 MIT (see `LICENSE`). The vendored TLS client is MIT (CreatorOS Inc.,
-`packages/confidential-web/src/tls-fork/LICENSE`).
+`src/tls-fork/LICENSE`).

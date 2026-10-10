@@ -5,7 +5,7 @@
 # wasm-opt (binaryen) is used when available (npm i -g binaryen, or brew).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/packages/confidential-web/wasm/pkg"
+OUT="$ROOT/wasm/pkg"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
 cargo build --release --target wasm32-unknown-unknown -p client-wasm

@@ -8,7 +8,7 @@ let bad = false;
 for (const name of (process.argv[2] ?? "chromium,firefox,webkit").split(",")) {
   const b = await { chromium, firefox, webkit }[name].launch();
   const p = await b.newPage();
-  await p.goto("http://127.0.0.1:4175/bench.html?tls=ws://127.0.0.1:7451&host=api.venice.ai");
+  await p.goto("http://127.0.0.1:4175/index.html?tls=ws://127.0.0.1:7451&host=api.venice.ai");
   await p.waitForFunction(() => window.__tls, null, { timeout: 30_000 });
   const r = await p.evaluate(() => window.__tls);
   if (!r.ok) bad = true;

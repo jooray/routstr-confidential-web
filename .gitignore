@@ -5,8 +5,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
-# wasm-pack output (rebuilt by `npm run build:wasm`)
-packages/confidential-web/wasm/pkg/
+# wasm/pkg/ IS committed (git-dependency consumers cannot build Rust); rebuild with `npm run build:wasm`
 crates/client-wasm/pkg/
 # test artefacts
 playwright-report/
@@ -16,3 +15,4 @@ test-results/
 .env
 .env.*
 *.key
+harness/dist/

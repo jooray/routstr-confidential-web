@@ -12,7 +12,7 @@ for (const name of engines) {
   const browser = await all[name].launch();
   const page = await browser.newPage();
   page.on("console", (m) => m.type() === "error" && console.error(`[${name}] ${m.text()}`));
-  await page.goto(`http://127.0.0.1:4173/bench.html?node=ws://127.0.0.1:7450&runs=${runs}`);
+  await page.goto(`http://127.0.0.1:4173/index.html?node=ws://127.0.0.1:7450&runs=${runs}`);
   try {
     await page.waitForFunction(() => window.__bench || window.__benchError, null, { timeout: 600_000 });
     const err = await page.evaluate(() => window.__benchError);

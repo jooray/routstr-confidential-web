@@ -1,10 +1,10 @@
-// Minimal static server for apps/demo-pwa/dist (used by the browser tests).
+// Minimal static server for harness/dist (used by the browser tests).
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = fileURLToPath(new URL("../apps/demo-pwa/dist/", import.meta.url));
+const root = fileURLToPath(new URL("../harness/dist/", import.meta.url));
 const types = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript",
@@ -40,5 +40,5 @@ export function serveDist(port = 4173) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.argv[2] ?? 4173);
   await serveDist(port);
-  console.log(`serving apps/demo-pwa/dist on http://127.0.0.1:${port}/`);
+  console.log(`serving harness/dist on http://127.0.0.1:${port}/`);
 }

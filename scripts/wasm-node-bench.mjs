@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const base = process.argv[2] ?? "ws://127.0.0.1:7450";
 const runs = Number(process.argv[3] ?? 2);
-const pkg = new URL("../packages/confidential-web/wasm/pkg/", import.meta.url);
+const pkg = new URL("../wasm/pkg/", import.meta.url);
 const wasm = await import(new URL("client_wasm.js", pkg));
 await wasm.default({ module_or_path: await readFile(fileURLToPath(new URL("client_wasm_bg.wasm", pkg))) });
 

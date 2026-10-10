@@ -1,0 +1,147 @@
+/**
+ * The request body as the provider sees it: the private part (messages,
+ * temperature, …) followed by the pinned suffix that fixes every
+ * cost-relevant parameter (model, max_tokens, n, stream). Ported from
+ * routstr-sdk `transport.ts` / `prewarm.ts`.
+ */
+
+import { endsWith } from "./bytes.js";
+import { canonicalSuffix } from "./suffix.js";
+
+/** Request keys the pinned suffix sets; they never come from the caller. */
+export const PINNED_KEYS = new Set([
+  "model",
+  "max_tokens",
+  "max_completion_tokens",
+  "max_output_tokens",
+  "n",
+  "stream",
+  "stream_options",
+  "venice_parameters",
+]);
+
+export function buildPinnedBody(request: Record<string, unknown>, model: string, maxTokens: number): Uint8Array {
+  const priv: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(request)) {
+    if (!PINNED_KEYS.has(k)) priv[k] = v;
+  }
+  const json = JSON.stringify(priv);
+  // Drop the closing brace: the suffix closes the object and wins last. With
+  // no private keys the suffix's leading comma must go too.
+  const suffix = canonicalSuffix(model, maxTokens);
+  const prefix = json.slice(0, -1);
+  return new TextEncoder().encode(prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix);
+}
+
+export function requestedMaxTokens(request: Record<string, unknown>, cap: number): number {
+  for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
+    const v = request[k];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      return Math.max(1, Math.min(Math.trunc(v), cap));
+    }
+  }
+  return cap;
+}
+
+/**
+ * Pad a pinned body to exactly `length` bytes with spaces between the private
+ * part and the suffix (JSON allows whitespace before the suffix's comma), so a
+ * session armed for length L serves any body ≤ L.
+ */
+export function padPinnedBody(body: Uint8Array, length: number, suffix: string): Uint8Array {
+  const s = new TextEncoder().encode(suffix);
+  if (!endsWith(body, s)) throw new RangeError("body does not end with the pinned suffix");
+  if (body.length > length) throw new RangeError(`body ${body.length} exceeds armed length ${length}`);
+  if (body.length === length) return body;
+  const out = new Uint8Array(length);
+  const cut = body.length - s.length;
+  out.set(body.subarray(0, cut), 0);
+  out.fill(0x20, cut, length - s.length);
+  out.set(s, length - s.length);
+  return out;
+}
+
+/** Power-of-two body-length bucket for the largest recent body, with headroom. */
+export function chooseBucket(
+  maxLen: number,
+  opts: { minBucket?: number; maxBucket?: number; headroom?: number } = {},
+): number {
+  const min = opts.minBucket ?? 4096;
+  const max = opts.maxBucket ?? 8 << 20;
+  const want = Math.ceil(Math.max(0, maxLen) * (opts.headroom ?? 1.25));
+  let b = min;
+  while (b < want && b < max) b *= 2;
+  return Math.min(b, max);
+}
+
+/** Incremental SSE `data:` line parser (OpenAI chat-completions stream). */
+export class SseParser {
+  private buf = "";
+  private dec = new TextDecoder();
+  done = false;
+
+  /** Feed decrypted body bytes; returns the parsed JSON events completed so far. */
+  push(chunk: Uint8Array): Record<string, unknown>[] {
+    this.buf += this.dec.decode(chunk, { stream: true });
+    const out: Record<string, unknown>[] = [];
+    let i: number;
+    while ((i = this.buf.indexOf("\n")) >= 0) {
+      const line = this.buf.slice(0, i).replace(/\r$/, "");
+      this.buf = this.buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === "[DONE]") {
+        this.done = true;
+        continue;
+      }
+      try {
+        out.push(JSON.parse(payload));
+      } catch {
+        /* not JSON: ignore (keep-alive comments etc.) */
+      }
+    }
+    return out;
+  }
+}
+
+/** Fold a streamed chat completion into one `chat.completion` object. */
+export function aggregateChatCompletion(events: Record<string, any>[]): Record<string, unknown> {
+  let id: unknown, created: unknown, model: unknown, usage: unknown;
+  const choices = new Map<number, { role: string; content: string; reasoning: string; finish_reason: unknown }>();
+  for (const ev of events) {
+    id ??= ev.id;
+    created ??= ev.created;
+    model ??= ev.model;
+    if (ev.usage) usage = ev.usage;
+    for (const c of Array.isArray(ev.choices) ? ev.choices : []) {
+      const idx = typeof c.index === "number" ? c.index : 0;
+      let acc = choices.get(idx);
+      if (!acc) {
+        acc = { role: "assistant", content: "", reasoning: "", finish_reason: null };
+        choices.set(idx, acc);
+      }
+      const d = c.delta ?? {};
+      if (typeof d.role === "string") acc.role = d.role;
+      if (typeof d.content === "string") acc.content += d.content;
+      const r = d.reasoning_content ?? d.reasoning;
+      if (typeof r === "string") acc.reasoning += r;
+      if (c.finish_reason != null) acc.finish_reason = c.finish_reason;
+    }
+  }
+  const out: Record<string, unknown> = {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [...choices.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([index, acc]) => {
+        const message: Record<string, unknown> = { role: acc.role, content: acc.content };
+        if (acc.reasoning) message.reasoning_content = acc.reasoning;
+        return { index, message, finish_reason: acc.finish_reason };
+      }),
+  };
+  if (usage !== undefined) out.usage = usage;
+  return out;
+}
