@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/target/
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+# wasm-pack output (rebuilt by `npm run build:wasm`)
+packages/confidential-web/wasm/pkg/
+crates/client-wasm/pkg/
+# test artefacts
+playwright-report/
+test-results/
+.vite/
+# never commit secrets
+.env
+.env.*
+*.key
