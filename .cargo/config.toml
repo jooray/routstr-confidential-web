@@ -1,0 +1,4 @@
+# getrandom 0.3/0.4 need the wasm_js backend selected explicitly on
+# wasm32-unknown-unknown (getrandom 0.2 uses its `js` feature instead).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

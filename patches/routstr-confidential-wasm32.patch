@@ -1,0 +1,683 @@
+diff --git a/crypto/twopc/Cargo.toml b/crypto/twopc/Cargo.toml
+index a226bfc..69c4bb9 100644
+--- a/crypto/twopc/Cargo.toml
++++ b/crypto/twopc/Cargo.toml
+@@ -31,13 +31,25 @@ sha2 = { version = "0.10", features = ["compress"] }
+ rand = "0.10"
+ getrandom = "0.3"
+ futures = "0.3"
+-tokio = { version = "1.38", features = ["full"] }
++tokio = { version = "1.38", features = ["sync", "macros", "io-util"] }
++web-time = "1"
+ tokio-util = { version = "0.7", features = ["compat"] }
+ serde_json = "1"
+ hex = "0.4"
+ thiserror = "2"
+ zeroize = { version = "1", features = ["derive"] }
+ 
++# Native: the full tokio runtime (binaries, node side, tests). On wasm32 only
++# tokio's executor-agnostic parts (duplex, mpsc, Mutex, select!) are used and
++# tasks run on wasm-bindgen-futures (see `src/rt.rs`).
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++tokio = { version = "1.38", features = ["full"] }
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++wasm-bindgen-futures = "0.4"
++gloo-timers = { version = "0.3", features = ["futures"] }
++getrandom = { version = "0.3", features = ["wasm_js"] }
++
+ [dev-dependencies]
+ cu-crypto = { path = "../cu-crypto" }
+ # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
+diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
+index 24c6b39..9de02fd 100644
+--- a/crypto/twopc/src/lib.rs
++++ b/crypto/twopc/src/lib.rs
+@@ -25,8 +25,8 @@
+ //! p.close().await;
+ //! ```
+ //!
+-//! `Party::new` needs a running tokio runtime (it spawns the channel
+-//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
++//! `Party::new` needs a running executor (it spawns the channel
++//! multiplexer: tokio natively, `wasm-bindgen-futures` on wasm32, see [`rt`]); `close` flushes the transport; `take_timings` returns per-step
+ //! wall time and transport bytes.
+ //!
+ //! # Protocol
+@@ -93,13 +93,15 @@ pub mod circuits;
+ mod ectf;
+ pub mod gc;
+ mod mux;
++pub mod rt;
+ #[doc(hidden)]
++#[cfg(not(target_arch = "wasm32"))]
+ pub mod testutil;
+ #[cfg(test)]
+ mod tests;
+ 
+ use std::sync::Arc;
+-use std::time::Instant;
++use rt::Instant;
+ 
+ use futures::{AsyncRead, AsyncWrite};
+ use mpz_common::{Context, Flush};
+@@ -408,6 +410,30 @@ fn os_rng() -> StdRng {
+     r
+ }
+ 
++/// `[f(0), f(1)]` on two scoped threads while `body` runs on this one
++/// (natively); sequentially on wasm32, which has no threads.
++fn scope2<T, F, B>(f: &F, body: B) -> [T; 2]
++where
++    T: Send,
++    F: Fn(usize) -> T + Sync,
++    B: FnOnce(),
++{
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        std::thread::scope(|sc| {
++            let r0 = sc.spawn(|| f(0));
++            let r1 = sc.spawn(|| f(1));
++            body();
++            [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
++        })
++    }
++    #[cfg(target_arch = "wasm32")]
++    {
++        body();
++        [f(0), f(1)]
++    }
++}
++
+ fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
+     let mut out = Vec::with_capacity(16 * v.len());
+     for b in v {
+@@ -647,7 +673,7 @@ impl Party {
+         if *TRACE {
+             let c = self.counters.clone();
+             let who = if self.role == Role::C { "C" } else { "N" };
+-            tokio::spawn(async move {
++            rt::spawn(async move {
+                 let t0 = Instant::now();
+                 let mut last = (0, 0);
+                 for _ in 0..200 {
+@@ -656,7 +682,7 @@ impl Party {
+                         eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
+                         last = v;
+                     }
+-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++                    rt::sleep(std::time::Duration::from_millis(100)).await;
+                 }
+             });
+         }
+@@ -680,7 +706,7 @@ impl Party {
+         let c_bits = spec(0).c_bits + spec(1).c_bits;
+         let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
+ 
+-        let garble = tokio::task::spawn_blocking(move || {
++        let garble = rt::spawn_blocking(move || {
+             (0..2)
+                 .map(|p| {
+                     let s = spec(p);
+@@ -737,7 +763,7 @@ impl Party {
+                     && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
+                     && t0.elapsed() < TABLES_MAX_WAIT
+                 {
+-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
++                    rt::sleep(std::time::Duration::from_millis(2)).await;
+                 }
+             }
+         };
+@@ -842,7 +868,7 @@ impl Party {
+         // Product check, openings, consistency-check material (CPU, blocking).
+         let mask_bits = mask_bits.to_vec();
+         let mask_macs = mask_macs.to_vec();
+-        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
++        let (st, keys, msgs) = rt::spawn_blocking(move || {
+             // Check rows and Y_N per phase.
+             let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
+                 let (lam, mac, t_mac) = &st[p];
+@@ -885,9 +911,7 @@ impl Party {
+                 (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
+             };
+             let mut msgs: Vec<Vec<u8>> = Vec::new();
+-            let rows = std::thread::scope(|sc| {
+-                let r0 = sc.spawn(|| rows_of(0));
+-                let r1 = sc.spawn(|| rows_of(1));
++            let rows = scope2(&rows_of, || {
+                 let mut acc = (Block::ZERO, Block::ZERO);
+                 for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
+                     let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
+@@ -932,7 +956,6 @@ impl Party {
+                 let mut open = from_bits(&bits);
+                 open.extend_from_slice(&hd);
+                 msgs.push(open);
+-                [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
+             });
+             for (r, y) in rows {
+                 msgs.push(r);
+@@ -1045,7 +1068,7 @@ impl Party {
+         let chi_dv = chi(&seed, b"dvzk");
+         let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
+         let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
+-        let compute = tokio::task::spawn_blocking(move || {
++        let compute = rt::spawn_blocking(move || {
+             let mut off = 0;
+             let mut per = Vec::new();
+             let mut acc = Block::ZERO;
+@@ -1444,7 +1467,7 @@ impl Party {
+             && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
+ 
+         let circ = s.circ.clone();
+-        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
++        let (ok_check, out_labels) = rt::spawn_blocking(move || {
+             let l = gc::evaluate(&circ, &inl, &tables, phase);
+             let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
+             let out: Vec<Block> = circ.outputs().map(|w| l[w]).collect();
+diff --git a/crypto/twopc/src/mux.rs b/crypto/twopc/src/mux.rs
+index 2a3a698..62f8451 100644
+--- a/crypto/twopc/src/mux.rs
++++ b/crypto/twopc/src/mux.rs
+@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+ use tokio::sync::mpsc;
+-use tokio::task::JoinHandle;
++use crate::rt::JoinHandle;
+ 
+ /// Maximum payload of one mux frame.
+ const MAX_MUX_FRAME: usize = 1 << 20;
+@@ -86,7 +86,7 @@ impl Mux {
+             remotes_w.push(rw);
+             locals.push(local);
+             let tx = if bulk.contains(&ch) { tx_bulk.clone() } else { tx.clone() };
+-            pumps.push(tokio::spawn(async move {
++            pumps.push(crate::rt::spawn(async move {
+                 let mut buf = vec![0u8; PUMP_CHUNK];
+                 loop {
+                     match rr.read(&mut buf).await {
+@@ -104,7 +104,7 @@ impl Mux {
+         drop(tx_bulk);
+ 
+         let c_w = counters.clone();
+-        let writer = tokio::spawn(async move {
++        let writer = crate::rt::spawn(async move {
+             let (mut hi_open, mut lo_open) = (true, true);
+             loop {
+                 // Normal frames first; bulk only when none is waiting.
+@@ -138,7 +138,7 @@ impl Mux {
+         });
+ 
+         let c_r = counters.clone();
+-        let reader = tokio::spawn(async move {
++        let reader = crate::rt::spawn(async move {
+             let mut remotes_w = remotes_w;
+             loop {
+                 let mut hdr = [0u8; 5];
+@@ -182,10 +182,10 @@ impl Mux {
+     /// to the transport. The channel ends must have been dropped first.
+     pub async fn close(mut self) {
+         for p in self.pumps.drain(..) {
+-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), p).await;
++            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), p).await;
+         }
+         if let Some(w) = self.writer.take() {
+-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), w).await;
++            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), w).await;
+         }
+         self.reader.abort();
+     }
+diff --git a/crypto/twopc/src/rt.rs b/crypto/twopc/src/rt.rs
+new file mode 100644
+index 0000000..e454730
+--- /dev/null
++++ b/crypto/twopc/src/rt.rs
+@@ -0,0 +1,139 @@
++//! Runtime shims so the protocol code runs both natively (tokio, the
++//! `cu-prover`/`cu-2pc` binaries and the node) and in the browser
++//! (`wasm32-unknown-unknown`, single-threaded, futures driven by
++//! `wasm-bindgen-futures`).
++//!
++//! Only these few primitives differ; everything else (tokio's in-memory
++//! `duplex`, `mpsc`, `Mutex`, `select!`) is executor-agnostic and compiles on
++//! wasm with tokio's `sync`/`macros`/`io-util` features.
++
++use std::future::Future;
++use std::time::Duration;
++
++/// `std::time::Instant` natively; `performance.now()` based in the browser
++/// (`std::time::Instant::now()` panics on wasm32-unknown-unknown).
++pub use web_time::Instant;
++
++/// A timeout elapsed.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Elapsed;
++
++impl std::fmt::Display for Elapsed {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("deadline has elapsed")
++    }
++}
++
++impl std::error::Error for Elapsed {}
++
++#[cfg(not(target_arch = "wasm32"))]
++mod imp {
++    use super::*;
++
++    pub use tokio::task::{JoinError, JoinHandle};
++
++    pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
++    where
++        F: Future + Send + 'static,
++        F::Output: Send + 'static,
++    {
++        tokio::spawn(f)
++    }
++
++    /// CPU-bound work off the async worker threads.
++    pub async fn spawn_blocking<F, R>(f: F) -> Result<R, JoinError>
++    where
++        F: FnOnce() -> R + Send + 'static,
++        R: Send + 'static,
++    {
++        tokio::task::spawn_blocking(f).await
++    }
++
++    pub async fn sleep(d: Duration) {
++        tokio::time::sleep(d).await
++    }
++
++    pub async fn timeout<F: Future>(d: Duration, f: F) -> Result<F::Output, Elapsed> {
++        tokio::time::timeout(d, f).await.map_err(|_| Elapsed)
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++mod imp {
++    use super::*;
++    use std::pin::Pin;
++    use std::task::{Context, Poll};
++
++    use futures::channel::oneshot;
++    use futures::future::{AbortHandle, Either, abortable, select};
++
++    /// The task was aborted (or panicked) before it produced its output.
++    #[derive(Debug)]
++    pub struct JoinError;
++
++    impl std::fmt::Display for JoinError {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            f.write_str("task cancelled")
++        }
++    }
++
++    impl std::error::Error for JoinError {}
++
++    /// Handle of a task spawned on the browser's event loop.
++    pub struct JoinHandle<T> {
++        rx: oneshot::Receiver<T>,
++        abort: AbortHandle,
++    }
++
++    impl<T> JoinHandle<T> {
++        pub fn abort(&self) {
++            self.abort.abort();
++        }
++    }
++
++    impl<T> Future for JoinHandle<T> {
++        type Output = Result<T, JoinError>;
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++            Pin::new(&mut self.rx).poll(cx).map_err(|_| JoinError)
++        }
++    }
++
++    pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
++    where
++        F: Future + 'static,
++        F::Output: 'static,
++    {
++        let (tx, rx) = oneshot::channel();
++        let (fut, abort) = abortable(f);
++        wasm_bindgen_futures::spawn_local(async move {
++            if let Ok(v) = fut.await {
++                let _ = tx.send(v);
++            }
++        });
++        JoinHandle { rx, abort }
++    }
++
++    /// Single-threaded: the work runs inline when the future is first polled
++    /// (run the whole protocol in a Web Worker to keep a page responsive).
++    pub async fn spawn_blocking<F, R>(f: F) -> Result<R, JoinError>
++    where
++        F: FnOnce() -> R,
++    {
++        Ok(f())
++    }
++
++    pub async fn sleep(d: Duration) {
++        gloo_timers::future::sleep(d).await
++    }
++
++    pub async fn timeout<F: Future>(d: Duration, f: F) -> Result<F::Output, Elapsed> {
++        let f = std::pin::pin!(f);
++        let s = std::pin::pin!(sleep(d));
++        match select(f, s).await {
++            Either::Left((v, _)) => Ok(v),
++            Either::Right(_) => Err(Elapsed),
++        }
++    }
++}
++
++pub use imp::*;
+diff --git a/crypto/zkbench/Cargo.toml b/crypto/zkbench/Cargo.toml
+index b5c7020..6293bd9 100644
+--- a/crypto/zkbench/Cargo.toml
++++ b/crypto/zkbench/Cargo.toml
+@@ -14,7 +14,8 @@ mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da
+ mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+ mpz-hash = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", default-features = false, features = ["sha256"] }
+ futures = "0.3"
+-tokio = { version = "1.38", features = ["full"] }
++tokio = { version = "1.38", features = ["sync", "macros", "io-util"] }
++web-time = "1"
+ tokio-util = { version = "0.7", features = ["compat"] }
+ rand = "0.10"
+ sha2 = "0.10"
+@@ -29,6 +30,16 @@ itybity = "0.2"
+ async-trait = "0.1"
+ serio = "0.2"
+ 
++# Native: the full tokio runtime (binaries, node side, tests). On wasm32 only
++# tokio's executor-agnostic parts (duplex, mpsc, Mutex, select!) are used and
++# tasks run on wasm-bindgen-futures (see `src/rt.rs`).
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++tokio = { version = "1.38", features = ["full"] }
++
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++wasm-bindgen-futures = "0.4"
++gloo-timers = { version = "0.3", features = ["futures"] }
++
+ [features]
+ rayon = ["mpz-zk/rayon"]
+ 
+diff --git a/crypto/zkbench/src/channel.rs b/crypto/zkbench/src/channel.rs
+index 9d8969a..8d01bdc 100644
+--- a/crypto/zkbench/src/channel.rs
++++ b/crypto/zkbench/src/channel.rs
+@@ -34,7 +34,7 @@
+ //!   it, so a cheating prover can never probe a Δ more than once.
+ 
+ use std::sync::Arc;
+-use std::time::Instant;
++use crate::rt::Instant;
+ 
+ use anyhow::{Context as _, Result, anyhow, bail};
+ use futures::{AsyncRead, AsyncWrite};
+diff --git a/crypto/zkbench/src/lib.rs b/crypto/zkbench/src/lib.rs
+index 4edfda2..8048973 100644
+--- a/crypto/zkbench/src/lib.rs
++++ b/crypto/zkbench/src/lib.rs
+@@ -12,7 +12,9 @@ pub mod gadgets;
+ pub mod proofs;
+ pub mod statements;
+ pub mod statements_v2;
++#[cfg(not(target_arch = "wasm32"))]
+ pub mod transport;
++pub mod rt;
+ 
+ /// Which side of a proof we are building.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/crypto/zkbench/src/mux.rs b/crypto/zkbench/src/mux.rs
+index 3d647b9..eeafd0a 100644
+--- a/crypto/zkbench/src/mux.rs
++++ b/crypto/zkbench/src/mux.rs
+@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+ use tokio::sync::mpsc;
+-use tokio::task::JoinHandle;
++use crate::rt::JoinHandle;
+ 
+ /// Maximum payload of one mux frame.
+ const MAX_MUX_FRAME: usize = 1 << 20;
+@@ -69,7 +69,7 @@ impl Mux {
+             remotes_w.push(rw);
+             locals.push(local);
+             let tx = tx.clone();
+-            pumps.push(tokio::spawn(async move {
++            pumps.push(crate::rt::spawn(async move {
+                 let mut buf = vec![0u8; PUMP_CHUNK];
+                 loop {
+                     match rr.read(&mut buf).await {
+@@ -86,7 +86,7 @@ impl Mux {
+         drop(tx);
+ 
+         let c_w = counters.clone();
+-        let writer = tokio::spawn(async move {
++        let writer = crate::rt::spawn(async move {
+             while let Some((ch, data)) = rx.recv().await {
+                 let mut hdr = [0u8; 5];
+                 hdr[0] = ch;
+@@ -105,7 +105,7 @@ impl Mux {
+         });
+ 
+         let c_r = counters.clone();
+-        let reader = tokio::spawn(async move {
++        let reader = crate::rt::spawn(async move {
+             let mut remotes_w = remotes_w;
+             loop {
+                 let mut hdr = [0u8; 5];
+@@ -148,10 +148,10 @@ impl Mux {
+     /// to the transport. The channel ends must have been dropped first.
+     pub async fn close(mut self) {
+         for p in self.pumps.drain(..) {
+-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), p).await;
++            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), p).await;
+         }
+         if let Some(w) = self.writer.take() {
+-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), w).await;
++            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), w).await;
+         }
+         self.reader.abort();
+     }
+diff --git a/crypto/zkbench/src/proofs.rs b/crypto/zkbench/src/proofs.rs
+index a97c71f..d54d3ae 100644
+--- a/crypto/zkbench/src/proofs.rs
++++ b/crypto/zkbench/src/proofs.rs
+@@ -12,11 +12,14 @@ use mpz_ot::{
+ use mpz_vm_core::{Execute, memory::correlated::Delta, prelude::*};
+ use mpz_zk::{Prover, ProverConfig, Verifier, VerifierConfig};
+ use rand::RngExt;
++#[cfg(not(target_arch = "wasm32"))]
+ use std::sync::Arc;
++#[cfg(not(target_arch = "wasm32"))]
+ use std::time::{Duration, Instant};
+ 
+ use crate::Role;
+ use crate::statements::{Check, Params, Witness, build};
++#[cfg(not(target_arch = "wasm32"))]
+ use crate::transport::Counters;
+ 
+ pub(crate) fn ferret_config() -> ferret::FerretConfig {
+@@ -202,7 +205,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
+     let witness_p = witness.clone();
+     let params_v = params.clone();
+ 
+-    let prover_task = tokio::spawn(async move {
++    let prover_task = crate::rt::spawn(async move {
+         let checks = build(&mut prover, Role::Prover, &params_p, Some(&witness_p))?;
+         let mut futs = Vec::with_capacity(checks.len());
+         for c in &checks {
+@@ -218,7 +221,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
+         Ok::<_, anyhow::Error>(())
+     });
+ 
+-    let verifier_task = tokio::spawn(async move {
++    let verifier_task = crate::rt::spawn(async move {
+         let checks = build(&mut verifier, Role::Verifier, &params_v, None)?;
+         let mut futs = Vec::with_capacity(checks.len());
+         for c in &checks {
+@@ -315,6 +318,7 @@ fn sha256_blocks(len: usize) -> usize {
+ }
+ 
+ /// Outcome of a prover‖verifier run over an emulated transport.
++#[cfg(not(target_arch = "wasm32"))]
+ #[derive(Debug)]
+ pub struct PairOutcome {
+     pub checks: Vec<CheckResult>,
+@@ -324,6 +328,7 @@ pub struct PairOutcome {
+ }
+ 
+ /// Run prover and verifier against each other over the emulated transport.
++#[cfg(not(target_arch = "wasm32"))]
+ pub async fn run_pair_transport(
+     delay: Duration,
+     rate: f64,
+diff --git a/crypto/zkbench/src/rt.rs b/crypto/zkbench/src/rt.rs
+new file mode 100644
+index 0000000..e454730
+--- /dev/null
++++ b/crypto/zkbench/src/rt.rs
+@@ -0,0 +1,139 @@
++//! Runtime shims so the protocol code runs both natively (tokio, the
++//! `cu-prover`/`cu-2pc` binaries and the node) and in the browser
++//! (`wasm32-unknown-unknown`, single-threaded, futures driven by
++//! `wasm-bindgen-futures`).
++//!
++//! Only these few primitives differ; everything else (tokio's in-memory
++//! `duplex`, `mpsc`, `Mutex`, `select!`) is executor-agnostic and compiles on
++//! wasm with tokio's `sync`/`macros`/`io-util` features.
++
++use std::future::Future;
++use std::time::Duration;
++
++/// `std::time::Instant` natively; `performance.now()` based in the browser
++/// (`std::time::Instant::now()` panics on wasm32-unknown-unknown).
++pub use web_time::Instant;
++
++/// A timeout elapsed.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Elapsed;
++
++impl std::fmt::Display for Elapsed {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("deadline has elapsed")
++    }
++}
++
++impl std::error::Error for Elapsed {}
++
++#[cfg(not(target_arch = "wasm32"))]
++mod imp {
++    use super::*;
++
++    pub use tokio::task::{JoinError, JoinHandle};
++
++    pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
++    where
++        F: Future + Send + 'static,
++        F::Output: Send + 'static,
++    {
++        tokio::spawn(f)
++    }
++
++    /// CPU-bound work off the async worker threads.
++    pub async fn spawn_blocking<F, R>(f: F) -> Result<R, JoinError>
++    where
++        F: FnOnce() -> R + Send + 'static,
++        R: Send + 'static,
++    {
++        tokio::task::spawn_blocking(f).await
++    }
++
++    pub async fn sleep(d: Duration) {
++        tokio::time::sleep(d).await
++    }
++
++    pub async fn timeout<F: Future>(d: Duration, f: F) -> Result<F::Output, Elapsed> {
++        tokio::time::timeout(d, f).await.map_err(|_| Elapsed)
++    }
++}
++
++#[cfg(target_arch = "wasm32")]
++mod imp {
++    use super::*;
++    use std::pin::Pin;
++    use std::task::{Context, Poll};
++
++    use futures::channel::oneshot;
++    use futures::future::{AbortHandle, Either, abortable, select};
++
++    /// The task was aborted (or panicked) before it produced its output.
++    #[derive(Debug)]
++    pub struct JoinError;
++
++    impl std::fmt::Display for JoinError {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            f.write_str("task cancelled")
++        }
++    }
++
++    impl std::error::Error for JoinError {}
++
++    /// Handle of a task spawned on the browser's event loop.
++    pub struct JoinHandle<T> {
++        rx: oneshot::Receiver<T>,
++        abort: AbortHandle,
++    }
++
++    impl<T> JoinHandle<T> {
++        pub fn abort(&self) {
++            self.abort.abort();
++        }
++    }
++
++    impl<T> Future for JoinHandle<T> {
++        type Output = Result<T, JoinError>;
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++            Pin::new(&mut self.rx).poll(cx).map_err(|_| JoinError)
++        }
++    }
++
++    pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
++    where
++        F: Future + 'static,
++        F::Output: 'static,
++    {
++        let (tx, rx) = oneshot::channel();
++        let (fut, abort) = abortable(f);
++        wasm_bindgen_futures::spawn_local(async move {
++            if let Ok(v) = fut.await {
++                let _ = tx.send(v);
++            }
++        });
++        JoinHandle { rx, abort }
++    }
++
++    /// Single-threaded: the work runs inline when the future is first polled
++    /// (run the whole protocol in a Web Worker to keep a page responsive).
++    pub async fn spawn_blocking<F, R>(f: F) -> Result<R, JoinError>
++    where
++        F: FnOnce() -> R,
++    {
++        Ok(f())
++    }
++
++    pub async fn sleep(d: Duration) {
++        gloo_timers::future::sleep(d).await
++    }
++
++    pub async fn timeout<F: Future>(d: Duration, f: F) -> Result<F::Output, Elapsed> {
++        let f = std::pin::pin!(f);
++        let s = std::pin::pin!(sleep(d));
++        match select(f, s).await {
++            Either::Left((v, _)) => Ok(v),
++            Either::Right(_) => Err(Elapsed),
++        }
++    }
++}
++
++pub use imp::*;

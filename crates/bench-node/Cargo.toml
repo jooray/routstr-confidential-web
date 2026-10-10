@@ -1,0 +1,20 @@
+[package]
+name = "bench-node"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Local benchmark peer: the NODE side of the v2 2PC and proof channel over WebSockets (no TLS server, no credential), plus a native client for wasm-vs-native timings"
+
+[dependencies]
+twopc = { path = "../vendor/twopc" }
+zkbench = { path = "../vendor/zkbench" }
+client-wasm = { path = "../client-wasm" }
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio-tungstenite = "0.26"
+futures = "0.3"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
+serde_json = "1"
+hex = "0.4"
+anyhow = "1"

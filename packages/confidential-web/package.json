@@ -1,0 +1,32 @@
+{
+  "name": "@routstr/confidential-web",
+  "version": "0.1.0",
+  "description": "Routstr confidential mode (protocol v2) in the browser: the node never sees the prompt or the response, the client never sees the provider key",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./worker": "./src/wasm/worker.ts"
+  },
+  "files": ["src", "wasm/pkg"],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@noble/ciphers": "1.3.0",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0",
+    "@peculiar/asn1-ecc": "2.10.0",
+    "@peculiar/asn1-rsa": "2.10.0",
+    "@peculiar/asn1-schema": "2.10.0",
+    "@peculiar/asn1-x509": "2.10.0",
+    "@peculiar/x509": "1.14.3",
+    "micro-rsa-dsa-dh": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}
