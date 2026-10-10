@@ -138,13 +138,16 @@ const PREWARM_DEFAULTS = {
  * releases its reservation) when the page is hidden, after `idleMs` without
  * activity, or `maxAgeMs` after setup.
  */
-class Prewarmer {
+export class Prewarmer {
   cfg: typeof PREWARM_DEFAULTS;
   private armed?: Armed;
   private target?: { model: string; maxTokens: number };
   private lastActivity = Date.now();
   private maxBody = 0;
-  private busy = 0;
+  /** Requests still waiting for a 2PC preparation (cold, or a claimed arm in progress). */
+  private preparing = 0;
+  /** Set while ensure() is between its first check and registering the armed session. */
+  private armWait?: Promise<Armed | undefined>;
   private arming = false;
   private backoffUntil = 0;
   private backoff = 0;
@@ -186,12 +189,18 @@ class Prewarmer {
     void this.ensure();
   }
 
-  begin(): void {
-    this.busy++;
+  /**
+   * A request is waiting for a 2PC preparation. No new session is armed
+   * meanwhile: two ~22 MB preparations at once would slow the one the user is
+   * waiting for.
+   */
+  beginPreparing(): void {
+    this.preparing++;
   }
 
-  end(): void {
-    this.busy = Math.max(0, this.busy - 1);
+  /** That preparation is done (or failed): arm the next session right away. */
+  endPreparing(): void {
+    this.preparing = Math.max(0, this.preparing - 1);
     this.activity();
   }
 
@@ -202,6 +211,15 @@ class Prewarmer {
   /** A healthy armed session for this request, or undefined. */
   take(model: string, maxTokens: number, bodyLen: number): Promise<ConfidentialSession> | undefined {
     const a = this.armed;
+    if (!a && this.armWait) {
+      // An arm is starting (checking funds and the offer): wait for it rather
+      // than starting a second, cold preparation.
+      return this.armWait.then((armed) => {
+        const lease = armed && this.armed === armed ? this.take(model, maxTokens, bodyLen) : undefined;
+        if (!lease) throw new Error("no armed session after all");
+        return lease;
+      });
+    }
     if (!a || a.model !== model || a.maxTokens !== maxTokens) return undefined;
     if (a.session.bodyLength < bodyLen) {
       this.teardown("armed body length too small");
@@ -236,13 +254,15 @@ class Prewarmer {
   }
 
   async ensure(): Promise<void> {
-    if (this.stopped || !this.cfg.enabled || this.arming || this.armed || this.busy > 0) return;
+    if (this.stopped || !this.cfg.enabled || this.arming || this.armed || this.preparing > 0) return;
     if (!this.visible() || Date.now() - this.lastActivity > this.cfg.idleMs) return;
     if (Date.now() < this.backoffUntil) return;
     const cred = this.client.credential;
     const target = this.target;
     if (!cred || !cred.startsWith("sk-") || !target) return;
     this.arming = true;
+    let registered: (a: Armed | undefined) => void = () => {};
+    this.armWait = new Promise<Armed | undefined>((r) => (registered = r));
     try {
       // No sats, no session: arming reserves funds on the key.
       const [offer, bal] = await Promise.all([this.client.offer(), this.client.api.balance(cred)]);
@@ -268,6 +288,7 @@ class Prewarmer {
       const ready = session.arm().then(() => session);
       const armed: Armed = { key: `${target.model}|${target.maxTokens}`, session, ready, model: target.model, maxTokens: target.maxTokens };
       this.armed = armed;
+      registered(armed);
       ready.then(
         () => {
           if (this.armed === armed) {
@@ -295,6 +316,8 @@ class Prewarmer {
       this.log(`cannot arm: ${errorText(e)}`);
     } finally {
       this.arming = false;
+      this.armWait = undefined;
+      registered(undefined);
     }
   }
 
@@ -435,7 +458,15 @@ export class ConfidentialClient {
     pw?.noteBody(body.length);
     pw?.setTarget(model, maxTokens);
     const lease = pw?.take(model, maxTokens, body.length);
-    pw?.begin();
+    // Hold off arming the next session only until this request's own 2PC
+    // preparation is done: for a claimed arm, when it is ready (the next one
+    // then starts while this answer streams); for a cold request, at its end.
+    let stillPreparing = !!pw;
+    if (pw) {
+      pw.beginPreparing();
+      // A failed arm falls back to a cold preparation: keep counting until the end.
+      if (lease) lease.then(() => { stillPreparing = false; pw.endPreparing(); }, () => {});
+    }
 
     // Async iterator plumbing.
     const queue: ChatCompletionChunk[] = [];
@@ -500,7 +531,10 @@ export class ConfidentialClient {
     const verification = (lease ? warm() : cold()).finally(() => {
       session?.close();
       signal?.removeEventListener("abort", abort);
-      pw?.end();
+      if (pw && stillPreparing) {
+        stillPreparing = false;
+        pw.endPreparing();
+      } else pw?.activity();
     });
     verification.then(
       () => {
