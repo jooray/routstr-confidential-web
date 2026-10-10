@@ -58,7 +58,7 @@ try {
     const models = await page.$$eval("#model option", (o) => o.map((x) => x.value));
     models.length > 0 ? ok(`models from the signed offer: ${models.join(", ")}`) : fail("no models");
     const est = await page.textContent("#estimate");
-    /reserves/.test(est ?? "") ? ok(`price estimate: ${est}`) : fail(`estimate: ${est}`);
+    /needs .* available/.test(est ?? "") ? ok(`price estimate: ${est}`) : fail(`estimate: ${est}`);
     const v = await page.evaluate(async () => (await fetch("./version.json", { cache: "no-store" })).json());
     ok(`version.json ${JSON.stringify(v)}`);
     const sw = await page.evaluate(async () => {

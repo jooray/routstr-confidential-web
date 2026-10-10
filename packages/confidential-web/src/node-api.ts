@@ -38,6 +38,30 @@ export interface LightningInvoiceStatus {
   paid_at?: number | null;
 }
 
+/** A Cashu mint's input fee on its active sat keyset (NUT-02 `input_fee_ppk`). */
+export interface MintFee {
+  mint: string;
+  /** parts per thousand of a sat, per input proof; the total is rounded up per swap. */
+  inputFeePpk?: number;
+  error?: string;
+}
+
+/** Input fees of the given mints (what a swap of your token costs at redeem/refund). */
+export async function mintInputFees(mints: readonly string[], fetchImpl: typeof fetch = (...a) => fetch(...a)): Promise<MintFee[]> {
+  return Promise.all(
+    mints.map(async (mint) => {
+      try {
+        const r = await fetchImpl(`${mint.replace(/\/$/, "")}/v1/keysets`, { signal: AbortSignal.timeout(8000) });
+        const j = (await r.json()) as { keysets?: { unit?: string; active?: boolean; input_fee_ppk?: number }[] };
+        const ks = (j.keysets ?? []).find((k) => k.active && (k.unit ?? "sat") === "sat");
+        return { mint, inputFeePpk: ks ? (ks.input_fee_ppk ?? 0) : undefined };
+      } catch (e) {
+        return { mint, error: e instanceof Error ? e.message : String(e) };
+      }
+    }),
+  );
+}
+
 export class NodeApiError extends Error {
   constructor(
     message: string,

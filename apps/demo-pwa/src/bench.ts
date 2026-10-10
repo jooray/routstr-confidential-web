@@ -4,7 +4,7 @@
  * B, proof channel preprocessing and the three proofs, all in the Worker the
  * library uses. Results go to `window.__bench` (read by scripts/browser-bench.mjs).
  */
-import { ProofChannel, TwoPcSession, WorkerWasmHost } from "@routstr/confidential-web";
+import { probeProviderTls, ProofChannel, TwoPcSession, WorkerWasmHost } from "@routstr/confidential-web";
 
 const q = new URLSearchParams(location.search);
 const node = q.get("node") ?? "ws://127.0.0.1:7450";
@@ -69,7 +69,15 @@ async function main(): Promise<void> {
   w.__bench = results;
 }
 
-main().catch((e: unknown) => {
+const tlsRelay = q.get("tls");
+if (tlsRelay) {
+  // TLS diagnostic: the vendored TLS client against the real provider via a
+  // local WS→TCP relay (scripts/ws-tcp-relay.mjs).
+  probeProviderTls(tlsRelay, q.get("host") ?? "api.venice.ai", "/api/v1/models").then((r) => {
+    (window as unknown as { __tls?: unknown }).__tls = r;
+    out.textContent = JSON.stringify(r, null, 2);
+  });
+} else main().catch((e: unknown) => {
   w.__benchError = e instanceof Error ? e.message : String(e);
   out.textContent = `error: ${w.__benchError}`;
 });

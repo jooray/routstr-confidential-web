@@ -3,7 +3,12 @@ import qrcode from "qrcode-generator";
 import {
   createConfidentialClient,
   formatSats,
+  mintInputFees,
   NodeApi,
+  offerAbandonFeeMsat,
+  offerSessionFeeMsat,
+  SessionRejectedError,
+  type MintFee,
   roughTokens,
   costMsat,
   type BalanceInfo,
@@ -26,6 +31,7 @@ const K = {
   credential: "rc:credential",
   model: "rc:model",
   maxTokens: "rc:max-tokens",
+  prewarm: "rc:prewarm",
 };
 
 function load<T>(k: string, d: T): T {
@@ -48,6 +54,9 @@ function save(k: string, v: unknown): void {
 const settings = load(K.settings, { ...DEFAULTS });
 let credential: string | undefined = load<string | undefined>(K.credential, undefined);
 let remember = credential !== undefined;
+// `?prewarm=0` (tests) or the user's choice in the Costs panel.
+let prewarmOn = new URLSearchParams(location.search).get("prewarm") === "0" ? false : load(K.prewarm, true);
+let mintFees: MintFee[] | undefined;
 
 // ─── tiny DOM helper ────────────────────────────────────────────────────────
 
@@ -142,8 +151,7 @@ function makeClient(): void {
     nodePubkeys: [settings.pubkey],
     trustedHosts: [settings.trustedHost],
     credential,
-    // `?prewarm=0` disables pre-warming (cold-path measurements).
-    prewarm: { enabled: new URLSearchParams(location.search).get("prewarm") !== "0" },
+    prewarm: { enabled: prewarmOn },
     onEvent: logEvent,
   });
 }
@@ -222,6 +230,8 @@ function emptyState(): HTMLElement {
 function renderSide(): void {
   const side = $("side");
   side.replaceChildren(
+    h("h2", {}, "Costs"),
+    costsCard(),
     h("h2", {}, "Wallet"),
     walletCard(),
     h("h2", {}, "Verification"),
@@ -278,10 +288,12 @@ function walletCard(): HTMLElement {
       h("button", { type: "button", onclick: onLightning }, "Lightning"),
     ),
     h("div", { id: "invoice" }),
+    h("p", { class: "muted" }, "Lightning: your wallet may add a routing fee on top of the invoice amount."),
     h(
       "details",
       {},
       h("summary", {}, "Pay with Cashu"),
+      mintFeeLines(),
       h("textarea", { id: "cashu", rows: 3, placeholder: "cashuB…" }),
       h("button", { type: "button", onclick: onCashu }, credential ? "Top up" : "Create key"),
     ),
@@ -299,7 +311,7 @@ function walletCard(): HTMLElement {
         "details",
         {},
         h("summary", {}, "Withdraw (refund)"),
-        h("p", { class: "muted" }, "Returns the whole balance as a Cashu token (or to a Lightning address) and empties the key."),
+        h("p", { class: "muted" }, "Returns the whole balance as a Cashu token (or to a Lightning address) and empties the key. The mint's input fee or the Lightning routing fee comes out of the amount."),
         h("input", { id: "refund-ln", placeholder: "Lightning address (optional)" }),
         h("button", { type: "button", onclick: onRefund }, "Withdraw"),
         h("div", { id: "refund-out" }),
@@ -307,6 +319,98 @@ function walletCard(): HTMLElement {
     );
   }
   return card;
+}
+
+/** Plain-language costs, all read from the signed offer and the node's model list. */
+function costsCard(): HTMLElement {
+  const card = h("div", { class: "card", id: "costs" });
+  if (!offer) {
+    card.append(h("p", { class: "muted" }, offerError ? "No verified offer: nothing can be priced." : "Loading the node's signed prices…"));
+    return card;
+  }
+  const abandon = offerAbandonFeeMsat(offer);
+  const sessionFee = offerSessionFeeMsat(offer);
+  const pct = typeof offer.rate_surcharge_pct === "number" ? offer.rate_surcharge_pct : 0;
+  const p = currentModelOrNull();
+  card.append(
+    h(
+      "p",
+      {},
+      h("strong", {}, "Per message: "),
+      p ? `${p.name ?? p.id} costs ${formatSats(p.rates.in * 1000)} per million input tokens and ${formatSats(p.rates.out * 1000)} per million output tokens. ` : "",
+      "What you pay is the provider-reported usage at these signed rates",
+      sessionFee ? `, plus a session fee of ${formatSats(sessionFee)}` : "",
+      pct ? ` (rates include a ${pct}% confidential surcharge)` : "",
+      ". Each answer shows its exact cost from the signed receipt.",
+    ),
+    h(
+      "p",
+      {},
+      h("strong", {}, "Balance needed: "),
+      "while a request runs, the node reserves its worst case (a prompt filling the model's whole context plus the max tokens",
+      abandon || sessionFee ? `, plus the ${formatSats(Math.max(abandon, sessionFee))} fee` : "",
+      ") and releases the unused part when it settles. Your key needs at least this much available:",
+    ),
+    h(
+      "dl",
+      { class: "kv" },
+      ...pricing.flatMap((m) => [
+        h("dt", {}, m.name ?? m.id),
+        h("dd", {}, m.reservationMsat !== undefined ? formatSats(m.reservationMsat) : "unknown (no context length)"),
+      ]),
+    ),
+    h(
+      "p",
+      {},
+      h("strong", {}, "Pre-warming: "),
+      abandon > 0
+        ? `keeping a session ready makes the first answer faster. It costs nothing if you use it; a prepared session you never use costs ${formatSats(abandon)} (the node's fee for the work it already did). It is only prepared while this page is visible and you have funds.`
+        : "keeping a session ready makes the first answer faster and costs nothing extra. It is only prepared while this page is visible and you have funds.",
+    ),
+    h(
+      "label",
+      { class: "inline" },
+      h("input", {
+        type: "checkbox",
+        checked: prewarmOn,
+        onchange: (e: Event) => {
+          prewarmOn = (e.target as HTMLInputElement).checked;
+          save(K.prewarm, prewarmOn);
+          client?.setPrewarm(prewarmOn);
+          if (prewarmOn) {
+            const m = currentModel();
+            if (m) client?.prepare(m.id, maxTokens());
+          }
+        },
+      }),
+      "Keep a session ready (pre-warm)",
+    ),
+  );
+  if (abandon > 5000) card.append(h("p", { class: "warnbox" }, "This node's unused-session fee is above 5 sats, so the app does not pre-warm."));
+  return card;
+}
+
+function mintFeeLines(): HTMLElement {
+  if (!mintFees) return h("p", { class: "muted" }, "Checking the mints' fees…");
+  const paid = mintFees.filter((m) => (m.inputFeePpk ?? 0) > 0);
+  return h(
+    "div",
+    { class: "muted" },
+    h(
+      "p",
+      {},
+      "Cashu mints may charge an input fee when your token is redeemed (and again when you withdraw): ",
+      paid.length
+        ? `${paid.map((m) => `${new URL(m.mint).host} ${m.inputFeePpk} ppk`).join(", ")} — that is about ${Math.ceil((paid[0]!.inputFeePpk ?? 0) / 1000)} sat per proof batch of up to ${Math.floor(1000 / Math.max(1, paid[0]!.inputFeePpk ?? 1))} proofs, rounded up.`
+        : "the node's mints charge none.",
+      ` Mints this node accepts: ${(offer?.mints ?? []).map((m) => new URL(m).host).join(", ") || "—"}.`,
+    ),
+  );
+}
+
+function currentModelOrNull(): ModelPricing | undefined {
+  const sel = document.getElementById("model") as HTMLSelectElement | null;
+  return sel ? pricing.find((p) => p.id === sel.value) : undefined;
 }
 
 function balanceSub(avail?: number): string {
@@ -511,10 +615,14 @@ function renderEstimate(): void {
   const mt = maxTokens();
   const typical = costMsat(p.rates, { prompt_tokens: inTok, completion_tokens: Math.min(mt, 300) }, p.sessionFeeMsat);
   const worst = costMsat(p.rates, { prompt_tokens: inTok, completion_tokens: mt }, p.sessionFeeMsat);
-  const resv = p.promptLimit !== undefined ? Math.ceil((p.promptLimit * p.rates.in + mt * p.rates.out) / 1000) + p.sessionFeeMsat : undefined;
+  const resv =
+    p.promptLimit !== undefined
+      ? Math.ceil((p.promptLimit * p.rates.in + mt * p.rates.out) / 1000) + Math.max(p.sessionFeeMsat, p.abandonFeeMsat)
+      : undefined;
   el.textContent =
     `≈ ${formatSats(typical)} per message (≤ ${formatSats(worst)} at ${mt} tokens)` +
-    (resv !== undefined ? ` · reserves ${formatSats(resv)} while open` : "") +
+    (resv !== undefined ? ` · needs ${formatSats(resv)} available (reserved while it runs)` : "") +
+    (p.abandonFeeMsat ? ` · unused prepared session ${formatSats(p.abandonFeeMsat)}` : "") +
     (p.sessionFeeMsat ? ` · incl. session fee ${formatSats(p.sessionFeeMsat)}` : "") +
     (p.rateSurchargePct ? ` · rates incl. ${p.rateSurchargePct}% surcharge` : "");
 }
@@ -526,6 +634,10 @@ function onModelChange(): void {
   save(K.maxTokens, maxTokens());
   client?.prepare(p.id, maxTokens());
   renderEstimate();
+  void client?.pricing(maxTokens()).then((list) => {
+    pricing = list;
+    document.getElementById("costs")?.replaceWith(costsCard());
+  });
 }
 
 // ─── wallet actions ─────────────────────────────────────────────────────────
@@ -743,7 +855,7 @@ async function onSend(e: Event): Promise<void> {
     );
     selectTurn(answer);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = friendlyError(err);
     answer.error = msg;
     testHook().errors.push(msg);
     answer.el.classList.add("error");
@@ -756,6 +868,17 @@ async function onSend(e: Event): Promise<void> {
     void refreshBalance();
     idle();
   }
+}
+
+function friendlyError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (err instanceof SessionRejectedError) {
+    if (err.status === 402) return `Not enough balance for this request's reservation (${raw}). Top up, or lower max tokens.`;
+    if (err.status === 429) return "The node already holds 3 unused sessions for your address (other tabs or devices behind the same IP). Close them or wait a few minutes.";
+    if (err.status === 409) return `The node's signed offer changed (prices or fees); reload to accept the new one. (${raw})`;
+    if (err.status === 401) return `The node does not know this key (${raw}).`;
+  }
+  return raw;
 }
 
 /** Non-secret outcomes for the browser tests (no credential, no prompt). */
@@ -786,6 +909,10 @@ async function restart(): Promise<void> {
     offer = await client!.offer();
     pricing = await client!.pricing(maxTokens());
     renderModels();
+    void mintInputFees(offer.mints ?? []).then((f) => {
+      mintFees = f;
+      renderSide();
+    });
   } catch (e) {
     offerError = e instanceof Error ? e.message : String(e);
   }

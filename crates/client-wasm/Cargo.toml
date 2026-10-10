@@ -33,5 +33,9 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.38", features = ["full"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
+sha2 = "0.10"
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

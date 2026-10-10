@@ -44,7 +44,8 @@ export interface PrewarmOptions {
   backoffMs?: number;
   /**
    * Do not pre-warm when the node keeps more than this (msat) for a session
-   * that is armed but never used (the offer's abandon fee). Default 5000.
+   * that is armed but never used (the offer's abandon fee). Default 5000
+   * (5 sats, the SDK's default): symbolic fees are fine, anything larger is not.
    */
   maxAbandonFeeMsat?: number;
 }
@@ -222,7 +223,7 @@ class Prewarmer {
       this.armed = undefined;
       this.log(`closed armed session (${reason})`);
     }
-    this.status = this.stopped ? "off" : "idle";
+    this.status = this.stopped || !this.cfg.enabled ? "off" : "idle";
   }
 
   private tick(): void {
@@ -377,6 +378,14 @@ export class ConfidentialClient {
   /** Arm for the model the user is about to use (pre-warm). */
   prepare(model: string, maxTokens?: number): void {
     this.prewarmer?.setTarget(model, maxTokens ?? this.offerCache?.offer.max_tokens_cap ?? 4096);
+  }
+
+  /** Turn pre-warming on or off at runtime (off closes the armed session). */
+  setPrewarm(enabled: boolean): void {
+    if (!this.prewarmer) return;
+    this.prewarmer.cfg.enabled = enabled;
+    if (enabled) this.prewarmer.activity();
+    else this.prewarmer.teardown("pre-warming turned off");
   }
 
   /** Signal user activity (typing, focus) to the pre-warmer. */

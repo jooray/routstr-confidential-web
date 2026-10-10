@@ -138,8 +138,8 @@ describe("pricing", () => {
     expect(costMsat(rates, { prompt_tokens: 1, completion_tokens: 0 }, 2000)).toBe(2001);
   });
 
-  it("estimates the reservation from the context length (as routstr-core)", () => {
-    expect(promptLimit({ id: "a", top_provider: { context_length: 1000, max_completion_tokens: 100 } })).toBe(900);
+  it("estimates the reservation from the full context length (conservative)", () => {
+    expect(promptLimit({ id: "a", top_provider: { context_length: 1000, max_completion_tokens: 100 } })).toBe(1000);
     expect(promptLimit({ id: "a", context_length: 500 })).toBe(500);
     expect(promptLimit(undefined)).toBeUndefined();
     const m = Object.keys(offer.price_list)[0]!;

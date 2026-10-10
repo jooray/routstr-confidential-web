@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::oneshot;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -34,8 +35,15 @@ fn emit(out: &Out, v: Value) {
 /// Pumps protocol bytes between the owner's frames and an in-memory duplex,
 /// and routes control JSON to `ctl`. Returns the owner's input sender and the
 /// protocol end of the duplex.
-fn bridge(out: &Out, ctl: Option<UnboundedSender<Value>>) -> (UnboundedSender<Frame>, tokio::io::DuplexStream) {
+fn bridge(
+    out: &Out,
+    ctl: Option<UnboundedSender<Value>>,
+) -> (UnboundedSender<Frame>, tokio::io::DuplexStream, oneshot::Sender<()>) {
     let (in_tx, mut in_rx) = unbounded::<Frame>();
+    // Fired when the driver finished: the input task then lets go of its
+    // `out` clone, so the output stream ends even if the owner keeps its
+    // input sender (no cycle through the transport).
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let (party_io, bridge) = tokio::io::duplex(4 << 20);
     let (mut br, mut bw) = tokio::io::split(bridge);
 
@@ -58,7 +66,12 @@ fn bridge(out: &Out, ctl: Option<UnboundedSender<Value>>) -> (UnboundedSender<Fr
     // owner → protocol / control
     let err_out = out.clone();
     rt::spawn(async move {
-        while let Some((ch, data)) = in_rx.next().await {
+        loop {
+            let next = match futures::future::select(in_rx.next(), &mut stop_rx).await {
+                futures::future::Either::Left((Some(f), _)) => f,
+                _ => break,
+            };
+            let (ch, data) = next;
             if data.len() > MAX_FRAME {
                 emit(&err_out, json!({"ev":"error","msg":"input frame too large"}));
                 break;
@@ -82,7 +95,7 @@ fn bridge(out: &Out, ctl: Option<UnboundedSender<Value>>) -> (UnboundedSender<Fr
         // Input closed: the protocol input ends too (and so does `ctl`).
         let _ = bw.shutdown().await;
     });
-    (in_tx, party_io)
+    (in_tx, party_io, stop_tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -149,12 +162,13 @@ async fn run_twopc(out: Out, mut ctl: UnboundedReceiver<Value>, io: tokio::io::D
 /// dropping it is the equivalent of closing the process's stdin.
 pub fn spawn_twopc(out: Out) -> UnboundedSender<Frame> {
     let (ctl_tx, ctl_rx) = unbounded::<Value>();
-    let (in_tx, party_io) = bridge(&out, Some(ctl_tx));
+    let (in_tx, party_io, stop) = bridge(&out, Some(ctl_tx));
     rt::spawn(async move {
         if let Err(msg) = run_twopc(out.clone(), ctl_rx, party_io).await {
             emit(&out, json!({"ev":"error","msg":msg}));
         }
         emit(&out, json!({"ev":"exit"}));
+        let _ = stop.send(());
     });
     in_tx
 }
@@ -236,12 +250,13 @@ async fn run_channel(
 /// (`cu-prover --channel`).
 pub fn spawn_zkchan(prealloc: zkbench::channel::Prealloc, out: Out) -> UnboundedSender<Frame> {
     let (ctl_tx, ctl_rx) = unbounded::<Value>();
-    let (in_tx, party_io) = bridge(&out, Some(ctl_tx));
+    let (in_tx, party_io, stop) = bridge(&out, Some(ctl_tx));
     rt::spawn(async move {
         if let Err(e) = run_channel(out.clone(), ctl_rx, party_io, prealloc).await {
             emit(&out, json!({"ev":"error","msg":format!("{e:#}")}));
         }
         emit(&out, json!({"ev":"exit"}));
+        let _ = stop.send(());
     });
     in_tx
 }
@@ -263,7 +278,7 @@ struct Job {
 /// `job` is `{"proof","role":"prover"|"verifier","params","witness"}`. Emits
 /// `{"ev":"done","ok":..,"checks":[..]}` (or `ok:false,"err"`) on channel 1.
 pub fn spawn_prover_job(job: &[u8], out: Out) -> UnboundedSender<Frame> {
-    let (in_tx, party_io) = bridge(&out, None);
+    let (in_tx, party_io, stop) = bridge(&out, None);
     let job: Result<Job, String> = serde_json::from_slice(job).map_err(|_| "bad job".to_string());
     rt::spawn(async move {
         let res: anyhow::Result<(String, Vec<zkbench::proofs::CheckResult>)> = async {
@@ -286,6 +301,7 @@ pub fn spawn_prover_job(job: &[u8], out: Out) -> UnboundedSender<Frame> {
             Err(e) => emit(&out, json!({"ev":"done","ok":false,"err":format!("{e:#}")})),
         }
         emit(&out, json!({"ev":"exit"}));
+        let _ = stop.send(());
     });
     in_tx
 }

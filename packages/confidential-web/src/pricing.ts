@@ -19,21 +19,27 @@ export interface ModelPricing {
   /** Kept by the node when an armed (pre-warmed) session is never used. */
   abandonFeeMsat: number;
   rateSurchargePct: number;
-  /** Reservation the node holds while a session for `maxTokens` is open (msat). */
+  /**
+   * Reservation the node holds while a session for `maxTokens` is open (msat):
+   * a full-context prompt plus `maxTokens` at the signed rates, plus the
+   * larger of the session and abandon fees. The key needs at least this
+   * available balance; the unused part is released at settlement.
+   */
   reservationMsat?: number;
   maxTokens: number;
 }
 
-/** Same rule as routstr-core `prompt_token_limit`. */
+/**
+ * The prompt size the node reserves for. Conservative: the model's full
+ * context length. (routstr-core's `prompt_token_limit` may subtract the
+ * provider's max completion tokens, but deployed nodes have been seen to
+ * reserve on the full context; over-estimating only shows a higher required
+ * balance, under-estimating would surprise the user with a 402.)
+ */
 export function promptLimit(m: NodeModel | undefined): number | undefined {
   if (!m) return undefined;
-  const cl = m.top_provider?.context_length ?? undefined;
-  const mct = m.top_provider?.max_completion_tokens ?? undefined;
-  if (cl || mct) {
-    if (cl && mct) return Math.max(0, cl - mct);
-    return cl ? cl : 0;
-  }
-  return m.context_length || undefined;
+  const cl = Math.max(m.top_provider?.context_length ?? 0, m.context_length ?? 0);
+  return cl > 0 ? cl : undefined;
 }
 
 export function sessionFeeMsat(offer: VerifiedOffer): number {
@@ -75,7 +81,9 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
         rateSurchargePct: pct,
         maxTokens: mt,
         reservationMsat:
-          limit !== undefined ? Math.ceil((limit * rates.in + mt * rates.out) / 1000) + fee : undefined,
+          limit !== undefined
+            ? Math.ceil((limit * rates.in + mt * rates.out) / 1000) + Math.max(fee, offerAbandonFeeMsat(offer))
+            : undefined,
       };
     })
     .sort((a, b) => a.id.localeCompare(b.id));

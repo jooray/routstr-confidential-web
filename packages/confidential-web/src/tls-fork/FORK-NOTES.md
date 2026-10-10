@@ -148,3 +148,19 @@ import { setCryptoImplementation } from '../vendor/tls/lib/crypto/index.js'
 import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 setCryptoImplementation(webcryptoCrypto)
 ```
+
+## Browser patches (routstr-confidential-web)
+
+Copied from routstr-sdk `client/confidential/tls-fork` (branch `confidential-2pc`)
+and changed only as follows (marked `// BROWSER PATCH`):
+
+1. `lib/crypto/webcrypto.js`: WebCrypto from `globalThis.crypto` instead of
+   Node's `import { webcrypto } from 'crypto'` (browsers, workers, Node ≥ 19).
+2. `lib/utils/parse-certificate.js`: `verifyCertificateChain` returns the
+   validated path (leaf … trust anchor).
+3. `lib/make-tls-client.js`: keeps that path and passes it to
+   `onRecvCertificates({ certificates, verifiedPath })`, so the client can show
+   the chain it validated (subject, issuer, validity, SPKI hash).
+4. Removed `lib/crypto/pure-js.*` and `lib/crypto/insecure-rand.*` (the
+   Math.random fallback) and `lib/scripts/` (Node-only tooling): the browser
+   build uses WebCrypto only.
