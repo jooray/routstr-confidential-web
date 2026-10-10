@@ -123,6 +123,12 @@ export interface ProofOutcome {
   bytesRecv?: number;
 }
 
+const PROOF_LABEL: Record<"pi_nk" | "pi_c2s" | "pi_c3s", string> = {
+  pi_nk: "π_NK (node's record is the template)",
+  pi_c2s: "π_C2S (pinned suffix)",
+  pi_c3s: "π_C3S (usage disclosure)",
+};
+
 export interface ConfidentialSessionTimings {
   readyMs?: number;
   handshakeMs?: number;
@@ -140,6 +146,20 @@ export interface ConfidentialSessionTimings {
   proofChannelReadyMs?: number;
   proofChannelSteps?: TwoPcTiming[];
   totalMs: number;
+  /**
+   * Every step as a span, in ms relative to the request (claim): negative
+   * values happened before it (a pre-armed session's setup and 2PC
+   * preprocessing). For waterfall charts.
+   */
+  spans?: TimingSpan[];
+}
+
+export interface TimingSpan {
+  name: string;
+  /** "node" (setup, record, settlement), "2pc", "proofs", "tls", "provider". */
+  lane: "node" | "2pc" | "proofs" | "tls" | "provider";
+  startMs: number;
+  endMs: number;
 }
 
 export interface ConfidentialSessionResult {
@@ -342,6 +362,10 @@ export class ConfidentialSession {
   private released = false;
   private failure?: Error;
   private tArmed = 0;
+  private tHsStart = 0;
+  private tLastData = 0;
+  /** Absolute-time spans (Date.now()), converted to claim-relative in finish(). */
+  private absSpans: { name: string; lane: TimingSpan["lane"]; start: number; end: number }[] = [];
   private finished = false;
   private c2Failed = false;
 
@@ -514,6 +538,7 @@ export class ConfidentialSession {
       },
       onApplicationData: (rec: Uint8Array) => {
         if (!this.ttft) this.ttft = Date.now();
+        this.tLastData = Date.now();
         this.responseChunks.push(rec);
         this.responseBytes = concat(this.responseBytes, rec);
         if (this.onResponseHead || this.onResponseBody) {
@@ -621,6 +646,7 @@ export class ConfidentialSession {
         const t = Date.now();
         const out = await twoPc.handshake(serverShare, thSH, this.timeouts.handshakeV2);
         this.tPhaseA = Date.now() - t;
+        this.absSpans.push({ name: "2PC phase A (handshake keys)", lane: "2pc", start: t, end: Date.now() });
         this.event({ ev: "twopc_phase_a", ms: this.tPhaseA });
         return out;
       },
@@ -628,6 +654,7 @@ export class ConfidentialSession {
         const t = Date.now();
         this.ap = await twoPc.application(thSF, this.timeouts.handshakeV2);
         this.tPhaseB = Date.now() - t;
+        this.absSpans.push({ name: "2PC phase B (application keys)", lane: "2pc", start: t, end: Date.now() });
         this.event({ ev: "twopc_phase_b", ms: this.tPhaseB });
         return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 };
       },
@@ -644,6 +671,7 @@ export class ConfidentialSession {
     if (twoPcFailure) throw twoPcFailure;
     this.handshaken = true;
     this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res));
+    this.tHsStart = Date.now();
     await this.tls.startHandshake();
     await Promise.race([this.handshakeP, this.errP, timeout(this.timeouts.handshakeV2, "handshake")]);
     if (!this.ap) throw new SessionProtocolError("handshake finished without 2PC application secrets");
@@ -693,11 +721,13 @@ export class ConfidentialSession {
         bytesSent: m.bytes_sent,
         bytesRecv: m.bytes_recv,
       };
+      this.absSpans.push({ name: PROOF_LABEL[proof], lane: "proofs", start: t, end: Date.now() });
       return;
     }
     if (ch) this.event({ ev: "proof_channel_fallback", proof, err: String(ch.failure?.message ?? "") });
     await this.prover.run(this.zkUrl(proof), { proof, role: cmd === "prove" ? "prover" : "verifier", params, witness });
     this.proofTimes[proof] = { ok: true, via: "per-proof", ms: Date.now() - t };
+    this.absSpans.push({ name: PROOF_LABEL[proof], lane: "proofs", start: t, end: Date.now() });
   }
 
   /** Serve one request on this session (arming it first if needed). */
@@ -861,6 +891,22 @@ export class ConfidentialSession {
     this.finished = true;
     const tEnd = Date.now();
     const ttftAbs = this.ttft || tEnd;
+    const lastData = this.tLastData || ttftAbs;
+    const abs = [
+      ...(this.tReady ? [{ name: "setup (node checks credential, reserves)", lane: "node" as const, start: this.tStart, end: this.tReady }] : []),
+      ...(this.tKeyShare ? [{ name: "2PC preprocessing + key share", lane: "2pc" as const, start: this.tReady, end: this.tKeyShare }] : []),
+      ...(this.zkChan?.tReady ? [{ name: "proof channel setup", lane: "proofs" as const, start: this.zkChan.tStart, end: this.zkChan.tReady }] : []),
+      ...(this.tHs ? [{ name: "TLS handshake with provider", lane: "tls" as const, start: this.tHsStart, end: this.tHs }] : []),
+      ...this.absSpans,
+      ...(this.tRecordStart ? [{ name: "credential record (node)", lane: "node" as const, start: this.tRecordStart, end: this.tHeadWritten }] : []),
+      ...(this.tBodyWrite ? [{ name: "provider: time to first byte", lane: "provider" as const, start: this.tBodyWrite, end: ttftAbs }] : []),
+      { name: "response streaming", lane: "provider" as const, start: ttftAbs, end: lastData },
+      { name: "settlement (usage proof, receipt)", lane: "node" as const, start: lastData, end: tEnd },
+    ];
+    const spans: TimingSpan[] = abs
+      .filter((x) => x.start > 0 && x.end >= x.start)
+      .map((x) => ({ name: x.name, lane: x.lane, startMs: x.start - tClaim, endMs: x.end - tClaim }))
+      .sort((a, b) => a.startMs - b.startMs);
     const timings: ConfidentialSessionTimings = {
       readyMs: this.tReady && this.tReady >= tClaim ? this.tReady - tClaim : undefined,
       handshakeMs: this.tHs ? this.tHs - Math.max(tClaim, this.tArmed) : undefined,
@@ -878,6 +924,7 @@ export class ConfidentialSession {
       proofChannelReadyMs: this.zkChan?.tReady ? this.zkChan.tReady - this.zkChan.tStart : undefined,
       proofChannelSteps: this.zkChan?.timings.slice(),
       totalMs: tEnd - tClaim,
+      spans,
     };
     return {
       sid: this.sid,

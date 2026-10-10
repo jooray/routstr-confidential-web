@@ -20,6 +20,7 @@ export type {
   ConfidentialSessionTimings,
   ProofOutcome,
   ProviderVerification,
+  TimingSpan,
 } from "./session.js";
 export * from "./errors.js";
 export {
