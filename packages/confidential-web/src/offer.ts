@@ -57,12 +57,22 @@ export interface ConfidentialOffer {
   mints?: string[];
   prewarm?: boolean;
   /**
-   * Optional flat fee per confidential session (msat), charged on settlement
-   * (and kept for an abandoned armed session). The client accepts it by
-   * echoing it in its setup. Absent = no fee.
+   * Flat fee (msats) on top of the usage of a completed request, and the
+   * charge for a request the provider refused (4xx/503). The client accepts it
+   * by echoing it in setup.
    */
   session_fee_msat?: number;
-  /** Optional surcharge already folded into `price_list` (percent; informational). */
+  /**
+   * Fee (msats, ≥ session_fee_msat) for a session that ends without a request
+   * reaching the provider: armed and never used, aborted before the body, the
+   * client gone. The node's anti-DoS deposit; it is reserved at setup and the
+   * client accepts it by echoing it in setup.
+   */
+  abandon_fee_msat?: number;
+  /**
+   * Informational: the surcharge (percent) the node applies to its per-token
+   * rates for confidential sessions. `price_list` already includes it.
+   */
   rate_surcharge_pct?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
@@ -137,14 +147,50 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   if (typeof offer.max_tokens_cap !== "number" || offer.max_tokens_cap <= 0) {
     throw new OfferMalformedError("offer.max_tokens_cap is not a positive number");
   }
-  const fee = offer.session_fee_msat;
-  if (fee !== undefined && (typeof fee !== "number" || !Number.isInteger(fee) || fee < 0)) {
+  if (
+    offer.session_fee_msat !== undefined &&
+    (typeof offer.session_fee_msat !== "number" ||
+      !Number.isSafeInteger(offer.session_fee_msat) ||
+      offer.session_fee_msat < 0)
+  ) {
     throw new OfferMalformedError("offer.session_fee_msat is not a non-negative integer");
   }
-  const pct = offer.rate_surcharge_pct;
-  if (pct !== undefined && (typeof pct !== "number" || !Number.isFinite(pct) || pct < 0)) {
+  if (
+    offer.abandon_fee_msat !== undefined &&
+    (typeof offer.abandon_fee_msat !== "number" ||
+      !Number.isSafeInteger(offer.abandon_fee_msat) ||
+      offer.abandon_fee_msat < 0)
+  ) {
+    throw new OfferMalformedError("offer.abandon_fee_msat is not a non-negative integer");
+  }
+  if (
+    offer.rate_surcharge_pct !== undefined &&
+    (typeof offer.rate_surcharge_pct !== "number" ||
+      !Number.isFinite(offer.rate_surcharge_pct) ||
+      offer.rate_surcharge_pct < 0)
+  ) {
     throw new OfferMalformedError("offer.rate_surcharge_pct is not a non-negative number");
   }
+}
+
+function feeValue(fee: unknown): number {
+  return typeof fee === "number" && Number.isSafeInteger(fee) && fee > 0 ? fee : 0;
+}
+
+/** The signed offer's session fee in msats (0 when the node charges none). */
+export function offerSessionFeeMsat(offer: Pick<ConfidentialOffer, "session_fee_msat">): number {
+  return feeValue(offer.session_fee_msat);
+}
+
+/**
+ * The signed offer's abandon fee in msats: what a session that ends without a
+ * request reaching the provider costs. Never below the session fee (the node
+ * uses the session fee when it sets none).
+ */
+export function offerAbandonFeeMsat(
+  offer: Pick<ConfidentialOffer, "session_fee_msat" | "abandon_fee_msat">,
+): number {
+  return Math.max(feeValue(offer.abandon_fee_msat), offerSessionFeeMsat(offer));
 }
 
 /** The exact bytes the node signed, or a canonical reconstruction. */

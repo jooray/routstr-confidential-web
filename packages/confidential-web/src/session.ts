@@ -34,7 +34,7 @@ import {
 import { matchHostname } from "./hosts";
 import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams } from "./params";
 import { WasmProverBackend } from "./prover";
-import { parseSignedReceipt, verifyReceipt } from "./receipt";
+import { feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt";
 import {
   canonicalSuffix,
   disclosureTailLens,
@@ -48,7 +48,7 @@ import {
 } from "./suffix";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc";
 import { ProofChannel } from "./zkchan";
-import type { VerifiedOffer } from "./offer";
+import { offerAbandonFeeMsat, offerSessionFeeMsat, type VerifiedOffer } from "./offer";
 import type { WasmHost } from "./wasm/host";
 import { makeTLSClient } from "./tls-fork/lib/index.js";
 import { setCryptoImplementation } from "./tls-fork/lib/crypto/index.js";
@@ -73,6 +73,8 @@ export interface ConfidentialReceipt {
   reserved_msats?: number;
   balance_msats?: number | null;
   session_fee_msat?: number;
+  abandon_fee_msat?: number;
+  rate_surcharge_pct?: number;
   notary_pubkey?: string;
   attestation_hash?: string;
   time?: number;
@@ -391,6 +393,11 @@ export class ConfidentialSession {
     return this.tArmed;
   }
 
+  /** What the node keeps if this session ends unused (the offer's abandon fee). */
+  get abandonFeeMsat(): number {
+    return offerAbandonFeeMsat(this.offer);
+  }
+
   get startedAt(): number {
     return this.tStart;
   }
@@ -577,10 +584,12 @@ export class ConfidentialSession {
       armed: true,
     };
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
-    // Accept exactly the session fee of the offer we verified (if any).
-    if (typeof this.offer.session_fee_msat === "number" && this.offer.session_fee_msat > 0) {
-      setup.session_fee_msat = this.offer.session_fee_msat;
-    }
+    // Accept that offer's fees explicitly (the node refuses a setup that does
+    // not, so a client unaware of fees is never charged one).
+    const fee = offerSessionFeeMsat(this.offer);
+    const abandonFee = offerAbandonFeeMsat(this.offer);
+    if (fee > 0) setup.session_fee_msat = fee;
+    if (abandonFee > 0) setup.abandon_fee_msat = abandonFee;
     setup.auth = this.auth;
     this.sendText(setup);
 
@@ -805,7 +814,7 @@ export class ConfidentialSession {
       attestationJson: att.a_json,
     });
     const receiptSigOk = verifySchnorrSignature(receiptJson, sigHex, this.ready.pubkey);
-    const fee = Math.max(0, Math.trunc(Number(this.offer.session_fee_msat ?? 0)));
+    const fee = offerSessionFeeMsat(this.offer);
 
     let usageMatch: boolean;
     let costWithinOffer = true;
@@ -815,8 +824,10 @@ export class ConfidentialSession {
       usageMatch = ru?.error_status === httpEarly.status;
       // Errors the provider answers before doing any work cost at most the session fee.
       const unbilled = httpEarly.status === 503 || (httpEarly.status >= 400 && httpEarly.status < 500);
-      if (unbilled && (receipt.cost_msats ?? 0) > fee) {
-        throw new ReceiptVerificationError(`node charged ${receipt.cost_msats} msats for an unbilled upstream error`);
+      if (unbilled && !feeOnlyChargeOk(receipt.cost_msats, fee)) {
+        throw new ReceiptVerificationError(
+          `node charged ${receipt.cost_msats} msats for an unbilled upstream error (session fee ${fee} msats)`,
+        );
       }
     } else {
       ownUsage = usageEventFromDisclosure(r) ?? undefined;
@@ -829,6 +840,7 @@ export class ConfidentialSession {
         ownUsage,
         priceEntry: this.offer.price_list[this.model],
         sessionFeeMsat: fee,
+        abandonFeeMsat: offerAbandonFeeMsat(this.offer),
       });
       usageMatch = checked.usageMatch;
       costWithinOffer = checked.costWithinOffer;

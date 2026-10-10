@@ -5,7 +5,7 @@
  * folded into the price list); both are read when present.
  */
 
-import type { ConfidentialPriceEntry, VerifiedOffer } from "./offer";
+import { offerAbandonFeeMsat, offerSessionFeeMsat, type ConfidentialPriceEntry, type VerifiedOffer } from "./offer";
 import type { NodeModel } from "./node-api";
 
 export interface ModelPricing {
@@ -16,6 +16,8 @@ export interface ModelPricing {
   promptLimit?: number;
   rates: ConfidentialPriceEntry;
   sessionFeeMsat: number;
+  /** Kept by the node when an armed (pre-warmed) session is never used. */
+  abandonFeeMsat: number;
   rateSurchargePct: number;
   /** Reservation the node holds while a session for `maxTokens` is open (msat). */
   reservationMsat?: number;
@@ -35,8 +37,7 @@ export function promptLimit(m: NodeModel | undefined): number | undefined {
 }
 
 export function sessionFeeMsat(offer: VerifiedOffer): number {
-  const f = offer.session_fee_msat;
-  return typeof f === "number" && Number.isFinite(f) && f > 0 ? Math.trunc(f) : 0;
+  return offerSessionFeeMsat(offer);
 }
 
 /** msat for a usage at the signed rates (+ the session fee), as the node computes it. */
@@ -70,6 +71,7 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
         promptLimit: limit,
         rates,
         sessionFeeMsat: fee,
+        abandonFeeMsat: offerAbandonFeeMsat(offer),
         rateSurchargePct: pct,
         maxTokens: mt,
         reservationMsat:

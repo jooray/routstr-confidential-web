@@ -21,7 +21,7 @@
  */
 
 import { ConfidentialError, SessionRejectedError } from "./errors";
-import { fetchConfidentialOffer, verifyConfidentialOffer, type VerifiedOffer } from "./offer";
+import { fetchConfidentialOffer, offerAbandonFeeMsat, verifyConfidentialOffer, type VerifiedOffer } from "./offer";
 import { NodeApi, type NodeModel } from "./node-api";
 import { modelPricing, type ModelPricing } from "./pricing";
 import { aggregateChatCompletion, buildPinnedBody, chooseBucket, padPinnedBody, requestedMaxTokens, SseParser } from "./request";
@@ -42,6 +42,11 @@ export interface PrewarmOptions {
   minBucket?: number;
   /** Retry delay after a failed arm (doubles up to 10 min). */
   backoffMs?: number;
+  /**
+   * Do not pre-warm when the node keeps more than this (msat) for a session
+   * that is armed but never used (the offer's abandon fee). Default 5000.
+   */
+  maxAbandonFeeMsat?: number;
 }
 
 export interface ConfidentialClientOptions {
@@ -121,6 +126,7 @@ const PREWARM_DEFAULTS = {
   onlyWhenVisible: true,
   minBucket: 4096,
   backoffMs: 30_000,
+  maxAbandonFeeMsat: 5000,
 };
 
 /**
@@ -248,6 +254,12 @@ class Prewarmer {
         return;
       }
       if (!(target.model in offer.price_list)) return;
+      const abandonFee = offerAbandonFeeMsat(offer);
+      if (abandonFee > this.cfg.maxAbandonFeeMsat) {
+        this.status = "off";
+        this.log("not arming: the node's abandon fee exceeds maxAbandonFeeMsat", { abandonFee });
+        return;
+      }
       const len = chooseBucket(this.maxBody, { minBucket: this.cfg.minBucket });
       const session = this.client.newSession(offer, cred, target.model, target.maxTokens, len);
       this.status = "arming";
