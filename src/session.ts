@@ -258,6 +258,23 @@ function timeout(ms: number, what: string): Promise<never> {
   return new Promise((_, rej) => setTimeout(() => rej(new ConfidentialTimeoutError(`timeout waiting for ${what}`)), ms));
 }
 
+/**
+ * Rejects after `ms` without activity: `last()` returns the time of the last
+ * progress (e.g. response data). For waits whose length depends on how long
+ * the provider streams, so a long answer is not mistaken for a stall.
+ */
+function idleTimeout(ms: number, what: string, last: () => number, stop: Promise<unknown>): Promise<never> {
+  return new Promise((_, rej) => {
+    const timer = setInterval(() => {
+      if (Date.now() - last() > ms) {
+        clearInterval(timer);
+        rej(new ConfidentialTimeoutError(`timeout waiting for ${what} (no response data for ${Math.round(ms / 1000)} s)`));
+      }
+    }, 1000);
+    stop.finally(() => clearInterval(timer)).catch(() => {});
+  });
+}
+
 function b64(b: Uint8Array): string {
   let s = "";
   for (const x of b) s += String.fromCharCode(x);
@@ -783,10 +800,13 @@ export class ConfidentialSession {
       },
     );
 
+    // The node attests after the provider closes the response, so the wait
+    // lasts as long as the answer streams: time out only on silence.
+    const attP = this.bus.wait("attestation");
     const att = (await Promise.race([
-      this.bus.wait("attestation"),
+      attP,
       this.errP,
-      timeout(this.timeouts.attestation, "attestation"),
+      idleTimeout(this.timeouts.attestation, "attestation", () => Math.max(this.tLastData, this.tBodyWrite), attP),
     ])) as { a?: unknown; a_json?: string; sig?: string };
     if (this.ready.pubkey !== this.offer.notary_pubkey) {
       throw new ReceiptVerificationError(
