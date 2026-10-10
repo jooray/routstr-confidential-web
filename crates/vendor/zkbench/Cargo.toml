@@ -14,7 +14,8 @@ mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da
 mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
 mpz-hash = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", default-features = false, features = ["sha256"] }
 futures = "0.3"
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.38", features = ["sync", "macros", "io-util"] }
+web-time = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
 rand = "0.10"
 sha2 = "0.10"
@@ -28,6 +29,16 @@ anyhow = "1"
 itybity = "0.2"
 async-trait = "0.1"
 serio = "0.2"
+
+# Native: the full tokio runtime (binaries, node side, tests). On wasm32 only
+# tokio's executor-agnostic parts (duplex, mpsc, Mutex, select!) are used and
+# tasks run on wasm-bindgen-futures (see `src/rt.rs`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [features]
 rayon = ["mpz-zk/rayon"]

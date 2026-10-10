@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use crate::rt::JoinHandle;
 
 /// Maximum payload of one mux frame.
 const MAX_MUX_FRAME: usize = 1 << 20;
@@ -69,7 +69,7 @@ impl Mux {
             remotes_w.push(rw);
             locals.push(local);
             let tx = tx.clone();
-            pumps.push(tokio::spawn(async move {
+            pumps.push(crate::rt::spawn(async move {
                 let mut buf = vec![0u8; PUMP_CHUNK];
                 loop {
                     match rr.read(&mut buf).await {
@@ -86,7 +86,7 @@ impl Mux {
         drop(tx);
 
         let c_w = counters.clone();
-        let writer = tokio::spawn(async move {
+        let writer = crate::rt::spawn(async move {
             while let Some((ch, data)) = rx.recv().await {
                 let mut hdr = [0u8; 5];
                 hdr[0] = ch;
@@ -105,7 +105,7 @@ impl Mux {
         });
 
         let c_r = counters.clone();
-        let reader = tokio::spawn(async move {
+        let reader = crate::rt::spawn(async move {
             let mut remotes_w = remotes_w;
             loop {
                 let mut hdr = [0u8; 5];
@@ -148,10 +148,10 @@ impl Mux {
     /// to the transport. The channel ends must have been dropped first.
     pub async fn close(mut self) {
         for p in self.pumps.drain(..) {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), p).await;
+            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), p).await;
         }
         if let Some(w) = self.writer.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), w).await;
+            let _ = crate::rt::timeout(std::time::Duration::from_secs(5), w).await;
         }
         self.reader.abort();
     }

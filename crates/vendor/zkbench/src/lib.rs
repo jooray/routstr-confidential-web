@@ -12,7 +12,9 @@ pub mod gadgets;
 pub mod proofs;
 pub mod statements;
 pub mod statements_v2;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
+pub mod rt;
 
 /// Which side of a proof we are building.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

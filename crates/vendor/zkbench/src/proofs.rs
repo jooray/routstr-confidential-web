@@ -12,11 +12,14 @@ use mpz_ot::{
 use mpz_vm_core::{Execute, memory::correlated::Delta, prelude::*};
 use mpz_zk::{Prover, ProverConfig, Verifier, VerifierConfig};
 use rand::RngExt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
 use crate::Role;
 use crate::statements::{Check, Params, Witness, build};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::transport::Counters;
 
 pub(crate) fn ferret_config() -> ferret::FerretConfig {
@@ -202,7 +205,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
     let witness_p = witness.clone();
     let params_v = params.clone();
 
-    let prover_task = tokio::spawn(async move {
+    let prover_task = crate::rt::spawn(async move {
         let checks = build(&mut prover, Role::Prover, &params_p, Some(&witness_p))?;
         let mut futs = Vec::with_capacity(checks.len());
         for c in &checks {
@@ -218,7 +221,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
         Ok::<_, anyhow::Error>(())
     });
 
-    let verifier_task = tokio::spawn(async move {
+    let verifier_task = crate::rt::spawn(async move {
         let checks = build(&mut verifier, Role::Verifier, &params_v, None)?;
         let mut futs = Vec::with_capacity(checks.len());
         for c in &checks {
@@ -315,6 +318,7 @@ fn sha256_blocks(len: usize) -> usize {
 }
 
 /// Outcome of a prover‖verifier run over an emulated transport.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct PairOutcome {
     pub checks: Vec<CheckResult>,
@@ -324,6 +328,7 @@ pub struct PairOutcome {
 }
 
 /// Run prover and verifier against each other over the emulated transport.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run_pair_transport(
     delay: Duration,
     rate: f64,

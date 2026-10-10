@@ -34,7 +34,7 @@
 //!   it, so a cheating prover can never probe a Δ more than once.
 
 use std::sync::Arc;
-use std::time::Instant;
+use crate::rt::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{AsyncRead, AsyncWrite};

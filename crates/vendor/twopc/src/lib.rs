@@ -25,8 +25,8 @@
 //! p.close().await;
 //! ```
 //!
-//! `Party::new` needs a running tokio runtime (it spawns the channel
-//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
+//! `Party::new` needs a running executor (it spawns the channel
+//! multiplexer: tokio natively, `wasm-bindgen-futures` on wasm32, see [`rt`]); `close` flushes the transport; `take_timings` returns per-step
 //! wall time and transport bytes.
 //!
 //! # Protocol
@@ -93,13 +93,15 @@ pub mod circuits;
 mod ectf;
 pub mod gc;
 mod mux;
+pub mod rt;
 #[doc(hidden)]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod testutil;
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
-use std::time::Instant;
+use rt::Instant;
 
 use futures::{AsyncRead, AsyncWrite};
 use mpz_common::{Context, Flush};
@@ -408,6 +410,30 @@ fn os_rng() -> StdRng {
     r
 }
 
+/// `[f(0), f(1)]` on two scoped threads while `body` runs on this one
+/// (natively); sequentially on wasm32, which has no threads.
+fn scope2<T, F, B>(f: &F, body: B) -> [T; 2]
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+    B: FnOnce(),
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::scope(|sc| {
+            let r0 = sc.spawn(|| f(0));
+            let r1 = sc.spawn(|| f(1));
+            body();
+            [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        body();
+        [f(0), f(1)]
+    }
+}
+
 fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 * v.len());
     for b in v {
@@ -647,7 +673,7 @@ impl Party {
         if *TRACE {
             let c = self.counters.clone();
             let who = if self.role == Role::C { "C" } else { "N" };
-            tokio::spawn(async move {
+            rt::spawn(async move {
                 let t0 = Instant::now();
                 let mut last = (0, 0);
                 for _ in 0..200 {
@@ -656,7 +682,7 @@ impl Party {
                         eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
                         last = v;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    rt::sleep(std::time::Duration::from_millis(100)).await;
                 }
             });
         }
@@ -680,7 +706,7 @@ impl Party {
         let c_bits = spec(0).c_bits + spec(1).c_bits;
         let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
 
-        let garble = tokio::task::spawn_blocking(move || {
+        let garble = rt::spawn_blocking(move || {
             (0..2)
                 .map(|p| {
                     let s = spec(p);
@@ -737,7 +763,7 @@ impl Party {
                     && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
                     && t0.elapsed() < TABLES_MAX_WAIT
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    rt::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
         };
@@ -842,7 +868,7 @@ impl Party {
         // Product check, openings, consistency-check material (CPU, blocking).
         let mask_bits = mask_bits.to_vec();
         let mask_macs = mask_macs.to_vec();
-        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
+        let (st, keys, msgs) = rt::spawn_blocking(move || {
             // Check rows and Y_N per phase.
             let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
                 let (lam, mac, t_mac) = &st[p];
@@ -885,9 +911,7 @@ impl Party {
                 (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
             };
             let mut msgs: Vec<Vec<u8>> = Vec::new();
-            let rows = std::thread::scope(|sc| {
-                let r0 = sc.spawn(|| rows_of(0));
-                let r1 = sc.spawn(|| rows_of(1));
+            let rows = scope2(&rows_of, || {
                 let mut acc = (Block::ZERO, Block::ZERO);
                 for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
                     let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
@@ -932,7 +956,6 @@ impl Party {
                 let mut open = from_bits(&bits);
                 open.extend_from_slice(&hd);
                 msgs.push(open);
-                [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
             });
             for (r, y) in rows {
                 msgs.push(r);
@@ -1045,7 +1068,7 @@ impl Party {
         let chi_dv = chi(&seed, b"dvzk");
         let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
         let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
-        let compute = tokio::task::spawn_blocking(move || {
+        let compute = rt::spawn_blocking(move || {
             let mut off = 0;
             let mut per = Vec::new();
             let mut acc = Block::ZERO;
@@ -1444,7 +1467,7 @@ impl Party {
             && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
 
         let circ = s.circ.clone();
-        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
+        let (ok_check, out_labels) = rt::spawn_blocking(move || {
             let l = gc::evaluate(&circ, &inl, &tables, phase);
             let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
             let out: Vec<Block> = circ.outputs().map(|w| l[w]).collect();
