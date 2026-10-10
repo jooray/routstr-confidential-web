@@ -911,7 +911,10 @@ export class ConfidentialSession {
   async run(body: Uint8Array): Promise<ConfidentialSessionResult> {
     const tClaim = Date.now();
     await this.arm();
-    return this.claim(body, tClaim);
+    await this.prepareProofs();
+    // Armed inside this request, so it is a cold request even though the key
+    // share is ready by now.
+    return this.finish(body, tClaim, false);
   }
 
   /** Abort an unclaimed session; the node releases its reservation (minus any session fee). */
