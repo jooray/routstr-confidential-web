@@ -187,6 +187,11 @@ export interface ConfidentialSessionResult {
   proofs: string[];
   /** True when the session was armed before the request (pre-warmed). */
   prewarmed: boolean;
+  /**
+   * The request arrived while its session was still arming and waited this
+   * long for the arm to finish (counted in `ttftMs` and `totalMs`).
+   */
+  waitedForArmMs?: number;
   protocol: number;
   nodePubkey: string;
 }
@@ -308,6 +313,20 @@ function indexOfCrlfCrlf(b: Uint8Array): number {
     if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
   }
   return -1;
+}
+
+/**
+ * How a claimed session relates to its request: pre-warmed only if the arm had
+ * finished when the request was made (`tClaim`); a request that arrived while
+ * the arm was running waited `waitedForArmMs` for it.
+ */
+export function claimTiming(
+  tClaim: number,
+  tArmed: number,
+  armingBefore: boolean,
+): { prewarmed: boolean; waitedForArmMs?: number } {
+  const prewarmed = tArmed > 0 && tArmed <= tClaim;
+  return { prewarmed, waitedForArmMs: armingBefore && tArmed > tClaim ? tArmed - tClaim : undefined };
 }
 
 export class ConfidentialSession {
@@ -752,15 +771,25 @@ export class ConfidentialSession {
     this.absSpans.push({ name: PROOF_LABEL[proof], lane: "proofs", start: t, end: Date.now() });
   }
 
-  /** Serve one request on this session (arming it first if needed). */
+  /**
+   * Serve one request on this session (arming it first if needed). `tClaim` is
+   * when the request was made: a caller that first waited for this session's
+   * arm passes the time before that wait, so the wait counts in the timings.
+   */
   async claim(body: Uint8Array, tClaim = Date.now()): Promise<ConfidentialSessionResult> {
-    const prewarmed = this.keyShareReady;
+    const armingBefore = this.armStarted;
     if (!this.armStarted) await this.arm();
     await this.prepareProofs();
-    return this.finish(body, tClaim, prewarmed);
+    const { prewarmed, waitedForArmMs } = claimTiming(tClaim, this.tArmed, armingBefore);
+    return this.finish(body, tClaim, prewarmed, waitedForArmMs);
   }
 
-  private async finish(body: Uint8Array, tClaim: number, prewarmed: boolean): Promise<ConfidentialSessionResult> {
+  private async finish(
+    body: Uint8Array,
+    tClaim: number,
+    prewarmed: boolean,
+    waitedForArmMs?: number,
+  ): Promise<ConfidentialSessionResult> {
     if (!this.prepared) throw new SessionProtocolError("finish before prepareProofs");
     if (body.length !== this.bodyLength) {
       throw new SessionProtocolError(`body length ${body.length} != declared setup len ${this.bodyLength}`);
@@ -975,6 +1004,7 @@ export class ConfidentialSession {
       timings,
       proofs: ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
       prewarmed,
+      waitedForArmMs,
       protocol: 2,
       nodePubkey: this.ready.pubkey,
     };

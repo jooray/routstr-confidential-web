@@ -455,6 +455,9 @@ export class ConfidentialClient {
     const body = buildPinnedBody(params, model, maxTokens);
     const suffix = canonicalSuffix(model, maxTokens);
     const pw = this.prewarmer;
+    // The request's start: a warm request may first wait for an arm still in
+    // progress, and that wait belongs in its timings.
+    const tRequest = Date.now();
     pw?.noteBody(body.length);
     pw?.setTarget(model, maxTokens);
     const lease = pw?.take(model, maxTokens, body.length);
@@ -509,7 +512,7 @@ export class ConfidentialClient {
       attach(s);
       this.emit({ ev: "request", path: "warm", model });
       try {
-        return await s.claim(padPinnedBody(body, s.bodyLength, suffix));
+        return await s.claim(padPinnedBody(body, s.bodyLength, suffix), tRequest);
       } catch (e) {
         // Before the credential record is released nothing reached the
         // provider: retry once on a cold session. Never after.
