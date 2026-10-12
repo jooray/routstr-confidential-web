@@ -60,8 +60,8 @@ describe("π_C2S / π_C3S windows are our own data", () => {
       off: ctLen - w,
       w,
       sel_start: w - 1 - suffix.length,
-      sel_len: suffix.length,
-      expected: [...suffix],
+      sel_len: suffix.length + 1,
+      expected: [...suffix, 0x17],
     },
   };
   const own = { h1, seq: 2, record, suffix };
@@ -78,6 +78,9 @@ describe("π_C2S / π_C3S windows are our own data", () => {
     earlier.PiC2S.seq = 0;
     expect(() => checkPiC2SParams(earlier, own)).toThrow(SessionProtocolError);
     expect(() => checkPiC2SParams(honest, { ...own, h1: new Uint8Array(32) })).toThrow(/h1/);
+    // The bare suffix, without the record's content type byte, is not enough.
+    const bare = { PiC2S: { ...honest.PiC2S, sel_len: suffix.length, expected: [...suffix] } };
+    expect(() => checkPiC2SParams(bare, own)).toThrow(SessionProtocolError);
   });
 
   it("π_C3S must cover exactly the final records we received", () => {

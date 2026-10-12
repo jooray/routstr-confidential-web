@@ -665,8 +665,6 @@ export class ConfidentialSession {
       max_tokens: this.maxTokens,
       len: this.bodyLength,
       armed: true,
-      // Let the suffix proof also pin the final record's content type.
-      suffix_type: true,
     };
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     // Accept that offer's fees explicitly (the node refuses a setup that does
