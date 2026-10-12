@@ -4,7 +4,8 @@ import { SessionProtocolError } from "../src/errors.js";
 
 describe("π_NK statement rebuilt from the signed offer", () => {
   const offer = {
-    head_template: "POST / HTTP/1.1\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n",
+    head_template: "POST / HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n",
+    upstream_host: "api.example.com",
     key_length: 4,
     key_alphabet: "[A-Za-z0-9_-]",
   };

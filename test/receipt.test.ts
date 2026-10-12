@@ -71,13 +71,20 @@ describe("receipt verification", () => {
     const receiptJson = canonicalJson(receipt);
     const sig = sign(receiptJson, priv);
     expect(parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s1", attestationJson: aJson }).cost_msats).toBe(5);
-    expect(() => parseSignedReceipt({ receiptJson, sig: undefined, pubkey: pubHex, sid: "s1" })).toThrow(
+    expect(() => parseSignedReceipt({ receiptJson, sig: undefined, pubkey: pubHex, sid: "s1", attestationJson: aJson })).toThrow(
       ReceiptVerificationError,
     );
     expect(() =>
-      parseSignedReceipt({ receiptJson: receiptJson.replace('"cost_msats":5', '"cost_msats":1'), sig, pubkey: pubHex, sid: "s1" }),
+      parseSignedReceipt({ receiptJson: receiptJson.replace('"cost_msats":5', '"cost_msats":1'), sig, pubkey: pubHex, sid: "s1", attestationJson: aJson }),
     ).toThrow(ReceiptVerificationError);
-    expect(() => parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s2" })).toThrow(/not s2/);
+    expect(() => parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s2", attestationJson: aJson })).toThrow(/not s2/);
+    // A signed receipt without an attestation hash is bound to nothing.
+    const unbound = canonicalJson({ sid: "s1", model: "m", cost_msats: 5 });
+    expect(() =>
+      parseSignedReceipt({ receiptJson: unbound, sig: sign(unbound, priv), pubkey: pubHex, sid: "s1", attestationJson: aJson }),
+    ).toThrow(/attestation/);
+    // No signed rate for the model: no cost is accepted.
+    expect(verifyReceipt({ receipt: { sid: "s1", model: "m", cost_msats: 0 } as never, ownUsage: { model: "m", usage: { prompt_tokens: 1, completion_tokens: 1 } } as never }).costWithinOffer).toBe(false);
     expect(() => parseSignedReceipt({ receiptJson, sig, pubkey: pubHex, sid: "s1", attestationJson: "{}" })).toThrow(
       /attestation/,
     );

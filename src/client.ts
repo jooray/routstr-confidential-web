@@ -274,7 +274,7 @@ export class Prewarmer {
         this.log("not arming: available balance below one reservation", { available, need });
         return;
       }
-      if (!(target.model in offer.price_list)) return;
+      if (!Object.hasOwn(offer.price_list, target.model)) return;
       const abandonFee = offerAbandonFeeMsat(offer);
       if (abandonFee > this.cfg.maxAbandonFeeMsat) {
         this.status = "off";
@@ -448,7 +448,7 @@ export class ConfidentialClient {
     if (!auth) throw new ConfidentialError("not_configured", "no credential: fund the wallet or paste an sk- key");
     const offer = await this.offer(freshOffer);
     const model = params.model;
-    if (!(model in offer.price_list)) {
+    if (!Object.hasOwn(offer.price_list, model)) {
       throw new ConfidentialError("offer_malformed", `the node does not serve ${model} confidentially`);
     }
     const maxTokens = requestedMaxTokens(params, Number(offer.max_tokens_cap ?? 4096));

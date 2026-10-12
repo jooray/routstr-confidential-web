@@ -377,6 +377,12 @@ export class ConfidentialSession {
 
   private responseChunks: Uint8Array[] = [];
   private serverRecords: Uint8Array[] = [];
+  /** Encrypted server records seen after the handshake, and KeyUpdates among them. */
+  private postHandshake = false;
+  private serverPostRecords = 0;
+  private serverKeyUpdates = 0;
+  /** Post-handshake index of the first record of the current server key epoch. */
+  private serverEpochStart = 0;
   private serverPending: Uint8Array = new Uint8Array(0);
   private epochBody = false;
   private bodyRecords: Uint8Array[] = [];
@@ -558,7 +564,17 @@ export class ConfidentialSession {
         if (this.epochBody) this.bodyRecords.push(record);
         this.sendBytes(record);
       },
-      onRead: () => {},
+      // Server KeyUpdates (encrypted, so only we see them) move the response
+      // to the next key epoch; π_C3S must derive that epoch's key and count
+      // sequence numbers from its first record.
+      onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
+        if (!this.postHandshake || ctx?.type !== "ciphertext") return;
+        const index = this.serverPostRecords++;
+        if (ctx.contentType === "HANDSHAKE" && containsKeyUpdate(rec.content)) {
+          this.serverKeyUpdates += 1;
+          this.serverEpochStart = index + 1;
+        }
+      },
       onRecvCertificates: ({ certificates, verifiedPath }: { certificates: any[]; verifiedPath?: any[] }) => {
         // Called only after the fork validated the chain to a bundled Mozilla
         // root and matched the hostname (it throws otherwise).
@@ -600,7 +616,10 @@ export class ConfidentialSession {
       onTlsEnd: () => {
         this.tlsEnded = true;
       },
-      onHandshake: () => this.handshakeDone?.(),
+      onHandshake: () => {
+        this.postHandshake = true;
+        this.handshakeDone?.();
+      },
       logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
     }) as TlsHandle;
   }
@@ -646,6 +665,8 @@ export class ConfidentialSession {
       max_tokens: this.maxTokens,
       len: this.bodyLength,
       armed: true,
+      // Let the suffix proof also pin the final record's content type.
+      suffix_type: true,
     };
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     // Accept that offer's fees explicitly (the node refuses a setup that does
@@ -875,10 +896,25 @@ export class ConfidentialSession {
       this.responseChunks.map((c) => c.length),
       r.length + skip,
     );
-    this.sendText({ type: "disclose", r: hex(r), tail_lens: tailLens, skip });
+    const disclose: Record<string, unknown> = { type: "disclose", r: hex(r), tail_lens: tailLens, skip };
+    if (this.serverKeyUpdates > 0) {
+      disclose.key_updates = this.serverKeyUpdates;
+      disclose.epoch_start = this.serverEpochStart;
+    }
+    this.sendText(disclose);
 
     const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
-    checkPiC3SParams(c3.params, { h2: this.ap!.h2, serverRecords: this.serverRecords, r, skip });
+    // Wire index of sequence 0 of the covered records' epoch: the records
+    // before the post-handshake ones are the encrypted server flight.
+    const handshakeRecords = this.serverRecords.length - this.serverPostRecords;
+    checkPiC3SParams(c3.params, {
+      h2: this.ap!.h2,
+      serverRecords: this.serverRecords,
+      r,
+      skip,
+      keyUpdates: this.serverKeyUpdates,
+      epochBase: handshakeRecords >= 0 ? handshakeRecords + this.serverEpochStart : undefined,
+    });
     await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
     this.twoPc?.close();
     this.zkChan?.close();
@@ -896,7 +932,8 @@ export class ConfidentialSession {
       sig: sigHex,
       pubkey: this.ready.pubkey,
       sid: this.sid,
-      attestationJson: att.a_json,
+      // The bytes whose signature and session binding were checked above.
+      attestationJson: attJson,
     });
     const receiptSigOk = verifySchnorrSignature(receiptJson, sigHex, this.ready.pubkey);
     const fee = offerSessionFeeMsat(this.offer);
@@ -1039,4 +1076,14 @@ export class ConfidentialSession {
       await new Promise((r2) => setTimeout(r2, 5));
     }
   }
+}
+
+/** Whether a decrypted handshake record carries a KeyUpdate message (type 24). */
+function containsKeyUpdate(content: Uint8Array): boolean {
+  let i = 0;
+  while (i + 4 <= content.length) {
+    if (content[i] === 24) return true;
+    i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!);
+  }
+  return false;
 }
