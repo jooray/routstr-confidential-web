@@ -7,6 +7,8 @@ provider API key, with every check done by the page itself.
 Introduction: [Confidential inference on Routstr without trusted hardware](https://juraj.bednar.io/en/blog-en/2026/10/10/confidential-inference-on-routstr-without-trusted-hardware/)
 (blog post).
 
+For more depth, there is a programmer's guide, [How routstr confidential mode works](https://juraj.bednar.io/wp-content/uploads/2026/10/routstr-confidential-for-programmers.pdf) (PDF, 72 pages; in Slovak: [Ako funguje dôverný režim routstr](https://juraj.bednar.io/wp-content/uploads/2026/10/routstr-confidential-pre-programatorov.pdf)), and a gentler explanation of the protocol as a magic show, [Seven magic tricks inside one AI request](https://juraj.bednar.io/en/blog-en/2026/10/12/seven-magic-tricks-inside-one-ai-request/), with an illustrated video (in Slovak: [Sedem kúzelníckych trikov v jednej AI požiadavke](https://juraj.bednar.io/blog/2026/10/12/sedem-kuzelnickych-trikov-v-jednej-ai-poziadavke/)).
+
 - The TypeScript library at the repository root (`@routstr/confidential-web`, ESM),
   `createConfidentialClient(...)` → `client.chat.completions.create({...,
   stream: true})`, OpenAI-style. It is "routstrd as a library" for confidential
