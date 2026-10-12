@@ -309,7 +309,7 @@ pub fn spawn_prover_job(job: &[u8], out: Out) -> UnboundedSender<Frame> {
 /// The zkbench v2 fixtures (`pi_nk`, `pi_c2s`, `pi_c3s`: params + witness),
 /// for benchmarks against the bench node. Test data only.
 pub fn fixtures_v2_json() -> String {
-    let v: Vec<Value> = zkbench::fixtures::all_v2()
+    let v: Vec<Value> = zkbench::fixtures::all()
         .into_iter()
         .map(|(name, p, w)| json!({"proof":name,"params":p,"witness":w}))
         .collect();

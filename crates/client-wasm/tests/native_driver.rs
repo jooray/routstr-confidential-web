@@ -117,7 +117,7 @@ async fn zkchan_driver_against_node_channel() {
     let (node_io, mut ev, input) = wire(|o| driver::spawn_zkchan(Prealloc::default(), o));
     let node = tokio::spawn(async move {
         let mut ch = ZkChannel::open(node_io.compat(), Party::Node, Prealloc::default()).await.unwrap();
-        let fx = zkbench::fixtures::all_v2();
+        let fx = zkbench::fixtures::all();
         let mut served = Vec::new();
         while let Ok(Some(req)) = ch.next_request().await {
             let (_, params, witness) = fx.iter().find(|(n, _, _)| *n == req.proof).unwrap();
@@ -129,7 +129,7 @@ async fn zkchan_driver_against_node_channel() {
     });
     next_ev(&mut ev, "ready").await;
     eprintln!("zkchan: ready");
-    for (i, (name, params, witness)) in zkbench::fixtures::all_v2().into_iter().enumerate() {
+    for (i, (name, params, witness)) in zkbench::fixtures::all().into_iter().enumerate() {
         let c = if name == "pi_nk" {
             json!({"cmd":"verify","id":i,"proof":name,"params":params,"witness":null})
         } else {
@@ -141,7 +141,7 @@ async fn zkchan_driver_against_node_channel() {
         eprintln!("zkchan: {name} ok");
     }
     // The client may not prove what the node proves.
-    let (_, nk_params, nk_w) = zkbench::fixtures::all_v2().remove(0);
+    let (_, nk_params, nk_w) = zkbench::fixtures::all().remove(0);
     cmd(&input, json!({"cmd":"prove","id":9,"proof":"pi_nk","params":nk_params,"witness":nk_w}));
     let d = next_ev(&mut ev, "done").await;
     assert_eq!(d["ok"], false);

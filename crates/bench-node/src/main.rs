@@ -109,7 +109,7 @@ async fn handle(tcp: TcpStream) -> Result<()> {
             use zkbench::channel::{Party, Prealloc, ZkChannel};
             let io = ws_bridge(ws);
             let mut ch = ZkChannel::open(io.compat(), Party::Node, Prealloc::default()).await?;
-            let fx = zkbench::fixtures::all_v2();
+            let fx = zkbench::fixtures::all();
             while let Some(req) = ch.next_request().await? {
                 let Some((_, params, witness)) = fx.iter().find(|(n, _, _)| *n == req.proof) else {
                     bail!("unknown proof {}", req.proof);
@@ -242,7 +242,7 @@ async fn native_client(base: &str) -> Result<Value> {
     let ready = wait_ev(&mut zev, "ready", &mut zsteps).await?;
     let t_zready = t0.elapsed();
     let mut proofs = serde_json::Map::new();
-    for (i, (name, params, witness)) in zkbench::fixtures::all_v2().into_iter().enumerate() {
+    for (i, (name, params, witness)) in zkbench::fixtures::all().into_iter().enumerate() {
         let cmd = if name == "pi_nk" {
             json!({"cmd":"verify","id":i,"proof":name,"params":params,"witness":null})
         } else {

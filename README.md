@@ -223,7 +223,7 @@ exported as `patches/routstr-confidential-wasm32.patch` with an explanation in
 `patches/README.md`, for upstreaming. Once it is upstream, the vendored copies
 can become a git dependency on that repository. Later upstream changes are
 applied to the vendored copies as they land; `twopc` and `zkbench` currently
-match `twopc-v2@5a573c6` (plus the wasm32 patch). mpz2 is pinned at the same rev
+match `twopc-v2@5abd8c9` (plus the wasm32 patch). mpz2 is pinned at the same rev
 (`8f89783`) and needed no change. The TS sources `offer.ts`, `receipt.ts`,
 `params.ts`, `suffix.ts`, `hosts.ts`, `canonical.ts`, `errors.ts` and the TLS
 fork come from routstr-sdk (`confidential-2pc`, commit `abfd9a6`) with
