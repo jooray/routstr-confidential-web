@@ -87,15 +87,19 @@ describe("π_C2S / π_C3S windows are our own data", () => {
     const h2 = new Uint8Array(32).fill(2);
     const recs = [new Uint8Array(60).fill(1), new Uint8Array(80).fill(2), new Uint8Array(70).fill(3)];
     const r = new Uint8Array(40).fill(9);
-    const params = (records: { seq: number; ct: number[] }[], skip = 0, anchor = h2) => ({
+    const params = (records: { seq: number; ct: number[]; off?: number }[], skip = 0, anchor = h2) => ({
       PiC3S: { h2: [...anchor], records, expected: [...r], skip },
     });
+    // The first covered record is decrypted from its last block boundary that
+    // still covers R (here 48: R fits in the last record).
     const tail = [
-      { seq: 1, ct: [...recs[1]!.subarray(0, 64)] },
+      { seq: 1, ct: [...recs[1]!.subarray(48, 64)], off: 48 },
       { seq: 2, ct: [...recs[2]!.subarray(0, 54)] },
     ];
     const ownC3 = { h2, serverRecords: recs, r, skip: 0 };
     expect(() => checkPiC3SParams(params(tail), ownC3)).not.toThrow();
+    const whole = [{ seq: 1, ct: [...recs[1]!.subarray(0, 64)] }, tail[1]!];
+    expect(() => checkPiC3SParams(params(whole), ownC3)).toThrow(/offset/);
     expect(() => checkPiC3SParams(params([{ seq: 0, ct: [...recs[0]!.subarray(0, 44)] }]), ownC3)).toThrow(
       SessionProtocolError,
     );
