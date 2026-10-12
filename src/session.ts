@@ -24,6 +24,7 @@
 
 import { verifySchnorrSignature } from "./canonical.js";
 import { concat, hex, randomHex, sha256 } from "./bytes.js";
+import { sha256 as nobleSha256 } from "@noble/hashes/sha2";
 import {
   ConfidentialTimeoutError,
   ReceiptVerificationError,
@@ -32,7 +33,7 @@ import {
   SessionRejectedError,
 } from "./errors.js";
 import { matchHostname } from "./hosts.js";
-import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams } from "./params.js";
+import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params.js";
 import { WasmProverBackend } from "./prover.js";
 import { checkAttestationBinding, feeOnlyChargeOk, parseSignedReceipt, verifyReceipt } from "./receipt.js";
 import {
@@ -377,13 +378,17 @@ export class ConfidentialSession {
 
   private responseChunks: Uint8Array[] = [];
   private serverRecords: Uint8Array[] = [];
-  /** Encrypted server records seen after the handshake, and KeyUpdates among them. */
+  /** Encrypted server records seen after the handshake (π_C3S key epoch). */
   private postHandshake = false;
-  private serverPostRecords = 0;
-  private serverKeyUpdates = 0;
-  /** Post-handshake index of the first record of the current server key epoch. */
-  private serverEpochStart = 0;
+  private serverPost: ServerPostRecord[] = [];
   private serverPending: Uint8Array = new Uint8Array(0);
+  /** Every upstream byte and complete record received (checked against the attestation). */
+  private readonly recvHash = nobleSha256.create();
+  private recvRecords = 0;
+  /** The node's head-record commitment, from its c_commit frame. */
+  private cCommitHex?: string;
+  /** SHA-256 of the provider's certificate DERs as sent, concatenated. */
+  private certChainHash?: Uint8Array;
   private epochBody = false;
   private bodyRecords: Uint8Array[] = [];
   private responseBytes: Uint8Array = new Uint8Array(0);
@@ -569,15 +574,15 @@ export class ConfidentialSession {
       // sequence numbers from its first record.
       onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
         if (!this.postHandshake || ctx?.type !== "ciphertext") return;
-        const index = this.serverPostRecords++;
-        if (ctx.contentType === "HANDSHAKE" && containsKeyUpdate(rec.content)) {
-          this.serverKeyUpdates += 1;
-          this.serverEpochStart = index + 1;
-        }
+        this.serverPost.push({
+          data: ctx.contentType === "APPLICATION_DATA",
+          keyUpdates: ctx.contentType === "HANDSHAKE" ? countKeyUpdates(rec.content) : 0,
+        });
       },
       onRecvCertificates: ({ certificates, verifiedPath }: { certificates: any[]; verifiedPath?: any[] }) => {
         // Called only after the fork validated the chain to a bundled Mozilla
         // root and matched the hostname (it throws otherwise).
+        this.certChainHash = sha256(...certificates.map((c: any) => new Uint8Array(c.internal.rawData as ArrayBuffer)));
         const path = verifiedPath ?? certificates;
         const leaf = path[0];
         const names: string[] = leaf?.getAlternativeDNSNames?.() ?? [];
@@ -625,10 +630,12 @@ export class ConfidentialSession {
   }
 
   private trackServerRecords(bytes: Uint8Array): void {
+    this.recvHash.update(bytes);
     let buf = concat(this.serverPending, bytes);
     while (buf.length >= 5) {
       const len = (buf[3]! << 8) | buf[4]!;
       if (buf.length < 5 + len) break;
+      this.recvRecords += 1;
       if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len));
       buf = buf.subarray(5 + len);
     }
@@ -751,6 +758,7 @@ export class ConfidentialSession {
     if (!this.ap) throw new SessionProtocolError("prepareProofs before arm");
     this.tNkStart = Date.now();
     const commit = await this.waitT("c_commit", this.timeouts.cCommit);
+    if (typeof commit.c_commit === "string") this.cCommitHex = commit.c_commit;
     for (const k of ["h1", "h2", "hk"] as const) {
       if (commit[k] !== undefined && commit[k] !== hex(this.ap[k])) {
         throw new SessionProtocolError(`c_commit: ${k} differs from our 2PC output`);
@@ -870,7 +878,15 @@ export class ConfidentialSession {
     const attOk = verifySchnorrSignature(attJson, att.sig, this.ready.pubkey);
     this.event({ ev: "attestation", sig_ok: attOk });
     if (!attOk) throw new ReceiptVerificationError("attestation signature invalid");
-    checkAttestationBinding(attJson, { sid: this.sid, thSH: this.thSH, thSF: this.thSF });
+    checkAttestationBinding(attJson, {
+      sid: this.sid,
+      thSH: this.thSH,
+      thSF: this.thSF,
+      cCommit: this.cCommitHex,
+      certChainHash: this.certChainHash,
+      serverRecords: this.recvRecords,
+      recvSha256: this.recvHash.clone().digest(),
+    });
 
     await this.settleFlush();
     await c2Promise;
@@ -894,24 +910,32 @@ export class ConfidentialSession {
       this.responseChunks.map((c) => c.length),
       r.length + skip,
     );
-    const disclose: Record<string, unknown> = { type: "disclose", r: hex(r), tail_lens: tailLens, skip };
-    if (this.serverKeyUpdates > 0) {
-      disclose.key_updates = this.serverKeyUpdates;
-      disclose.epoch_start = this.serverEpochStart;
+    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
+    const disclose: Record<string, unknown> = {
+      type: "disclose",
+      r: hex(r),
+      tail_lens: tailLens,
+      skip,
+      trailing: epoch.trailing,
+    };
+    if (epoch.keyUpdates > 0) {
+      disclose.key_updates = epoch.keyUpdates;
+      disclose.epoch_start = epoch.epochStart;
     }
     this.sendText(disclose);
 
     const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
     // Wire index of sequence 0 of the covered records' epoch: the records
     // before the post-handshake ones are the encrypted server flight.
-    const handshakeRecords = this.serverRecords.length - this.serverPostRecords;
+    const handshakeRecords = this.serverRecords.length - this.serverPost.length;
     checkPiC3SParams(c3.params, {
       h2: this.ap!.h2,
       serverRecords: this.serverRecords,
       r,
       skip,
-      keyUpdates: this.serverKeyUpdates,
-      epochBase: handshakeRecords >= 0 ? handshakeRecords + this.serverEpochStart : undefined,
+      keyUpdates: epoch.keyUpdates,
+      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
+      trailing: epoch.trailing,
     });
     await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
     this.twoPc?.close();
@@ -1076,12 +1100,13 @@ export class ConfidentialSession {
   }
 }
 
-/** Whether a decrypted handshake record carries a KeyUpdate message (type 24). */
-function containsKeyUpdate(content: Uint8Array): boolean {
+/** KeyUpdate messages (type 24) in a decrypted handshake record. */
+function countKeyUpdates(content: Uint8Array): number {
+  let n = 0;
   let i = 0;
   while (i + 4 <= content.length) {
-    if (content[i] === 24) return true;
+    if (content[i] === 24) n++;
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!);
   }
-  return false;
+  return n;
 }

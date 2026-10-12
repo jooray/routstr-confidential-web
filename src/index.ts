@@ -26,6 +26,7 @@ export * from "./errors.js";
 export {
   fetchConfidentialOffer,
   offerAbandonFeeMsat,
+  offerReserveMarginTokens,
   offerSessionFeeMsat,
   verifyConfidentialOffer,
   verifyOfferSignature,

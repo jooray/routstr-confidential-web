@@ -74,6 +74,12 @@ export interface ConfidentialOffer {
    * rates for confidential sessions. `price_list` already includes it.
    */
   rate_surcharge_pct?: number;
+  /**
+   * Completion tokens the node reserves beyond `max_tokens` (a provider may
+   * bill a few past the cap). Only the reservation grows; the charge is still
+   * the usage.
+   */
+  reserve_margin_tokens?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
@@ -128,7 +134,23 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
       throw new OfferMalformedError(`offer is missing required field '${key}'`);
     }
   }
-  if (typeof offer.v !== "number") throw new OfferMalformedError("offer.v is not a number");
+  if (typeof offer.v !== "number" || !Number.isSafeInteger(offer.v)) {
+    throw new OfferMalformedError("offer.v is not an integer");
+  }
+  for (const key of ["min_v", "max_v"] as const) {
+    const bound = offer[key];
+    if (bound !== undefined && (typeof bound !== "number" || !Number.isSafeInteger(bound))) {
+      throw new OfferMalformedError(`offer.${key} is not an integer`);
+    }
+  }
+  // The offered range must contain the version the offer itself runs.
+  const minV = (offer.min_v ?? offer.v) as number;
+  const maxV = (offer.max_v ?? offer.v) as number;
+  if (!(minV <= offer.v && offer.v <= maxV)) {
+    throw new OfferMalformedError(
+      `offer version v=${offer.v} lies outside its own range min_v=${minV} max_v=${maxV}`,
+    );
+  }
   if (typeof offer.upstream_host !== "string" || !offer.upstream_host) {
     throw new OfferMalformedError("offer.upstream_host is not a non-empty string");
   }
@@ -177,6 +199,11 @@ function feeValue(fee: unknown): number {
   return typeof fee === "number" && Number.isSafeInteger(fee) && fee > 0 ? fee : 0;
 }
 
+/** The signed offer's completion-token margin on the reservation (0 when none). */
+export function offerReserveMarginTokens(offer: Pick<ConfidentialOffer, "reserve_margin_tokens">): number {
+  return feeValue(offer.reserve_margin_tokens);
+}
+
 /** The signed offer's session fee in msats (0 when the node charges none). */
 export function offerSessionFeeMsat(offer: Pick<ConfidentialOffer, "session_fee_msat">): number {
   return feeValue(offer.session_fee_msat);
@@ -213,6 +240,8 @@ export function supportedVersion(offer: ConfidentialOffer): boolean {
   const min = offer.min_v ?? offer.v;
   const max = offer.max_v ?? offer.v;
   return (
+    min <= offer.v &&
+    offer.v <= max &&
     offer.v >= CONFIDENTIAL_VERSION_MIN &&
     offer.v <= CONFIDENTIAL_VERSION_MAX &&
     min <= CONFIDENTIAL_VERSION_MAX &&

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Prewarmer } from "../src/client";
 
 /** A fake session whose arm() resolves when the test says so. */
@@ -100,5 +100,56 @@ describe("pre-warm pool", () => {
     await tick();
     expect(got).toBe(sessions[0]!.s);
     pw.stop?.();
+  });
+
+  it("backs off, doubling, when armed sessions keep dying before use", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { client, sessions } = fakeClient();
+      const pw = new Prewarmer(client as never, { onlyWhenVisible: false, backoffMs: 30_000 });
+      const killArmed = async () => {
+        await tick();
+        sessions[sessions.length - 1]!.finish();
+        await tick();
+        sessions[sessions.length - 1]!.s.healthy = false;
+        (pw as unknown as { tick(): void }).tick();
+        await tick();
+      };
+      pw.setTarget("m", 100);
+      await killArmed();
+      expect(sessions.length).toBe(1);
+      expect(pw.status).toBe("backoff");
+      pw.activity(); // traffic does not override the backoff
+      await tick();
+      expect(sessions.length).toBe(1);
+      vi.advanceTimersByTime(31_000);
+      pw.activity();
+      await killArmed();
+      expect(sessions.length).toBe(2);
+      vi.advanceTimersByTime(31_000); // the second death waits 60 s
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(2);
+      vi.advanceTimersByTime(30_000);
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(3);
+      // A warm request served resets the count.
+      sessions[2]!.finish();
+      await tick();
+      const lease = pw.take("m", 100, 300);
+      expect(lease).toBeDefined();
+      pw.servedWarm();
+      pw.activity();
+      await killArmed(); // arms the next one and it dies: back to 30 s
+      expect(sessions.length).toBe(4);
+      vi.advanceTimersByTime(31_000);
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(5);
+      pw.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

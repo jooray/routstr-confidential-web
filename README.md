@@ -65,7 +65,9 @@ on the node. It is tested against the production node
    verifies the node-signed attestation and the **signed receipt**: the
    signature, the binding to this session, usage equal to its own plaintext,
    and cost ≤ usage × signed rates + signed fee. A stream ends cleanly only
-   after all of these pass. Any failure throws.
+   after all of these pass. Any failure throws, from the stream's iterator
+   and from `stream.verification`. A consumer that leaves the loop early (on
+   `finish_reason`, say) must await `stream.verification` to see it.
 
 The protocol and its security argument are in routstr-confidential:
 `docs/TWOPC-DESIGN.md` and `paper/`.
@@ -109,7 +111,8 @@ Other caveats:
   can read it: XSS, a compromised dependency, a malicious update, or a browser
   extension with host access. Keep balances small and withdraw (refund) what
   you do not use.
-- **Trust configuration is page configuration.** The node URL, the pinned node
+- **Trust configuration is page configuration.** The node URL (https; plain
+  http only for loopback or an onion service), the pinned node
   key and the trusted provider host are shown in the "Node" panel. The
   provider certificate the page validated is shown for every answer.
 - **Pre-warming.** An armed session holds a reservation, and the node may keep
@@ -117,9 +120,11 @@ Other caveats:
   is never used. The library arms only while the page is visible, the key has
   enough available balance and the user is active, at most one session at a
   time. It does not arm if the abandon fee is above `maxAbandonFeeMsat`
-  (default 5 sats). It can be turned off.
+  (default 5 sats). An armed session that dies before use backs arming off
+  (30 s, doubling to 10 min, reset by a request an armed session served). It
+  can be turned off.
 - The 2PC has **no external review** yet (see routstr-confidential). The
-  client's selective-failure leakage bound is ≤ log2 5 bits per session, about
+  client's selective-failure leakage bound is ≤ log2 6 bits per session, about
   fresh single-use values.
 
 ## Costs (all read from the signed offer, never hard-coded)

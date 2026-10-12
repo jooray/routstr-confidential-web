@@ -21,6 +21,7 @@
  */
 
 import { ConfidentialError, SessionRejectedError } from "./errors.js";
+import { encryptedNodeTransport } from "./hosts.js";
 import { fetchConfidentialOffer, offerAbandonFeeMsat, verifyConfidentialOffer, type VerifiedOffer } from "./offer.js";
 import { NodeApi, type NodeModel } from "./node-api.js";
 import { modelPricing, type ModelPricing } from "./pricing.js";
@@ -51,8 +52,13 @@ export interface PrewarmOptions {
 }
 
 export interface ConfidentialClientOptions {
-  /** Node base URL (https). */
+  /** Node base URL (https; plain http only for loopback or an onion service). */
   node: string;
+  /**
+   * Development only: allow a plain-http node that is neither loopback nor an
+   * onion service. The credential then travels unencrypted.
+   */
+  allowInsecureTransport?: boolean;
   /** Node signing keys (hex or npub) whose offers are accepted. */
   nodePubkeys: readonly string[];
   /** Provider hostnames the client accepts (exact or wildcard), e.g. ["api.venice.ai"]. */
@@ -151,6 +157,12 @@ export class Prewarmer {
   private arming = false;
   private backoffUntil = 0;
   private backoff = 0;
+  /**
+   * Armed sessions that died before use since a warm request last succeeded.
+   * Each one doubles the wait before the next arm: a node that keeps ending
+   * armed sessions would otherwise cost an arm (and its abandon fee) per tick.
+   */
+  private deaths = 0;
   private timer?: ReturnType<typeof setInterval>;
   private stopped = false;
   status: "off" | "idle" | "arming" | "armed" | "waiting-funds" | "backoff" = "off";
@@ -227,6 +239,7 @@ export class Prewarmer {
     }
     if (!a.session.healthy && a.session.isArmed) {
       this.teardown("armed session unhealthy");
+      this.armedFailed("armed session died before use");
       return undefined;
     }
     this.armed = undefined;
@@ -244,10 +257,29 @@ export class Prewarmer {
     this.status = this.stopped || !this.cfg.enabled ? "off" : "idle";
   }
 
+  /** An armed session ended (or failed when claimed) before it was used: back off. */
+  armedFailed(reason: string): void {
+    this.deaths++;
+    const ms = Math.min(this.cfg.backoffMs * 2 ** (this.deaths - 1), 600_000);
+    this.backoffUntil = Math.max(this.backoffUntil, Date.now() + ms);
+    this.status = "backoff";
+    this.log(`${reason}; backing off`, { backoff_ms: ms });
+  }
+
+  /** A request served from an armed session succeeded: earlier deaths stop counting. */
+  servedWarm(): void {
+    if (this.deaths === 0) return;
+    this.deaths = 0;
+    this.backoffUntil = 0;
+  }
+
   private tick(): void {
     const a = this.armed;
-    if (a && (Date.now() - a.session.startedAt > this.cfg.maxAgeMs || (a.session.isArmed && !a.session.healthy))) {
-      this.teardown("expired or unhealthy");
+    if (a && a.session.isArmed && !a.session.healthy) {
+      this.teardown("unhealthy");
+      this.armedFailed("armed session died before use");
+    } else if (a && Date.now() - a.session.startedAt > this.cfg.maxAgeMs) {
+      this.teardown("expired");
     }
     if (Date.now() - this.lastActivity > this.cfg.idleMs) this.teardown("idle");
     void this.ensure();
@@ -343,6 +375,14 @@ export class ConfidentialClient {
   constructor(opts: ConfidentialClientOptions) {
     if (!opts.trustedHosts?.length) throw new ConfidentialError("not_configured", "trustedHosts is required");
     if (!opts.nodePubkeys?.length) throw new ConfidentialError("not_configured", "nodePubkeys is required");
+    // Pinned keys authenticate the offer, not the connection: the session
+    // carries the credential, which plain http would expose on the wire.
+    if (!opts.allowInsecureTransport && !encryptedNodeTransport(opts.node)) {
+      throw new ConfidentialError(
+        "not_configured",
+        `refusing plain http to ${opts.node}: the credential would travel unencrypted (use https)`,
+      );
+    }
     this.opts = opts;
     this.node = opts.node.replace(/\/$/, "");
     this.api = new NodeApi(this.node, opts.fetchImpl);
@@ -512,12 +552,15 @@ export class ConfidentialClient {
       attach(s);
       this.emit({ ev: "request", path: "warm", model });
       try {
-        return await s.claim(padPinnedBody(body, s.bodyLength, suffix), tRequest);
+        const result = await s.claim(padPinnedBody(body, s.bodyLength, suffix), tRequest);
+        pw?.servedWarm();
+        return result;
       } catch (e) {
         // Before the credential record is released nothing reached the
         // provider: retry once on a cold session. Never after.
         if (s.bodyReleased || signal?.aborted) throw e;
         s.close();
+        pw?.armedFailed(`armed session failed before release: ${errorText(e)}`);
         this.emit({ ev: "request", path: "cold", reason: `warm session failed before release: ${errorText(e)}` });
         return cold();
       }

@@ -36,6 +36,8 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
     const { enqueue: enqueueServerPacket } = makeQueue();
     const keyPairs = {};
     let handshakeDone = false;
+    // FORK PATCH (TLS-08): the server asked for our KeyUpdate.
+    let keyUpdateReplyOwed = false;
     let ended = false;
     let sessionId = new Uint8Array();
     let handshakeMsgs = [];
@@ -290,10 +292,12 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         break;
                     case SUPPORTED_RECORD_TYPE_MAP.KEY_UPDATE:
                         // FORK PATCH (TLS-08): validate request_update.
-                        // A server update_requested would oblige the client to
-                        // send its own KeyUpdate, which the protocol's fixed
-                        // client epoch accounting cannot absorb: it is a
-                        // protocol error that ends the client.
+                        // A server update_requested obliges the client to send
+                        // its own KeyUpdate before its next application data
+                        // (RFC 8446 §4.6.3), which the protocol's fixed client
+                        // epoch accounting cannot absorb. After the request the
+                        // client writes nothing more, so the request is
+                        // accepted and only a later write fails.
                         if (connTlsVersion !== 'TLS1_3' || !handshakeDone) {
                             throw new Error('Unexpected KeyUpdate');
                         }
@@ -303,7 +307,7 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                             throw new Error('Malformed KeyUpdate');
                         }
                         if (content[0] === KEY_UPDATE_TYPE_MAP.UPDATE_REQUESTED) {
-                            throw new Error('Server KeyUpdate with update_requested is not supported');
+                            keyUpdateReplyOwed = true;
                         }
                         const newMasterSecret = await computeUpdatedTrafficMasterSecret(keys.serverSecret, cipherSuite);
                         const newKeys = await deriveTrafficKeysForSide(newMasterSecret, cipherSuite);
@@ -788,6 +792,9 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         // FORK PATCH: seal a KeyUpdate record and return its bytes without
         // sending it; the traffic keys are rotated as in updateTrafficKeys().
         async updateTrafficKeysSilently(requestUpdateFromServer = false) {
+            if (keyUpdateReplyOwed) {
+                throw new Error('Server KeyUpdate with update_requested before the client finished writing is not supported');
+            }
             const packet = packKeyUpdateRecord(requestUpdateFromServer
                 ? 'UPDATE_REQUESTED'
                 : 'UPDATE_NOT_REQUESTED');
@@ -893,6 +900,9 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
          * update its keys as well
          */
         async updateTrafficKeys(requestUpdateFromServer = false) {
+            if (keyUpdateReplyOwed) {
+                throw new Error('Server KeyUpdate with update_requested before the client finished writing is not supported');
+            }
             const packet = packKeyUpdateRecord(requestUpdateFromServer
                 ? 'UPDATE_REQUESTED'
                 : 'UPDATE_NOT_REQUESTED');
@@ -915,6 +925,9 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         async write(data) {
             if (!handshakeDone) {
                 throw new Error('Handshake not done');
+            }
+            if (keyUpdateReplyOwed) {
+                throw new Error('Server KeyUpdate with update_requested before the client finished writing is not supported');
             }
             const chunks = chunkUint8Array(data, MAX_ENC_PACKET_SIZE);
             for (const chunk of chunks) {

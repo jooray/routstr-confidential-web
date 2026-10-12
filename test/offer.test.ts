@@ -87,6 +87,19 @@ describe("offer verification", () => {
     );
   });
 
+  it("rejects an offer whose version lies outside its own min_v..max_v", () => {
+    for (const bad of [
+      { v: 2, min_v: 3, max_v: 3 },
+      { v: 2, min_v: 1, max_v: 1 },
+      { v: 2.5, min_v: 2, max_v: 3 },
+    ]) {
+      const { offer, pubHex } = signedOffer(bad);
+      expect(() => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS })).toThrow(
+        OfferMalformedError,
+      );
+    }
+  });
+
   it("reads optional fee fields and rejects malformed ones", () => {
     const { offer, pubHex } = signedOffer({ session_fee_msat: 2000, abandon_fee_msat: 5000, rate_surcharge_pct: 10 });
     const o = verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS });

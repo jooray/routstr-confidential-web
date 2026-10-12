@@ -147,6 +147,11 @@ describe("pricing", () => {
     const r = offer.price_list[m]!;
     expect(p!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1000 * r.out) / 1000));
     expect(p!.sessionFeeMsat).toBe(0);
+    // The node reserves the offer's completion margin on top of max_tokens.
+    const [q] = modelPricing({ ...offer, reserve_margin_tokens: 16 }, [{ id: m, context_length: 100_000 }], 1000).filter(
+      (x) => x.id === m,
+    );
+    expect(q!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1016 * r.out) / 1000));
   });
 
   it("hex round-trips", () => {

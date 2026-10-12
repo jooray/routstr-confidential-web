@@ -105,4 +105,35 @@ describe("receipt verification", () => {
     expect(() => checkAttestationBinding("null", own)).toThrow(ReceiptVerificationError);
     expect(() => checkAttestationBinding("{", own)).toThrow(/JSON/);
   });
+
+  it("checks the attestation's commitment, certificate hash and upstream byte record against ours", () => {
+    const thSH = new Uint8Array(32).fill(7);
+    const thSF = new Uint8Array(32).fill(9);
+    const chain = new Uint8Array(32).fill(3);
+    const recv = new Uint8Array(32).fill(4);
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32), certChainHash: chain, serverRecords: 9, recvSha256: recv };
+    const att = (o: Record<string, unknown>) =>
+      canonicalJson({
+        sid: "s1",
+        th_sh: bytesToHex(thSH),
+        th_sf: bytesToHex(thSF),
+        c_commit: "ab".repeat(32),
+        cert_chain_hash: bytesToHex(chain),
+        server_records: 9,
+        sha256_recv: bytesToHex(recv),
+        ...o,
+      });
+    expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    expect(() => checkAttestationBinding(att({ c_commit: null }), own)).toThrow(/commitment/);
+    expect(() => checkAttestationBinding(att({ cert_chain_hash: "00".repeat(32) }), own)).toThrow(/certificate/);
+    expect(() => checkAttestationBinding(att({ server_records: 8 }), own)).toThrow(/upstream records/);
+    expect(() => checkAttestationBinding(att({ sha256_recv: "00".repeat(32) }), own)).toThrow(/upstream bytes/);
+  });
+
+  it("never refuses the node's cached-input charge for float rounding", () => {
+    const usage = { prompt_tokens: 10000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 1 } };
+    expect(Math.ceil((1.1 * 9999 + 1.1 * 1) / 1000)).toBe(12); // what the node charges
+    expect(maxChargeMsats({ in: 1.1, cached_in: 1.1, out: 0 }, usage)).toBe(12);
+    expect(maxChargeMsats({ in: 1.1, out: 0 }, { prompt_tokens: 10000, completion_tokens: 0 })).toBe(11);
+  });
 });

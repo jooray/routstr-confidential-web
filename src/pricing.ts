@@ -5,7 +5,11 @@
  * folded into the price list); both are read when present.
  */
 
-import { offerAbandonFeeMsat, offerSessionFeeMsat, type ConfidentialPriceEntry, type VerifiedOffer } from "./offer.js";
+import {
+  offerAbandonFeeMsat,
+  offerReserveMarginTokens,
+  offerSessionFeeMsat,
+  type ConfidentialPriceEntry, type VerifiedOffer } from "./offer.js";
 import type { NodeModel } from "./node-api.js";
 
 export interface ModelPricing {
@@ -21,7 +25,8 @@ export interface ModelPricing {
   rateSurchargePct: number;
   /**
    * Reservation the node holds while a session for `maxTokens` is open (msat):
-   * a full-context prompt plus `maxTokens` at the signed rates, plus the
+   * a full-context prompt plus `maxTokens` and the offer's
+   * `reserve_margin_tokens` at the signed rates, plus the
    * larger of the session and abandon fees. The key needs at least this
    * available balance; the unused part is released at settlement.
    */
@@ -65,6 +70,7 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
   const byId = new Map(models.map((m) => [m.id, m]));
   const fee = sessionFeeMsat(offer);
   const pct = typeof offer.rate_surcharge_pct === "number" ? offer.rate_surcharge_pct : 0;
+  const margin = offerReserveMarginTokens(offer);
   return Object.entries(offer.price_list)
     .map(([id, rates]) => {
       const m = byId.get(id);
@@ -82,7 +88,8 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
         maxTokens: mt,
         reservationMsat:
           limit !== undefined
-            ? Math.ceil((limit * rates.in + mt * rates.out) / 1000) + Math.max(fee, offerAbandonFeeMsat(offer))
+            ? Math.ceil((limit * rates.in + (mt + margin) * rates.out) / 1000) +
+              Math.max(fee, offerAbandonFeeMsat(offer))
             : undefined,
       };
     })
