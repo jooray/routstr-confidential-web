@@ -7,7 +7,9 @@
 # - "reproducible build": rebuilds wasm/pkg from scratch with the pinned
 #   toolchain (rust-toolchain.toml), wasm-bindgen-cli (Cargo.lock) and
 #   binaryen (package-lock.json), host paths remapped out, and requires the
-#   result to be byte-identical to the committed files.
+#   result to be byte-identical to the committed files. The committed
+#   wasm/pkg is this job's build (x86_64-linux is the reference platform; a
+#   macOS build differs in crate hashes and codegen).
 name: wasm
 
 on:
@@ -55,3 +57,9 @@ jobs:
         run: |
           git status --porcelain wasm/pkg
           git diff --stat --exit-code -- wasm/pkg
+      - name: upload the rebuilt wasm/pkg (to diff a mismatch)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg-ci
+          path: wasm/pkg

@@ -77,8 +77,8 @@ export interface InitOutput {
     readonly twopcclient_close: (a: number) => void;
     readonly twopcclient_new: (a: any) => number;
     readonly twopcclient_push: (a: number, b: number, c: number, d: number) => [number, number];
-    readonly wasm_bindgen_96bbe4b92e825b21___convert__closures_____invoke___wasm_bindgen_96bbe4b92e825b21___JsValue__core_9b3796e30d99ddb7___result__Result_____wasm_bindgen_96bbe4b92e825b21___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_96bbe4b92e825b21___convert__closures_____invoke_______true_: (a: number, b: number) => void;
+    readonly wasm_bindgen_537207de442e5c71___convert__closures_____invoke___wasm_bindgen_537207de442e5c71___JsValue__core_9b3796e30d99ddb7___result__Result_____wasm_bindgen_537207de442e5c71___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_537207de442e5c71___convert__closures_____invoke_______true_: (a: number, b: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

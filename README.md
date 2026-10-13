@@ -209,8 +209,12 @@ browser supports (Safari ≥ 16.4). The wasm is 5.93 MB, 1.8 MB gzipped. Commit
 **Checking the committed wasm.** The build is meant to be byte-reproducible:
 `build-wasm.sh` remaps host paths (the checkout and `CARGO_HOME`) out of the
 binary, enforces `Cargo.lock` and uses the pinned `wasm-opt`. Rebuilding the
-same tree from another checkout path and an empty target directory gives the
-same bytes. `buildInfo()` (exposed by the wasm and shown by the demo app)
+same tree from another checkout path and an empty target directory on the
+same host platform gives the same bytes. The reference platform is
+x86_64-linux (CI's `ubuntu-24.04`): the committed `wasm/pkg` is that build.
+rustc's crate hashes and some codegen depend on the host, so a macOS build of
+the same tree is functionally the same but not byte-identical; to check the
+committed files, rebuild on x86_64 Linux (or in a container). `buildInfo()` (exposed by the wasm and shown by the demo app)
 names the upstream commit, the mpz2 rev and `src:<digest>`, a SHA-256 over
 every source file that goes into the wasm; `node scripts/source-digest.mjs`
 recomputes it from a checkout and `--check` fails if `wasm/pkg` was not built

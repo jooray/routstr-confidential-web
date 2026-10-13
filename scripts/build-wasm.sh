@@ -5,8 +5,10 @@
 # and `npm ci` (wasm-opt from the pinned binaryen devDependency).
 #
 # The output is meant to be byte-reproducible from the same sources and tool
-# versions on any machine: host paths (the checkout, CARGO_HOME) are remapped
-# out of the binary, the lockfile is enforced, and wasm-opt is the pinned one.
+# versions on the same host platform (the reference is x86_64-linux, CI's
+# ubuntu-24.04; rustc's crate hashes and codegen depend on the host): host
+# paths (the checkout, CARGO_HOME) are remapped out of the binary, the
+# lockfile is enforced, and wasm-opt is the pinned one.
 # CI (.github/workflows/wasm.yml) rebuilds and compares with the committed
 # wasm/pkg. Set WASM_OPT to override the optimizer (the result then differs).
 set -euo pipefail
