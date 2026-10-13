@@ -33,7 +33,7 @@ import { getDefaultWasmHost, type WasmHost } from "./wasm/host.js";
 export interface PrewarmOptions {
   /** Default true when an options object is given. */
   enabled?: boolean;
-  /** Close an armed session this long after setup (the node ends sessions at 600 s). */
+  /** Close an armed session this long after setup (the node ends sessions at 600 s; at least 60 s). */
   maxAgeMs?: number;
   /** No activity (request, typing, focus) for this long: tear down, stop arming. */
   idleMs?: number;
@@ -126,6 +126,9 @@ interface Armed {
   maxTokens: number;
 }
 
+/** The shortest `maxAgeMs` the pre-warmer accepts. */
+const PREWARM_MIN_MAX_AGE_MS = 60_000;
+
 const PREWARM_DEFAULTS = {
   enabled: true,
   maxAgeMs: 480_000,
@@ -172,6 +175,10 @@ export class Prewarmer {
     opts: PrewarmOptions,
   ) {
     this.cfg = { ...PREWARM_DEFAULTS, ...opts };
+    // Each retired, unused session costs its 2PC traffic and possibly an
+    // abandon fee: a near-zero age would arm and retire one on every tick.
+    if (this.cfg.maxAgeMs === undefined) this.cfg.maxAgeMs = PREWARM_DEFAULTS.maxAgeMs;
+    if (!(this.cfg.maxAgeMs >= PREWARM_MIN_MAX_AGE_MS)) this.cfg.maxAgeMs = PREWARM_MIN_MAX_AGE_MS;
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") this.activity();
@@ -365,12 +372,19 @@ export class Prewarmer {
 export class ConfidentialClient {
   readonly node: string;
   readonly api: NodeApi;
-  readonly host: WasmHost;
   credential?: string;
   private readonly opts: ConfidentialClientOptions;
   private offerCache?: { offer: VerifiedOffer; at: number };
   private modelsCache?: { models: NodeModel[]; at: number };
   readonly prewarmer?: Prewarmer;
+
+  /**
+   * Where the wasm runs: the configured host, else the page-wide default,
+   * looked up per session so a crashed default worker is replaced.
+   */
+  get host(): WasmHost {
+    return this.opts.host ?? getDefaultWasmHost();
+  }
 
   constructor(opts: ConfidentialClientOptions) {
     if (!opts.trustedHosts?.length) throw new ConfidentialError("not_configured", "trustedHosts is required");
@@ -386,7 +400,6 @@ export class ConfidentialClient {
     this.opts = opts;
     this.node = opts.node.replace(/\/$/, "");
     this.api = new NodeApi(this.node, opts.fetchImpl);
-    this.host = opts.host ?? getDefaultWasmHost();
     this.credential = opts.credential;
     if (opts.prewarm) this.prewarmer = new Prewarmer(this, opts.prewarm === true ? {} : opts.prewarm);
   }

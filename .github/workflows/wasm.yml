@@ -1,0 +1,57 @@
+# Checks that the committed wasm/pkg is what the sources in the tree build to,
+# and runs the library's tests.
+#
+# - "source digest": the wasm's buildInfo() carries a digest of every source
+#   file that goes into it (crates/client-wasm/build.rs); this fails when
+#   wasm/pkg was not rebuilt after a source change. Cheap, host-independent.
+# - "reproducible build": rebuilds wasm/pkg from scratch with the pinned
+#   toolchain (rust-toolchain.toml), wasm-bindgen-cli (Cargo.lock) and
+#   binaryen (package-lock.json), host paths remapped out, and requires the
+#   result to be byte-identical to the committed files.
+name: wasm
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: source digest (wasm/pkg built from this tree)
+        run: node scripts/source-digest.mjs --check
+      - run: npm run typecheck
+      - run: npm test
+      - name: native driver tests (client-wasm against the real node side)
+        run: cargo test --locked --release -p client-wasm
+
+  reproducible-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: wasm-bindgen-cli (version from Cargo.lock)
+        run: |
+          WB_VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')
+          cargo install wasm-bindgen-cli --version "$WB_VER" --locked
+      - name: rebuild wasm/pkg
+        run: ./scripts/build-wasm.sh
+      - name: compare with the committed wasm/pkg
+        run: |
+          git status --porcelain wasm/pkg
+          git diff --stat --exit-code -- wasm/pkg

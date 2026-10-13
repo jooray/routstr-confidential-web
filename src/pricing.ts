@@ -26,25 +26,63 @@ export interface ModelPricing {
   /**
    * Reservation the node holds while a session for `maxTokens` is open (msat):
    * a full-context prompt plus `maxTokens` and the offer's
-   * `reserve_margin_tokens` at the signed rates, plus the
-   * larger of the session and abandon fees. The key needs at least this
-   * available balance; the unused part is released at settlement.
+   * `reserve_margin_tokens` at the signed rates, plus the larger of the
+   * session and abandon fees. Without a context length: the model's maximum
+   * cost (`sats_pricing.max_cost`) raised by the rate surcharge, plus the
+   * margin at the signed completion rate, plus the same fee. Undefined when
+   * neither is known. The key needs at least this available balance; the
+   * unused part is released at settlement.
    */
   reservationMsat?: number;
   maxTokens: number;
 }
 
 /**
- * The prompt size the node reserves for. Conservative: the model's full
- * context length. (routstr-core's `prompt_token_limit` may subtract the
- * provider's max completion tokens, but deployed nodes have been seen to
- * reserve on the full context; over-estimating only shows a higher required
- * balance, under-estimating would surprise the user with a 402.)
+ * The prompt size the node reserves for: the model's full context length,
+ * taken as the node does, the first positive integer of
+ * `top_provider.context_length` and `context_length`, in that order.
+ * Undefined when neither is one (the node then reserves the model's maximum
+ * cost instead).
  */
 export function promptLimit(m: NodeModel | undefined): number | undefined {
   if (!m) return undefined;
-  const cl = Math.max(m.top_provider?.context_length ?? 0, m.context_length ?? 0);
-  return cl > 0 ? cl : undefined;
+  return [m.top_provider?.context_length, m.context_length].find(
+    (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0,
+  );
+}
+
+/** The model's undiscounted maximum cost in sats, from the node's model list. */
+function maxCostSats(m: NodeModel | undefined): number | undefined {
+  const v: unknown = m?.sats_pricing?.max_cost;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+/**
+ * The reservation (msat) the node holds for a session on `m` with a pinned
+ * completion cap of `maxTokens`, as routstr-core's confidential `reserve()`
+ * computes it. See `ModelPricing.reservationMsat`.
+ */
+export function reservationMsat(
+  offer: VerifiedOffer,
+  rates: ConfidentialPriceEntry,
+  m: NodeModel | undefined,
+  maxTokens: number,
+): number | undefined {
+  const fee = Math.max(sessionFeeMsat(offer), offerAbandonFeeMsat(offer));
+  const margin = offerReserveMarginTokens(offer);
+  const limit = promptLimit(m);
+  if (limit !== undefined) {
+    return Math.ceil((limit * rates.in + (maxTokens + margin) * rates.out) / 1000) + fee;
+  }
+  const maxCost = maxCostSats(m);
+  if (maxCost === undefined) return undefined;
+  const pct = surchargePct(offer);
+  return Math.ceil(Math.ceil(maxCost * 1000) * (1 + pct / 100) + (margin * rates.out) / 1000) + fee;
+}
+
+function surchargePct(offer: VerifiedOffer): number {
+  const v = offer.rate_surcharge_pct;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 }
 
 export function sessionFeeMsat(offer: VerifiedOffer): number {
@@ -69,8 +107,7 @@ export function costMsat(
 export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxTokens: number): ModelPricing[] {
   const byId = new Map(models.map((m) => [m.id, m]));
   const fee = sessionFeeMsat(offer);
-  const pct = typeof offer.rate_surcharge_pct === "number" ? offer.rate_surcharge_pct : 0;
-  const margin = offerReserveMarginTokens(offer);
+  const pct = surchargePct(offer);
   return Object.entries(offer.price_list)
     .map(([id, rates]) => {
       const m = byId.get(id);
@@ -86,11 +123,7 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
         abandonFeeMsat: offerAbandonFeeMsat(offer),
         rateSurchargePct: pct,
         maxTokens: mt,
-        reservationMsat:
-          limit !== undefined
-            ? Math.ceil((limit * rates.in + (mt + margin) * rates.out) / 1000) +
-              Math.max(fee, offerAbandonFeeMsat(offer))
-            : undefined,
+        reservationMsat: reservationMsat(offer, rates, m, mt),
       };
     })
     .sort((a, b) => a.id.localeCompare(b.id));

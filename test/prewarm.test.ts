@@ -153,3 +153,15 @@ describe("pre-warm pool", () => {
     }
   });
 });
+
+describe("pre-warm options", () => {
+  it("clamps maxAgeMs to at least 60 s and keeps the default when unset", () => {
+    const { client } = fakeClient();
+    const short = new Prewarmer(client as never, { onlyWhenVisible: false, enabled: false, maxAgeMs: 10 });
+    expect(short.cfg.maxAgeMs).toBe(60_000);
+    short.stop();
+    const unset = new Prewarmer(client as never, { onlyWhenVisible: false, enabled: false, maxAgeMs: undefined });
+    expect(unset.cfg.maxAgeMs).toBe(480_000);
+    unset.stop();
+  });
+});

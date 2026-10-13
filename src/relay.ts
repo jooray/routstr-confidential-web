@@ -83,6 +83,8 @@ export class DriverRelay {
         }
         this.o.onEvent(m);
       }
+    }, (e) => {
+      if (!this.closed) this.o.onFailure(new ProverError(`${this.o.label}: ${e.message}`));
     });
   }
 

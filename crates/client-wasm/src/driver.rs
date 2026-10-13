@@ -11,6 +11,8 @@
 //! Secrets (the 2PC outputs, proof witnesses) only ever travel on channel 1
 //! between the driver and its owner; nothing is logged.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -25,8 +27,66 @@ use twopc::{ApOut, Party, Role};
 /// Largest frame accepted from the owner (as the binaries' stdin limit).
 pub const MAX_FRAME: usize = 16 << 20;
 
+/// Most input bytes queued for a driver and not yet taken by it. The node
+/// cannot be slowed down through a browser WebSocket, so a backlog beyond
+/// this (an honest session moves ~23 MB in all, and the driver consumes as it
+/// goes) ends the driver instead of growing memory without bound.
+pub const MAX_PENDING_INPUT: usize = 64 << 20;
+
 pub type Frame = (u8, Vec<u8>);
 pub type Out = UnboundedSender<Frame>;
+
+/// Why a frame was not queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputError {
+    /// The driver stopped (or its input was closed).
+    Stopped,
+    /// More than [`MAX_PENDING_INPUT`] bytes would be queued.
+    Backlog,
+}
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputError::Stopped => f.write_str("driver has stopped"),
+            InputError::Backlog => f.write_str("driver input backlog over the limit"),
+        }
+    }
+}
+
+impl std::error::Error for InputError {}
+
+/// The owner's end of a driver's input: frames in, with the queued bytes
+/// counted against [`MAX_PENDING_INPUT`]. Dropping it closes the input (like
+/// closing the process's stdin) once every clone is gone.
+#[derive(Clone)]
+pub struct Input {
+    tx: UnboundedSender<Frame>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Input {
+    /// Queue one frame. Over the backlog limit the input is closed, so the
+    /// driver stops.
+    pub fn unbounded_send(&self, frame: Frame) -> Result<(), InputError> {
+        let n = frame.1.len();
+        let before = self.pending.fetch_add(n, Ordering::AcqRel);
+        if before.saturating_add(n) > MAX_PENDING_INPUT {
+            self.pending.fetch_sub(n, Ordering::AcqRel);
+            self.tx.close_channel();
+            return Err(InputError::Backlog);
+        }
+        self.tx.unbounded_send(frame).map_err(|_| {
+            self.pending.fetch_sub(n, Ordering::AcqRel);
+            InputError::Stopped
+        })
+    }
+
+    /// Bytes queued and not yet taken by the driver.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+}
 
 fn emit(out: &Out, v: Value) {
     let _ = out.unbounded_send((1, serde_json::to_vec(&v).expect("json")));
@@ -38,8 +98,10 @@ fn emit(out: &Out, v: Value) {
 fn bridge(
     out: &Out,
     ctl: Option<UnboundedSender<Value>>,
-) -> (UnboundedSender<Frame>, tokio::io::DuplexStream, oneshot::Sender<()>) {
+) -> (Input, tokio::io::DuplexStream, oneshot::Sender<()>) {
     let (in_tx, mut in_rx) = unbounded::<Frame>();
+    let pending = Arc::new(AtomicUsize::new(0));
+    let taken = pending.clone();
     // Fired when the driver finished: the input task then lets go of its
     // `out` clone, so the output stream ends even if the owner keeps its
     // input sender (no cycle through the transport).
@@ -72,6 +134,7 @@ fn bridge(
                 _ => break,
             };
             let (ch, data) = next;
+            taken.fetch_sub(data.len(), Ordering::AcqRel);
             if data.len() > MAX_FRAME {
                 emit(&err_out, json!({"ev":"error","msg":"input frame too large"}));
                 break;
@@ -95,7 +158,7 @@ fn bridge(
         // Input closed: the protocol input ends too (and so does `ctl`).
         let _ = bw.shutdown().await;
     });
-    (in_tx, party_io, stop_tx)
+    (Input { tx: in_tx, pending }, party_io, stop_tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +223,7 @@ async fn run_twopc(out: Out, mut ctl: UnboundedReceiver<Value>, io: tokio::io::D
 
 /// Starts the client side of the 2PC (`cu-2pc`). Returns the input sender;
 /// dropping it is the equivalent of closing the process's stdin.
-pub fn spawn_twopc(out: Out) -> UnboundedSender<Frame> {
+pub fn spawn_twopc(out: Out) -> Input {
     let (ctl_tx, ctl_rx) = unbounded::<Value>();
     let (in_tx, party_io, stop) = bridge(&out, Some(ctl_tx));
     rt::spawn(async move {
@@ -209,6 +272,12 @@ async fn run_channel(
             }
             let params: Params = serde_json::from_value(cmd.get("params").cloned().unwrap_or_default())
                 .map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
+            // Refused here, before anything reaches the channel: a mismatch
+            // must not consume the proof's single run or poison the channel,
+            // nor run a different statement under this proof's name.
+            if params.proof().name() != proof {
+                anyhow::bail!("{proof}: the params are for {}", params.proof().name());
+            }
             // Never echo the witness parser's message: it may quote the value.
             let witness: Option<Witness> = match cmd.get("witness") {
                 Some(w) if !w.is_null() => {
@@ -248,7 +317,7 @@ async fn run_channel(
 
 /// Starts the client end of the session's proof channel
 /// (`cu-prover --channel`).
-pub fn spawn_zkchan(prealloc: zkbench::channel::Prealloc, out: Out) -> UnboundedSender<Frame> {
+pub fn spawn_zkchan(prealloc: zkbench::channel::Prealloc, out: Out) -> Input {
     let (ctl_tx, ctl_rx) = unbounded::<Value>();
     let (in_tx, party_io, stop) = bridge(&out, Some(ctl_tx));
     rt::spawn(async move {
@@ -277,12 +346,17 @@ struct Job {
 /// One proof on its own connection (the per-proof `/zk?proof=…` path).
 /// `job` is `{"proof","role":"prover"|"verifier","params","witness"}`. Emits
 /// `{"ev":"done","ok":..,"checks":[..]}` (or `ok:false,"err"`) on channel 1.
-pub fn spawn_prover_job(job: &[u8], out: Out) -> UnboundedSender<Frame> {
+pub fn spawn_prover_job(job: &[u8], out: Out) -> Input {
     let (in_tx, party_io, stop) = bridge(&out, None);
     let job: Result<Job, String> = serde_json::from_slice(job).map_err(|_| "bad job".to_string());
     rt::spawn(async move {
         let res: anyhow::Result<(String, Vec<zkbench::proofs::CheckResult>)> = async {
             let job = job.map_err(|e| anyhow::anyhow!(e))?;
+            // The job names its proof; the params must be that proof's, or the
+            // driver would run (and report under the name) a different statement.
+            if zkbench::statements::Proof::from_name(&job.proof) != Some(job.params.proof()) {
+                anyhow::bail!("the job is for {}, its params are for {}", job.proof, job.params.proof().name());
+            }
             let role = match job.role.as_str() {
                 "prover" => zkbench::Role::Prover,
                 "verifier" => zkbench::Role::Verifier,
@@ -304,6 +378,19 @@ pub fn spawn_prover_job(job: &[u8], out: Out) -> UnboundedSender<Frame> {
         let _ = stop.send(());
     });
     in_tx
+}
+
+/// What this build was made from (see `build.rs`): the crate version, the
+/// routstr-confidential commit the vendored crates come from, the mpz2 rev
+/// and the digest of the source files (`node scripts/source-digest.mjs`).
+pub fn build_info() -> String {
+    format!(
+        "client-wasm {} (protocol v2; routstr-confidential@{}, mpz2@{}, src:{})",
+        env!("CARGO_PKG_VERSION"),
+        env!("CU_UPSTREAM"),
+        env!("CU_MPZ2"),
+        env!("CU_SOURCE_DIGEST"),
+    )
 }
 
 /// The zkbench v2 fixtures (`pi_nk`, `pi_c2s`, `pi_c3s`: params + witness),

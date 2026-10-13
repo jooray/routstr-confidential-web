@@ -18,10 +18,22 @@ function post(m: FromWorker, transfer: Transferable[] = []): void {
 
 function handle(m: ToWorker): void {
   if (m.op === "start") {
-    const d = host!.start(m.kind, m.options, (ch, data) => {
-      const copy = data.slice();
-      post({ op: "frame", id: m.id, ch, data: copy }, [copy.buffer]);
-    });
+    // A driver that cannot start fails alone, not the whole worker.
+    let d: DriverHandle;
+    try {
+      d = host!.start(
+        m.kind,
+        m.options,
+        (ch, data) => {
+          const copy = data.slice();
+          post({ op: "frame", id: m.id, ch, data: copy }, [copy.buffer]);
+        },
+        (e) => post({ op: "driver_error", id: m.id, msg: e.message }),
+      );
+    } catch (e) {
+      post({ op: "driver_error", id: m.id, msg: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     drivers.set(m.id, d);
   } else if (m.op === "push") {
     drivers.get(m.id)?.push(m.ch, m.data);

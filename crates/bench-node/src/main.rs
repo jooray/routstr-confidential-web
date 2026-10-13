@@ -172,8 +172,8 @@ where
 /// returns the receiver of control events and the input sender.
 async fn connect(
     url: &str,
-    start: impl FnOnce(client_wasm::driver::Out) -> futures::channel::mpsc::UnboundedSender<client_wasm::driver::Frame>,
-) -> Result<(futures::channel::mpsc::UnboundedReceiver<Value>, futures::channel::mpsc::UnboundedSender<client_wasm::driver::Frame>)> {
+    start: impl FnOnce(client_wasm::driver::Out) -> client_wasm::driver::Input,
+) -> Result<(futures::channel::mpsc::UnboundedReceiver<Value>, client_wasm::driver::Input)> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.with_context(|| format!("connect {url}"))?;
     let (mut tx, mut rx) = ws.split();
     let (out_tx, mut out_rx) = futures::channel::mpsc::unbounded();

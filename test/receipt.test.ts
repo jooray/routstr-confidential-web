@@ -4,6 +4,7 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { ReceiptVerificationError } from "../src/errors.js";
 import {
   checkAttestationBinding,
+  checkUpstreamErrorReceipt,
   feeOnlyChargeOk,
   maxChargeMsats,
   parseSignedReceipt,
@@ -64,6 +65,33 @@ describe("receipt verification", () => {
     expect(feeOnlyChargeOk(2000, 2000)).toBe(true);
   });
 
+  it("bounds the charge for an upstream error receipt", () => {
+    const err = (status: unknown, extra: Record<string, unknown> = {}) =>
+      ({ sid: "s1", model: "m", usage: { error_status: status }, ...extra }) as never;
+    // 4xx / 503: at most the session fee.
+    expect(checkUpstreamErrorReceipt(err(429, { cost_msats: 0 }), 429, 0)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(503, { cost_msats: 2000 }), 503, 2000)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(503, { cost_msats: 2001, reserved_msats: 9000 }), 503, 2000)).toThrow(
+      ReceiptVerificationError,
+    );
+    // Other 5xx: at most the reservation the receipt names.
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0)).toThrow(
+      /reservation/,
+    );
+    expect(() => checkUpstreamErrorReceipt(err(502, { cost_msats: 1e12 }), 502, 0)).toThrow(/reservation/);
+    expect(checkUpstreamErrorReceipt(err(504, { cost_msats: 500 }), 504, 500)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: -1, reserved_msats: 9000 }), 500, 0)).toThrow(
+      ReceiptVerificationError,
+    );
+    expect(() =>
+      checkUpstreamErrorReceipt(err(500, { cost_msats: 10, reserved_msats: 9000, session_fee_msat: 5 }), 500, 0),
+    ).toThrow(/session fee/);
+    // The status must be the one we saw, as a number.
+    expect(checkUpstreamErrorReceipt(err("500", { cost_msats: 0 }), 500, 0)).toBe(false);
+    expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 0 }), 500, 0)).toBe(false);
+  });
+
   it("accepts only a receipt signed for this session and attestation", () => {
     const { priv, pubHex } = makeKey();
     const aJson = '{"sid":"s1","x":1}';
@@ -94,10 +122,13 @@ describe("receipt verification", () => {
   it("accepts only an attestation naming this session and handshake", () => {
     const thSH = new Uint8Array(32).fill(7);
     const thSF = new Uint8Array(32).fill(9);
-    const own = { sid: "s1", thSH, thSF };
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) };
     const att = (o: Record<string, unknown>) =>
-      canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: null, ...o });
+      canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: "ab".repeat(32), ...o });
     expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
+    // The commitment is always checked: without ours there is nothing to compare.
+    expect(() => checkAttestationBinding(att({}), { sid: "s1", thSH, thSF })).toThrow(/commitment/);
+    expect(() => checkAttestationBinding(att({ c_commit: null }), own)).toThrow(/commitment/);
     expect(() => checkAttestationBinding(att({ sid: "s2" }), own)).toThrow(/not s1/);
     expect(() => checkAttestationBinding(att({ th_sh: "00".repeat(32) }), own)).toThrow(/handshake/);
     expect(() => checkAttestationBinding(att({ th_sf: null }), own)).toThrow(/handshake/);

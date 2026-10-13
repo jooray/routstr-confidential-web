@@ -6,7 +6,7 @@
 
 use client_wasm::driver::{self, Frame};
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -14,8 +14,8 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// Wires a driver's channel-0 frames to one end of a duplex; returns the
 /// other end and the control-event receiver.
 fn wire(
-    start: impl FnOnce(driver::Out) -> UnboundedSender<Frame>,
-) -> (tokio::io::DuplexStream, UnboundedReceiver<Value>, UnboundedSender<Frame>) {
+    start: impl FnOnce(driver::Out) -> driver::Input,
+) -> (tokio::io::DuplexStream, UnboundedReceiver<Value>, driver::Input) {
     let (a, b) = tokio::io::duplex(1 << 22);
     let (mut ar, mut aw) = tokio::io::split(a);
     let (out_tx, mut out_rx) = unbounded::<Frame>();
@@ -62,7 +62,7 @@ async fn next_ev(rx: &mut UnboundedReceiver<Value>, want: &str) -> Value {
     }
 }
 
-fn cmd(input: &UnboundedSender<Frame>, v: Value) {
+fn cmd(input: &driver::Input, v: Value) {
     input.unbounded_send((1, serde_json::to_vec(&v).unwrap())).unwrap();
 }
 
@@ -140,6 +140,13 @@ async fn zkchan_driver_against_node_channel() {
         assert_eq!(d["ok"], true, "{name}: {d}");
         eprintln!("zkchan: {name} ok");
     }
+    // Params for another statement than the command names are refused
+    // before anything reaches the channel (the channel stays usable).
+    let (_, c2s_params, c2s_w) = zkbench::fixtures::all().remove(1);
+    cmd(&input, json!({"cmd":"prove","id":8,"proof":"pi_c3s","params":c2s_params,"witness":c2s_w}));
+    let d = next_ev(&mut ev, "done").await;
+    assert_eq!(d["ok"], false);
+    assert!(d["err"].as_str().unwrap().contains("the params are for pi_c2s"), "{d}");
     // The client may not prove what the node proves.
     let (_, nk_params, nk_w) = zkbench::fixtures::all().remove(0);
     cmd(&input, json!({"cmd":"prove","id":9,"proof":"pi_nk","params":nk_params,"witness":nk_w}));
@@ -160,4 +167,45 @@ async fn zkchan_driver_against_node_channel() {
 fn fixtures_are_valid_json() {
     let v: Value = serde_json::from_str(&driver::fixtures_v2_json()).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prover_job_refuses_params_for_another_proof() {
+    let (_, c2s_params, c2s_w) = zkbench::fixtures::all().remove(1);
+    let job = serde_json::to_vec(&json!({"proof":"pi_c3s","role":"prover","params":c2s_params,"witness":c2s_w})).unwrap();
+    let (_node_io, mut ev, _input) = wire(|o| driver::spawn_prover_job(&job, o));
+    let d = next_ev(&mut ev, "done").await;
+    assert_eq!(d["ok"], false);
+    assert!(d["err"].as_str().unwrap().contains("its params are for pi_c2s"), "{d}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_backlog_is_bounded() {
+    // No node: the 2PC driver never reads past its first message, so input
+    // queues up until the limit, then the input closes and the driver stops.
+    let (out_tx, mut out_rx) = unbounded::<Frame>();
+    let input = driver::spawn_twopc(out_tx);
+    let chunk = vec![0u8; 8 << 20];
+    let mut sent = 0usize;
+    let err = loop {
+        match input.unbounded_send((0, chunk.clone())) {
+            Ok(()) => sent += chunk.len(),
+            Err(e) => break e,
+        }
+        assert!(sent <= driver::MAX_PENDING_INPUT + (8 << 20), "never refused");
+    };
+    assert_eq!(err, driver::InputError::Backlog);
+    assert!(input.pending() <= driver::MAX_PENDING_INPUT);
+    // Closed: later frames are refused too, and the driver ends.
+    assert!(input.unbounded_send((1, b"{}".to_vec())).is_err());
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some((ch, data)) = out_rx.next().await {
+            if ch == 1 && serde_json::from_slice::<Value>(&data).unwrap()["ev"] == "exit" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(ended, Ok(true));
 }

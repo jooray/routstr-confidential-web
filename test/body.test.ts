@@ -16,6 +16,7 @@ import {
   usageEventFromDisclosure,
 } from "../src/suffix.js";
 import { costMsat, modelPricing, promptLimit } from "../src/pricing.js";
+import { offerReserveMarginTokens } from "../src/offer.js";
 import { verifyConfidentialOffer } from "../src/offer.js";
 import { fromHex, hex } from "../src/bytes.js";
 import prod from "./fixtures/cypherpunk-offer.json";
@@ -152,6 +153,39 @@ describe("pricing", () => {
       (x) => x.id === m,
     );
     expect(q!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1016 * r.out) / 1000));
+  });
+
+  it("takes the context length in the node's order: top_provider first, then the model's", () => {
+    // The first positive integer wins, not the larger one.
+    expect(promptLimit({ id: "a", top_provider: { context_length: 1000 }, context_length: 5000 })).toBe(1000);
+    expect(promptLimit({ id: "a", top_provider: { context_length: 0 }, context_length: 5000 })).toBe(5000);
+    expect(promptLimit({ id: "a", top_provider: { context_length: null }, context_length: 5000 })).toBe(5000);
+    expect(promptLimit({ id: "a", top_provider: { context_length: 1.5 }, context_length: 700 })).toBe(700);
+    expect(promptLimit({ id: "a", top_provider: { context_length: -1 }, context_length: 0 })).toBeUndefined();
+    expect(promptLimit({ id: "a" })).toBeUndefined();
+  });
+
+  it("without a context length, reserves the model's maximum cost like the node", () => {
+    const m = Object.keys(offer.price_list)[0]!;
+    const r = offer.price_list[m]!;
+    const model = { id: m, sats_pricing: { max_cost: 12.3456 } };
+    // ceil(ceil(max_cost·1000)·(1 + pct/100) + margin·out/1000) + max(session fee, abandon fee)
+    const signed = { ...offer, reserve_margin_tokens: 16, rate_surcharge_pct: 10, session_fee_msat: 500, abandon_fee_msat: 2000 };
+    const [p] = modelPricing(signed, [model], 1000).filter((x) => x.id === m);
+    expect(p!.reservationMsat).toBe(Math.ceil(12346 * 1.1 + (16 * r.out) / 1000) + 2000);
+    // No surcharge, margin or fees: just the maximum cost, rounded up to msat.
+    const [q] = modelPricing(offer, [model], 1000).filter((x) => x.id === m);
+    expect(q!.reservationMsat).toBe(12346 + Math.ceil((offerReserveMarginTokens(offer) * r.out) / 1000));
+    // Neither a context length nor a maximum cost: unknown.
+    const [u] = modelPricing(offer, [{ id: m }], 1000).filter((x) => x.id === m);
+    expect(u!.reservationMsat).toBeUndefined();
+    const [z] = modelPricing(offer, [{ id: m, sats_pricing: { max_cost: 0 } }], 1000).filter((x) => x.id === m);
+    expect(z!.reservationMsat).toBeUndefined();
+    // A context length takes precedence over the maximum cost.
+    const [c] = modelPricing(offer, [{ ...model, context_length: 100_000 }], 1000).filter((x) => x.id === m);
+    expect(c!.reservationMsat).toBe(
+      Math.ceil((100_000 * r.in + (1000 + offerReserveMarginTokens(offer)) * r.out) / 1000),
+    );
   });
 
   it("hex round-trips", () => {

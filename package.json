@@ -1,6 +1,6 @@
 {
   "name": "@routstr/confidential-web",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Routstr confidential mode (protocol v2) in the browser: the node never sees the prompt or the response, the client never sees the provider key; 2PC handshake and proofs in wasm",
   "license": "MIT",
   "type": "module",

@@ -30,7 +30,7 @@ index a226bfc..69c4bb9 100644
  cu-crypto = { path = "../cu-crypto" }
  # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
-index 24c6b39..9de02fd 100644
+index 3affaa2..e2f8b72 100644
 --- a/crypto/twopc/src/lib.rs
 +++ b/crypto/twopc/src/lib.rs
 @@ -25,8 +25,8 @@
@@ -43,8 +43,8 @@ index 24c6b39..9de02fd 100644
 +//! multiplexer: tokio natively, `wasm-bindgen-futures` on wasm32, see [`rt`]); `close` flushes the transport; `take_timings` returns per-step
  //! wall time and transport bytes.
  //!
- //! # Protocol
-@@ -93,13 +93,15 @@ pub mod circuits;
+ //! The library sets no deadlines: a receive waits until the peer's data or
+@@ -105,13 +105,15 @@ pub mod circuits;
  mod ectf;
  pub mod gc;
  mod mux;
@@ -61,7 +61,7 @@ index 24c6b39..9de02fd 100644
  
  use futures::{AsyncRead, AsyncWrite};
  use mpz_common::{Context, Flush};
-@@ -408,6 +410,30 @@ fn os_rng() -> StdRng {
+@@ -431,6 +433,30 @@ fn os_rng() -> StdRng {
      r
  }
  
@@ -92,7 +92,7 @@ index 24c6b39..9de02fd 100644
  fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
      let mut out = Vec::with_capacity(16 * v.len());
      for b in v {
-@@ -647,7 +673,7 @@ impl Party {
+@@ -700,7 +726,7 @@ impl Party {
          if *TRACE {
              let c = self.counters.clone();
              let who = if self.role == Role::C { "C" } else { "N" };
@@ -101,7 +101,7 @@ index 24c6b39..9de02fd 100644
                  let t0 = Instant::now();
                  let mut last = (0, 0);
                  for _ in 0..200 {
-@@ -656,7 +682,7 @@ impl Party {
+@@ -709,7 +735,7 @@ impl Party {
                          eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
                          last = v;
                      }
@@ -110,7 +110,7 @@ index 24c6b39..9de02fd 100644
                  }
              });
          }
-@@ -680,7 +706,7 @@ impl Party {
+@@ -733,7 +759,7 @@ impl Party {
          let c_bits = spec(0).c_bits + spec(1).c_bits;
          let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
  
@@ -119,7 +119,7 @@ index 24c6b39..9de02fd 100644
              (0..2)
                  .map(|p| {
                      let s = spec(p);
-@@ -737,7 +763,7 @@ impl Party {
+@@ -791,7 +817,7 @@ impl Party {
                      && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
                      && t0.elapsed() < TABLES_MAX_WAIT
                  {
@@ -128,16 +128,16 @@ index 24c6b39..9de02fd 100644
                  }
              }
          };
-@@ -842,7 +868,7 @@ impl Party {
-         // Product check, openings, consistency-check material (CPU, blocking).
-         let mask_bits = mask_bits.to_vec();
-         let mask_macs = mask_macs.to_vec();
+@@ -897,7 +923,7 @@ impl Party {
+         let mask_bits = Zeroizing::new(mask_bits.to_vec());
+         let mask_macs = SecretBlocks(mask_macs.to_vec());
+         drop((r_bits, r_macs));
 -        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
 +        let (st, keys, msgs) = rt::spawn_blocking(move || {
              // Check rows and Y_N per phase.
              let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
                  let (lam, mac, t_mac) = &st[p];
-@@ -885,9 +911,7 @@ impl Party {
+@@ -940,9 +966,7 @@ impl Party {
                  (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
              };
              let mut msgs: Vec<Vec<u8>> = Vec::new();
@@ -148,7 +148,7 @@ index 24c6b39..9de02fd 100644
                  let mut acc = (Block::ZERO, Block::ZERO);
                  for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
                      let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
-@@ -932,7 +956,6 @@ impl Party {
+@@ -987,7 +1011,6 @@ impl Party {
                  let mut open = from_bits(&bits);
                  open.extend_from_slice(&hd);
                  msgs.push(open);
@@ -156,7 +156,7 @@ index 24c6b39..9de02fd 100644
              });
              for (r, y) in rows {
                  msgs.push(r);
-@@ -1045,7 +1068,7 @@ impl Party {
+@@ -1103,7 +1126,7 @@ impl Party {
          let chi_dv = chi(&seed, b"dvzk");
          let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
          let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
@@ -165,17 +165,17 @@ index 24c6b39..9de02fd 100644
              let mut off = 0;
              let mut per = Vec::new();
              let mut acc = Block::ZERO;
-@@ -1444,7 +1467,7 @@ impl Party {
+@@ -1519,7 +1542,7 @@ impl Party {
              && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
  
          let circ = s.circ.clone();
 -        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
 +        let (ok_check, out_labels) = rt::spawn_blocking(move || {
-             let l = gc::evaluate(&circ, &inl, &tables, phase);
+             let l = SecretBlocks(gc::evaluate(&circ, &inl, &tables, phase));
+             drop(inl);
              let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
-             let out: Vec<Block> = circ.outputs().map(|w| l[w]).collect();
 diff --git a/crypto/twopc/src/mux.rs b/crypto/twopc/src/mux.rs
-index 2a3a698..62f8451 100644
+index 21e6e06..d51662d 100644
 --- a/crypto/twopc/src/mux.rs
 +++ b/crypto/twopc/src/mux.rs
 @@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
@@ -187,7 +187,7 @@ index 2a3a698..62f8451 100644
  
  /// Maximum payload of one mux frame.
  const MAX_MUX_FRAME: usize = 1 << 20;
-@@ -86,7 +86,7 @@ impl Mux {
+@@ -93,7 +93,7 @@ impl Mux {
              remotes_w.push(rw);
              locals.push(local);
              let tx = if bulk.contains(&ch) { tx_bulk.clone() } else { tx.clone() };
@@ -196,7 +196,7 @@ index 2a3a698..62f8451 100644
                  let mut buf = vec![0u8; PUMP_CHUNK];
                  loop {
                      match rr.read(&mut buf).await {
-@@ -104,7 +104,7 @@ impl Mux {
+@@ -111,7 +111,7 @@ impl Mux {
          drop(tx_bulk);
  
          let c_w = counters.clone();
@@ -205,7 +205,7 @@ index 2a3a698..62f8451 100644
              let (mut hi_open, mut lo_open) = (true, true);
              loop {
                  // Normal frames first; bulk only when none is waiting.
-@@ -138,7 +138,7 @@ impl Mux {
+@@ -145,7 +145,7 @@ impl Mux {
          });
  
          let c_r = counters.clone();
@@ -214,7 +214,7 @@ index 2a3a698..62f8451 100644
              let mut remotes_w = remotes_w;
              loop {
                  let mut hdr = [0u8; 5];
-@@ -182,10 +182,10 @@ impl Mux {
+@@ -192,10 +192,10 @@ impl Mux {
      /// to the transport. The channel ends must have been dropped first.
      pub async fn close(mut self) {
          for p in self.pumps.drain(..) {
@@ -373,7 +373,7 @@ index 0000000..e454730
 +
 +pub use imp::*;
 diff --git a/crypto/zkbench/Cargo.toml b/crypto/zkbench/Cargo.toml
-index b5c7020..6293bd9 100644
+index f948594..7db6f8e 100644
 --- a/crypto/zkbench/Cargo.toml
 +++ b/crypto/zkbench/Cargo.toml
 @@ -14,7 +14,8 @@ mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da
@@ -386,9 +386,9 @@ index b5c7020..6293bd9 100644
  tokio-util = { version = "0.7", features = ["compat"] }
  rand = "0.10"
  sha2 = "0.10"
-@@ -29,6 +30,16 @@ itybity = "0.2"
- async-trait = "0.1"
+@@ -30,6 +31,16 @@ async-trait = "0.1"
  serio = "0.2"
+ zeroize = { version = "1", features = ["derive"] }
  
 +# Native: the full tokio runtime (binaries, node side, tests). On wasm32 only
 +# tokio's executor-agnostic parts (duplex, mpsc, Mutex, select!) are used and
@@ -404,7 +404,7 @@ index b5c7020..6293bd9 100644
  rayon = ["mpz-zk/rayon"]
  
 diff --git a/crypto/zkbench/src/channel.rs b/crypto/zkbench/src/channel.rs
-index 9d8969a..8d01bdc 100644
+index ec8852a..7acf798 100644
 --- a/crypto/zkbench/src/channel.rs
 +++ b/crypto/zkbench/src/channel.rs
 @@ -34,7 +34,7 @@
@@ -416,14 +416,23 @@ index 9d8969a..8d01bdc 100644
  
  use anyhow::{Context as _, Result, anyhow, bail};
  use futures::{AsyncRead, AsyncWrite};
+@@ -494,7 +494,7 @@ impl ZkChannel {
+ 
+         let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64 };
+         ctl.io_mut().send(mine).await.context("proof channel hello")?;
+-        let peer: Hello = tokio::time::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
++        let peer: Hello = crate::rt::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
+             .await
+             .map_err(|_| anyhow::anyhow!("proof channel hello: no reply in {}s", HELLO_TIMEOUT.as_secs()))?
+             .context("proof channel hello")?;
 diff --git a/crypto/zkbench/src/lib.rs b/crypto/zkbench/src/lib.rs
-index 4edfda2..8048973 100644
+index efdedbc..9e69c29 100644
 --- a/crypto/zkbench/src/lib.rs
 +++ b/crypto/zkbench/src/lib.rs
-@@ -12,7 +12,9 @@ pub mod gadgets;
+@@ -11,7 +11,9 @@ pub mod mux;
+ pub mod gadgets;
  pub mod proofs;
  pub mod statements;
- pub mod statements_v2;
 +#[cfg(not(target_arch = "wasm32"))]
  pub mod transport;
 +pub mod rt;
@@ -431,7 +440,7 @@ index 4edfda2..8048973 100644
  /// Which side of a proof we are building.
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 diff --git a/crypto/zkbench/src/mux.rs b/crypto/zkbench/src/mux.rs
-index 3d647b9..eeafd0a 100644
+index d7f9e87..eb6b4de 100644
 --- a/crypto/zkbench/src/mux.rs
 +++ b/crypto/zkbench/src/mux.rs
 @@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
@@ -443,7 +452,7 @@ index 3d647b9..eeafd0a 100644
  
  /// Maximum payload of one mux frame.
  const MAX_MUX_FRAME: usize = 1 << 20;
-@@ -69,7 +69,7 @@ impl Mux {
+@@ -77,7 +77,7 @@ impl Mux {
              remotes_w.push(rw);
              locals.push(local);
              let tx = tx.clone();
@@ -452,7 +461,7 @@ index 3d647b9..eeafd0a 100644
                  let mut buf = vec![0u8; PUMP_CHUNK];
                  loop {
                      match rr.read(&mut buf).await {
-@@ -86,7 +86,7 @@ impl Mux {
+@@ -94,7 +94,7 @@ impl Mux {
          drop(tx);
  
          let c_w = counters.clone();
@@ -461,7 +470,7 @@ index 3d647b9..eeafd0a 100644
              while let Some((ch, data)) = rx.recv().await {
                  let mut hdr = [0u8; 5];
                  hdr[0] = ch;
-@@ -105,7 +105,7 @@ impl Mux {
+@@ -113,7 +113,7 @@ impl Mux {
          });
  
          let c_r = counters.clone();
@@ -470,7 +479,7 @@ index 3d647b9..eeafd0a 100644
              let mut remotes_w = remotes_w;
              loop {
                  let mut hdr = [0u8; 5];
-@@ -148,10 +148,10 @@ impl Mux {
+@@ -160,10 +160,10 @@ impl Mux {
      /// to the transport. The channel ends must have been dropped first.
      pub async fn close(mut self) {
          for p in self.pumps.drain(..) {
@@ -484,7 +493,7 @@ index 3d647b9..eeafd0a 100644
          self.reader.abort();
      }
 diff --git a/crypto/zkbench/src/proofs.rs b/crypto/zkbench/src/proofs.rs
-index a97c71f..d54d3ae 100644
+index 385e07a..e154720 100644
 --- a/crypto/zkbench/src/proofs.rs
 +++ b/crypto/zkbench/src/proofs.rs
 @@ -12,11 +12,14 @@ use mpz_ot::{
@@ -520,7 +529,7 @@ index a97c71f..d54d3ae 100644
          let checks = build(&mut verifier, Role::Verifier, &params_v, None)?;
          let mut futs = Vec::with_capacity(checks.len());
          for c in &checks {
-@@ -315,6 +318,7 @@ fn sha256_blocks(len: usize) -> usize {
+@@ -283,6 +286,7 @@ fn sha256_blocks(len: usize) -> usize {
  }
  
  /// Outcome of a prover‖verifier run over an emulated transport.
@@ -528,7 +537,7 @@ index a97c71f..d54d3ae 100644
  #[derive(Debug)]
  pub struct PairOutcome {
      pub checks: Vec<CheckResult>,
-@@ -324,6 +328,7 @@ pub struct PairOutcome {
+@@ -292,6 +296,7 @@ pub struct PairOutcome {
  }
  
  /// Run prover and verifier against each other over the emulated transport.

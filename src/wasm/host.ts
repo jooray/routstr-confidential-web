@@ -23,6 +23,12 @@ export interface DriverOptions {
 
 export type FrameHandler = (channel: number, data: Uint8Array) => void;
 
+/**
+ * Called at most once when the driver can no longer run: the worker hosting
+ * it crashed, or it could not be started. No frames follow.
+ */
+export type DriverErrorHandler = (error: Error) => void;
+
 export interface DriverHandle {
   push(channel: number, data: Uint8Array): void;
   close(): void;
@@ -31,7 +37,7 @@ export interface DriverHandle {
 export interface WasmHost {
   /** Resolves once the wasm module is instantiated. */
   ready(): Promise<void>;
-  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler): DriverHandle;
+  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler, onError?: DriverErrorHandler): DriverHandle;
   /** zkbench fixtures (benchmarks only). */
   fixtures?(): Promise<string>;
   terminate?(): void;
@@ -85,7 +91,7 @@ export class InlineWasmHost implements WasmHost {
     return this.mod!.fixturesV2();
   }
 
-  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler): DriverHandle {
+  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler, onError?: DriverErrorHandler): DriverHandle {
     const mod = this.mod;
     if (!mod) throw new Error("wasm host not ready (await host.ready() first)");
     // The callback runs inside wasm's event-loop tasks; never let a JS error
@@ -104,7 +110,18 @@ export class InlineWasmHost implements WasmHost {
     let closed = false;
     return {
       push: (ch, data) => {
-        if (!closed) d.push(ch, data);
+        if (closed) return;
+        try {
+          d.push(ch, data);
+        } catch (e) {
+          // A driver that already stopped drops late input (its own events
+          // report why it stopped); a backlog over the limit ends it.
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("backlog")) {
+            closed = true;
+            onError?.(new Error(msg));
+          }
+        }
       },
       close: () => {
         if (closed) return;
@@ -133,6 +150,7 @@ export type FromWorker =
   | { op: "ready"; info: string }
   | { op: "init_error"; msg: string }
   | { op: "frame"; id: number; ch: number; data: Uint8Array }
+  | { op: "driver_error"; id: number; msg: string }
   | { op: "fixtures"; id: number; json: string };
 
 export interface WorkerHostOptions {
@@ -146,8 +164,10 @@ export class WorkerWasmHost implements WasmHost {
   readonly worker: Worker;
   private readyP: Promise<void>;
   private nextId = 1;
-  private handlers = new Map<number, FrameHandler>();
-  private fixtureWaiters = new Map<number, (s: string) => void>();
+  private handlers = new Map<number, { onFrame: FrameHandler; onError?: DriverErrorHandler }>();
+  private fixtureWaiters = new Map<number, { res: (s: string) => void; rej: (e: Error) => void }>();
+  /** Set once the worker failed: every driver on it is gone. */
+  private dead?: Error;
   info = "";
 
   constructor(options: WorkerHostOptions = {}) {
@@ -159,20 +179,72 @@ export class WorkerWasmHost implements WasmHost {
         if (m.op === "ready") {
           this.info = m.info;
           res();
-        } else if (m.op === "init_error") rej(new Error(`wasm worker: ${m.msg}`));
-        else if (m.op === "frame") this.handlers.get(m.id)?.(m.ch, m.data);
-        else if (m.op === "fixtures") {
-          this.fixtureWaiters.get(m.id)?.(m.json);
+        } else if (m.op === "init_error") {
+          const e = new Error(`wasm worker: ${m.msg}`);
+          rej(e);
+          this.fail(e);
+        } else if (m.op === "frame") this.handlers.get(m.id)?.onFrame(m.ch, m.data);
+        else if (m.op === "driver_error") {
+          const h = this.handlers.get(m.id);
+          this.handlers.delete(m.id);
+          h?.onError?.(new Error(`wasm driver: ${m.msg}`));
+        } else if (m.op === "fixtures") {
+          this.fixtureWaiters.get(m.id)?.res(m.json);
           this.fixtureWaiters.delete(m.id);
         }
       };
-      this.worker.onerror = (e) => rej(new Error(`wasm worker failed: ${e.message}`));
+      // An uncaught error in the worker (a wasm trap or panic included) leaves
+      // its wasm instance unusable: before ready it fails `ready()`, after it
+      // every live driver, and the page-wide host is replaced.
+      this.worker.onerror = (e: ErrorEvent) => {
+        e.preventDefault?.();
+        const err = new Error(`wasm worker failed: ${e.message ?? "error"}`);
+        rej(err);
+        this.fail(err);
+      };
+      this.worker.onmessageerror = () => {
+        const err = new Error("wasm worker: undecodable message");
+        rej(err);
+        this.fail(err);
+      };
     });
     this.readyP.catch(() => {});
     this.post({ op: "init", wasm: options.wasmUrl });
   }
 
+  /** The worker failed: fail every pending handler, stop the worker, stop being the default host. */
+  private fail(err: Error): void {
+    if (this.dead) return;
+    this.dead = err;
+    const handlers = [...this.handlers.values()];
+    this.handlers.clear();
+    const waiters = [...this.fixtureWaiters.values()];
+    this.fixtureWaiters.clear();
+    this.readyP = Promise.reject(err);
+    this.readyP.catch(() => {});
+    try {
+      this.worker.terminate();
+    } catch {
+      /* ignore */
+    }
+    if (defaultHost === this) defaultHost = undefined;
+    for (const h of handlers) {
+      try {
+        h.onError?.(err);
+      } catch (e) {
+        console.error("confidential-web: driver error handler failed", e);
+      }
+    }
+    for (const w of waiters) w.rej(err);
+  }
+
+  /** The error that ended this host's worker, if it failed. */
+  get failure(): Error | undefined {
+    return this.dead;
+  }
+
   private post(m: ToWorker, transfer: Transferable[] = []): void {
+    if (this.dead) return;
     this.worker.postMessage(m, transfer);
   }
 
@@ -183,14 +255,19 @@ export class WorkerWasmHost implements WasmHost {
   async fixtures(): Promise<string> {
     await this.readyP;
     const id = this.nextId++;
-    const p = new Promise<string>((res) => this.fixtureWaiters.set(id, res));
+    const p = new Promise<string>((res, rej) => this.fixtureWaiters.set(id, { res, rej }));
     this.post({ op: "fixtures", id });
     return p;
   }
 
-  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler): DriverHandle {
+  start(kind: DriverKind, options: DriverOptions, onFrame: FrameHandler, onError?: DriverErrorHandler): DriverHandle {
     const id = this.nextId++;
-    this.handlers.set(id, onFrame);
+    if (this.dead) {
+      const err = this.dead;
+      queueMicrotask(() => onError?.(err));
+      return { push: () => {}, close: () => {} };
+    }
+    this.handlers.set(id, { onFrame, onError });
     this.post({ op: "start", id, kind, options });
     let closed = false;
     return {
@@ -204,14 +281,17 @@ export class WorkerWasmHost implements WasmHost {
         if (closed) return;
         closed = true;
         this.post({ op: "close", id });
-        // Late frames (the driver's last flush) are dropped after a grace period.
+        // Late frames (the driver's last flush) are dropped after a grace
+        // period; a closed driver's failure is no longer reported.
+        const h = this.handlers.get(id);
+        if (h) h.onError = undefined;
         setTimeout(() => this.handlers.delete(id), 5_000);
       },
     };
   }
 
   terminate(): void {
-    this.worker.terminate();
+    this.fail(new Error("wasm worker terminated"));
   }
 }
 

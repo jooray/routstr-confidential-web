@@ -10,6 +10,8 @@ export interface NodeModel {
   description?: string;
   context_length?: number;
   top_provider?: { context_length?: number | null; max_completion_tokens?: number | null } | null;
+  /** Per-token prices and the per-request maximum, in sats (the node's model list). */
+  sats_pricing?: { max_cost?: number; prompt?: number; completion?: number; [k: string]: unknown } | null;
   [k: string]: unknown;
 }
 

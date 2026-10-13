@@ -203,8 +203,20 @@ Rebuilding the wasm needs rustup (the toolchain is pinned in
 (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`). `wasm-opt`
 comes from the `binaryen` devDependency. `.cargo/config.toml` selects the
 getrandom `wasm_js` backend and enables `simd128`, which every evergreen
-browser supports (Safari ≥ 16.4). The wasm is 5.98 MB, 1.81 MB gzipped. Commit
+browser supports (Safari ≥ 16.4). The wasm is 5.93 MB, 1.8 MB gzipped. Commit
 `wasm/pkg/` after rebuilding.
+
+**Checking the committed wasm.** The build is meant to be byte-reproducible:
+`build-wasm.sh` remaps host paths (the checkout and `CARGO_HOME`) out of the
+binary, enforces `Cargo.lock` and uses the pinned `wasm-opt`. Rebuilding the
+same tree from another checkout path and an empty target directory gives the
+same bytes. `buildInfo()` (exposed by the wasm and shown by the demo app)
+names the upstream commit, the mpz2 rev and `src:<digest>`, a SHA-256 over
+every source file that goes into the wasm; `node scripts/source-digest.mjs`
+recomputes it from a checkout and `--check` fails if `wasm/pkg` was not built
+from that tree. CI (`.github/workflows/wasm.yml`) runs the digest check and the
+tests, and rebuilds `wasm/pkg` on Linux and compares it byte for byte with the
+committed files.
 
 **Using it from a bundler.** The worker (`new URL("./worker.js",
 import.meta.url)`) and the `.wasm` (`new URL("client_wasm_bg.wasm",
@@ -217,23 +229,22 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 ## Dependencies on routstr-confidential
 
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
-`jooray/routstr-confidential@0903e77` (branch `twopc-v2`). The first commit
-here is the pristine copy. The second applies the wasm32 patch, which is also
-exported as `patches/routstr-confidential-wasm32.patch` with an explanation in
-`patches/README.md`, for upstreaming. Once it is upstream, the vendored copies
-can become a git dependency on that repository. Later upstream changes are
-applied to the vendored copies as they land; `twopc` and `zkbench` currently
-match `twopc-v2@5abd8c9` (plus the wasm32 patch). mpz2 is pinned at the same rev
-(`8f89783`) and needed no change. The TS sources `offer.ts`, `receipt.ts`,
-`params.ts`, `suffix.ts`, `hosts.ts`, `canonical.ts`, `errors.ts` and the TLS
-fork come from routstr-sdk (`confidential-2pc`, commit `abfd9a6`) with
-node-only imports replaced. The browser changes to the TLS fork are listed in
+`jooray/routstr-confidential` (branch `twopc-v2`) at the commit named in
+`crates/vendor/UPSTREAM`, with the wasm32 patch applied. The patch is
+`patches/routstr-confidential-wasm32.patch`, explained in
+`patches/README.md`; applying it to that commit reproduces `crates/vendor/`
+exactly. Once it is upstream, the vendored copies can become a git dependency
+on that repository. mpz2 is pinned at the same rev (`8f89783`) and needed no
+change. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `suffix.ts`,
+`hosts.ts`, `canonical.ts`, `errors.ts` and the TLS fork come from
+routstr-sdk (`confidential-2pc`) with node-only imports replaced; `session.ts`
+is a port of the SDK's with the same checks. The browser changes to the TLS fork are listed in
 `src/tls-fork/FORK-NOTES.md`.
 
 ## Tests
 
 ```bash
-npm test                                             # vitest: offer/receipt/fees/suffix/padding/params/SSE/pricing (33 tests)
+npm test                                             # vitest: offer/receipt/fees/suffix/padding/params/SSE/pricing/worker host, and the wasm source digest
 cargo test --release -p client-wasm                  # the wasm drivers' logic natively, against the real node side (2PC + proof channel)
 cargo test --release -p twopc -p zkbench             # the vendored crates with the patch, natively (unchanged results)
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \

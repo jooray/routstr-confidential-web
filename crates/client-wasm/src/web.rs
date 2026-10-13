@@ -4,7 +4,7 @@
 //! page responsive (the garbled-circuit evaluation is CPU-bound).
 
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::mpsc::unbounded;
 use wasm_bindgen::prelude::*;
 
 use crate::driver::{self, Frame};
@@ -26,14 +26,14 @@ fn sink(cb: js_sys::Function) -> driver::Out {
     tx
 }
 
-struct Input(Option<UnboundedSender<Frame>>);
+struct Input(Option<driver::Input>);
 
 impl Input {
     fn push(&self, channel: u8, data: &[u8]) -> Result<(), JsValue> {
         match &self.0 {
             Some(tx) => tx
                 .unbounded_send((channel, data.to_vec()))
-                .map_err(|_| JsValue::from_str("driver has stopped")),
+                .map_err(|e| JsValue::from_str(&e.to_string())),
             None => Err(JsValue::from_str("closed")),
         }
     }
@@ -127,5 +127,5 @@ pub fn fixtures_v2() -> String {
 
 #[wasm_bindgen(js_name = buildInfo)]
 pub fn build_info() -> String {
-    format!("client-wasm {} (protocol v2; routstr-confidential@0903e77, mpz2@8f89783)", env!("CARGO_PKG_VERSION"))
+    driver::build_info()
 }

@@ -3,7 +3,10 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at `0903e77` (branch `twopc-v2`):
+`jooray/routstr-confidential` at bc3a3d4 (branch `twopc-v2`, the
+commit after `5abd8c9`), and `git apply` of it there reproduces
+`crates/vendor/` byte for byte (`cu-crypto` needs no change and is a plain
+copy):
 
 ```bash
 cd routstr-confidential && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
@@ -11,8 +14,12 @@ cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
 
-This repository vendors the patched crates in `crates/vendor/` (first commit:
-pristine copy; second commit: this patch), so the diff is reviewable in git.
+This repository vendors the patched crates in `crates/vendor/`. To re-vendor
+after a change upstream: copy `crypto/{cu-crypto,twopc,zkbench}` (without
+`target/` and `zkbench/Cargo.lock`) from a tree with this patch applied, or
+regenerate the patch from the merged result with
+`git diff --no-index` against the pristine crates, and check that applying it
+to the new base reproduces `crates/vendor/` exactly.
 
 What it changes:
 
@@ -30,7 +37,8 @@ What it changes:
    and the node-side `std::thread::scope` for the two phases' check rows
    becomes `scope2` (threads natively, sequential on wasm). `testutil` is
    native-only.
-4. **`zkbench`**: `channel.rs` uses `rt::Instant`; `proofs.rs` spawns with
+4. **`zkbench`**: `channel.rs` uses `rt::Instant` and `rt::timeout` (the
+   hello timeout); `proofs.rs` spawns with
    `rt::spawn`; the emulated `transport` module and `run_pair_transport`
    (benchmarks, need tokio timers) are native-only.
 5. **Cargo.toml** (both): tokio is `["sync","macros","io-util"]` everywhere and
