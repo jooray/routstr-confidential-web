@@ -368,6 +368,19 @@ function indexOfCrlfCrlf(b: Uint8Array): number {
  * finished when the request was made (`tClaim`); a request that arrived while
  * the arm was running waited `waitedForArmMs` for it.
  */
+/**
+ * The node's `ready` frame: a v2 session under the signed offer's key. A
+ * missing key is refused too, here, before the 2PC and any provider traffic.
+ */
+export function checkReady(ready: { v?: unknown; pubkey?: unknown }, offer: { notary_pubkey: string }): void {
+  if (ready.v !== 2) {
+    throw new SessionProtocolError(`node started a v${String(ready.v ?? 1)} session for a v2 offer`);
+  }
+  if (ready.pubkey !== offer.notary_pubkey) {
+    throw new SessionProtocolError("the session key differs from the signed offer's key");
+  }
+}
+
 export function claimTiming(
   tClaim: number,
   tArmed: number,
@@ -809,13 +822,7 @@ export class ConfidentialSession {
     this.sid = this.ready.sid;
     this.tReady = Date.now();
     this.event({ ev: "ready", sid: this.sid, v: this.ready.v ?? 1 });
-    if (this.ready.v !== 2) {
-      throw new SessionProtocolError(`node started a v${this.ready.v ?? 1} session for a v2 offer`);
-    }
-    // A missing key is refused here too, before the 2PC and any provider traffic.
-    if (this.ready.pubkey !== this.offer.notary_pubkey) {
-      throw new SessionProtocolError("the session key differs from the signed offer's key");
-    }
+    checkReady(this.ready, this.offer);
 
     const twoPc = new TwoPcSession(this.host, this.WS);
     this.twoPc = twoPc;
