@@ -45,6 +45,7 @@ import {
 import { base64ToBytes, imageMimeType, imageSuffix, responseImages } from "./images.js";
 import {
   canonicalSuffix,
+  validateChatSuffix,
   disclosureTailLens,
   effectiveModelFromText,
   extractUsageDisclosure,
@@ -515,7 +516,17 @@ export class ConfidentialSession {
       this.image = { ...options.image, variant: signed };
       this.suffix = imageSuffix(images, options.model, signed, options.image.count);
     } else {
-      this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
+      // Held to the policy as at verification (a caller may pass an offer
+      // that did not go through verifyConfidentialOffer).
+      if (options.offer.v !== 2) {
+        throw new SessionProtocolError(`the browser client speaks protocol v2 only (offer v=${options.offer.v})`);
+      }
+      try {
+        validateChatSuffix(options.offer.chat, options.offer.suffix_keys);
+      } catch (e) {
+        throw new SessionProtocolError(`the signed offer's chat block is refused: ${(e as Error).message}`);
+      }
+      this.suffix = options.suffix ?? canonicalSuffix(options.offer.chat, options.model, options.maxTokens);
     }
     if (options.offer.v !== 2) {
       throw new SessionProtocolError(`the browser client speaks protocol v2 only (offer v=${options.offer.v})`);

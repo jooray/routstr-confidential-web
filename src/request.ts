@@ -6,32 +6,40 @@
  */
 
 import { endsWith } from "./bytes.js";
-import { SessionProtocolError } from "./errors.js";
-import { canonicalSuffix } from "./suffix.js";
+import { ConfidentialError, SessionProtocolError } from "./errors.js";
+import { CHAT_PROTOCOL_KEYS, type ChatSuffixSpec, canonicalSuffix, samePinValue } from "./suffix.js";
 
-/** Request keys the pinned suffix sets; they never come from the caller. */
-export const PINNED_KEYS = new Set([
-  "model",
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  "n",
-  "stream",
-  "stream_options",
-  "venice_parameters",
-]);
-
-export function buildPinnedBody(request: Record<string, unknown>, model: string, maxTokens: number): Uint8Array {
+/**
+ * The protocol's own keys (model, caps, n, stream) never come from the
+ * caller. Another key the offer pins is dropped when the caller asked for the
+ * pinned value, and refused when it asked for another: the suffix would
+ * silently override it.
+ */
+export function buildPinnedBody(
+  request: Record<string, unknown>,
+  model: string,
+  maxTokens: number,
+  chat: ChatSuffixSpec,
+): Uint8Array {
+  const pinned = new Map(chat.fixed_pins);
   const priv: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(request)) {
-    if (!PINNED_KEYS.has(k)) priv[k] = v;
+    if (CHAT_PROTOCOL_KEYS.has(k)) continue;
+    if (pinned.has(k)) {
+      if (samePinValue(v, pinned.get(k))) continue;
+      throw new ConfidentialError(
+        "pinned_parameter",
+        `the node's offer pins ${k} to ${JSON.stringify(pinned.get(k))}; this request sets it to ${JSON.stringify(v)}`,
+      );
+    }
+    priv[k] = v;
   }
   // The body must end with the exact suffix π_C2S proves, leading comma
   // included, so it needs at least one private field before it.
   if (Object.keys(priv).length === 0) throw new SessionProtocolError("a confidential request needs its messages");
   const json = JSON.stringify(priv);
   // Drop the closing brace: the suffix closes the object and wins last.
-  return new TextEncoder().encode(json.slice(0, -1) + canonicalSuffix(model, maxTokens));
+  return new TextEncoder().encode(json.slice(0, -1) + canonicalSuffix(chat, model, maxTokens));
 }
 
 export function requestedMaxTokens(request: Record<string, unknown>, cap: number): number {

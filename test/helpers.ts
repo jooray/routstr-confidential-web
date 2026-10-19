@@ -2,6 +2,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { canonicalJson } from "../src/canonical.js";
+import { VENICE_CHAT } from "./fixtures/chat.js";
 
 export function makeKey(fill = 7) {
   const priv = new Uint8Array(32).fill(fill);
@@ -28,6 +29,7 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
     head_template:
       "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\nContent-Length: {LEN}\r\n\r\n",
     suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
+    chat: VENICE_CHAT,
     price_list: {
       cheap: { in: 1000, cached_in: 100, out: 2000 },
       dear: { in: 2000, cached_in: 2000, out: 4000 },

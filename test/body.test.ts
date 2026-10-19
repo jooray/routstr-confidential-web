@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { VENICE_CHAT } from "./fixtures/chat.js";
 import {
   aggregateChatCompletion,
   buildPinnedBody,
@@ -26,14 +27,14 @@ const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 describe("canonical suffix", () => {
   it("is byte-exact with the sidecar's reconstruction", () => {
-    expect(canonicalSuffix("deepseek-v4-flash", 128)).toBe(
+    expect(canonicalSuffix(VENICE_CHAT, "deepseek-v4-flash", 128)).toBe(
       ',"model":"deepseek-v4-flash","max_tokens":128,"max_completion_tokens":128,"n":1,"stream":true,' +
         '"stream_options":{"include_usage":true},' +
-        '"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}',
+        '"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}',
     );
   });
   it("JSON-escapes the model name", () => {
-    expect(canonicalSuffix('a"b', 1)).toContain('"model":"a\\"b"');
+    expect(canonicalSuffix(VENICE_CHAT, 'a"b', 1)).toContain('"model":"a\\"b"');
   });
 });
 
@@ -43,9 +44,10 @@ describe("pinned body", () => {
       { model: "evil", max_tokens: 99999, n: 4, stream: false, messages: [{ role: "user", content: "hi" }] },
       "m",
       12,
+      VENICE_CHAT,
     );
     const text = dec(body);
-    const suffix = canonicalSuffix("m", 12);
+    const suffix = canonicalSuffix(VENICE_CHAT, "m", 12);
     expect(text.endsWith(suffix)).toBe(true);
     expect(text.slice(0, -suffix.length)).toBe('{"messages":[{"role":"user","content":"hi"}]');
     const j = JSON.parse(text);
@@ -53,9 +55,9 @@ describe("pinned body", () => {
   });
 
   it("needs a private field before the exact suffix", () => {
-    expect(() => buildPinnedBody({ model: "m" }, "m", 3)).toThrow(/messages/);
-    const body = dec(buildPinnedBody({ model: "m", messages: [] }, "m", 3));
-    expect(body.endsWith(canonicalSuffix("m", 3))).toBe(true);
+    expect(() => buildPinnedBody({ model: "m" }, "m", 3, VENICE_CHAT)).toThrow(/messages/);
+    const body = dec(buildPinnedBody({ model: "m", messages: [] }, "m", 3, VENICE_CHAT));
+    expect(body.endsWith(canonicalSuffix(VENICE_CHAT, "m", 3))).toBe(true);
     expect(JSON.parse(body).max_tokens).toBe(3);
   });
 
@@ -66,8 +68,8 @@ describe("pinned body", () => {
   });
 
   it("pads with spaces before the suffix: same JSON, suffix still last", () => {
-    const body = buildPinnedBody({ messages: [{ role: "user", content: "héllo" }] }, "m", 5);
-    const suffix = canonicalSuffix("m", 5);
+    const body = buildPinnedBody({ messages: [{ role: "user", content: "héllo" }] }, "m", 5, VENICE_CHAT);
+    const suffix = canonicalSuffix(VENICE_CHAT, "m", 5);
     const padded = padPinnedBody(body, 4096, suffix);
     expect(padded.length).toBe(4096);
     expect(dec(padded).endsWith(suffix)).toBe(true);
@@ -162,6 +164,9 @@ describe("pricing", () => {
     pinnedPubkeys: ["2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7"],
     trustedHosts: ["api.venice.ai"],
   });
+  // The production offer without fees or a completion margin, so the expected
+  // reservations below are the bare rate arithmetic.
+  const plain = { ...offer, session_fee_msat: undefined, abandon_fee_msat: undefined, reserve_margin_tokens: undefined };
 
   it("prices usage like the node (cached input at the cached rate)", () => {
     const rates = { in: 1000, cached_in: 100, out: 2000 };
@@ -175,12 +180,12 @@ describe("pricing", () => {
     expect(promptLimit({ id: "a", context_length: 500 })).toBe(500);
     expect(promptLimit(undefined)).toBeUndefined();
     const m = Object.keys(offer.price_list)[0]!;
-    const [p] = modelPricing(offer, [{ id: m, context_length: 100_000 }], 1000).filter((x) => x.id === m);
+    const [p] = modelPricing(plain, [{ id: m, context_length: 100_000 }], 1000).filter((x) => x.id === m);
     const r = offer.price_list[m]!;
     expect(p!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1000 * r.out) / 1000));
     expect(p!.sessionFeeMsat).toBe(0);
     // The node reserves the offer's completion margin on top of max_tokens.
-    const [q] = modelPricing({ ...offer, reserve_margin_tokens: 16 }, [{ id: m, context_length: 100_000 }], 1000).filter(
+    const [q] = modelPricing({ ...plain, reserve_margin_tokens: 16 }, [{ id: m, context_length: 100_000 }], 1000).filter(
       (x) => x.id === m,
     );
     expect(q!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1016 * r.out) / 1000));
@@ -205,17 +210,17 @@ describe("pricing", () => {
     const [p] = modelPricing(signed, [model], 1000).filter((x) => x.id === m);
     expect(p!.reservationMsat).toBe(Math.ceil(12346 * 1.1 + (16 * r.out) / 1000) + 2000);
     // No surcharge, margin or fees: just the maximum cost, rounded up to msat.
-    const [q] = modelPricing(offer, [model], 1000).filter((x) => x.id === m);
-    expect(q!.reservationMsat).toBe(12346 + Math.ceil((offerReserveMarginTokens(offer) * r.out) / 1000));
+    const [q] = modelPricing(plain, [model], 1000).filter((x) => x.id === m);
+    expect(q!.reservationMsat).toBe(12346 + Math.ceil((offerReserveMarginTokens(plain) * r.out) / 1000));
     // Neither a context length nor a maximum cost: unknown.
-    const [u] = modelPricing(offer, [{ id: m }], 1000).filter((x) => x.id === m);
+    const [u] = modelPricing(plain, [{ id: m }], 1000).filter((x) => x.id === m);
     expect(u!.reservationMsat).toBeUndefined();
-    const [z] = modelPricing(offer, [{ id: m, sats_pricing: { max_cost: 0 } }], 1000).filter((x) => x.id === m);
+    const [z] = modelPricing(plain, [{ id: m, sats_pricing: { max_cost: 0 } }], 1000).filter((x) => x.id === m);
     expect(z!.reservationMsat).toBeUndefined();
     // A context length takes precedence over the maximum cost.
-    const [c] = modelPricing(offer, [{ ...model, context_length: 100_000 }], 1000).filter((x) => x.id === m);
+    const [c] = modelPricing(plain, [{ ...model, context_length: 100_000 }], 1000).filter((x) => x.id === m);
     expect(c!.reservationMsat).toBe(
-      Math.ceil((100_000 * r.in + (1000 + offerReserveMarginTokens(offer)) * r.out) / 1000),
+      Math.ceil((100_000 * r.in + (1000 + offerReserveMarginTokens(plain)) * r.out) / 1000),
     );
   });
 

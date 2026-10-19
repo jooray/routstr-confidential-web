@@ -24,6 +24,7 @@ export type ConfidentialErrorCode =
   | "not_configured"
   | "unsupported_endpoint"
   | "offer_no_images"
+  | "pinned_parameter"
   | "upstream_error";
 
 export class ConfidentialError extends Error {

@@ -656,8 +656,8 @@ export class ConfidentialClient {
       throw new ConfidentialError("offer_malformed", `the node does not serve ${model} confidentially`);
     }
     const maxTokens = requestedMaxTokens(params, Number(offer.max_tokens_cap ?? 4096));
-    const body = buildPinnedBody(params, model, maxTokens);
-    const suffix = canonicalSuffix(model, maxTokens);
+    const body = buildPinnedBody(params, model, maxTokens, offer.chat);
+    const suffix = canonicalSuffix(offer.chat, model, maxTokens);
     const pw = this.prewarmer;
     // The request's start: a warm request may first wait for an arm still in
     // progress, and that wait belongs in its timings.

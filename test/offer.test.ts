@@ -110,7 +110,9 @@ describe("offer verification", () => {
     for (const bad of [-1, 1.5, "10"]) {
       expect(() => validateOfferShape({ ...shape, session_fee_msat: bad })).toThrow(OfferMalformedError);
     }
-    // suffix_keys must be exactly the keys the canonical suffix pins.
+    // suffix_keys must be exactly the keys the chat block pins, and the block is required.
+    const { chat: _chat, ...noChat } = shape as Record<string, unknown>;
+    expect(() => validateOfferShape(noChat)).toThrow(/chat/);
     for (const keys of [[], ["model", "max_tokens", "stream"], ["venice_parameters", "stream_options", "stream", "n", "max_completion_tokens", "max_tokens", "model"]]) {
       expect(() => validateOfferShape({ ...shape, suffix_keys: keys })).toThrow(/suffix_keys/);
     }
