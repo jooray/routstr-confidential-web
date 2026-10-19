@@ -100,6 +100,17 @@ describe("streaming", () => {
     expect(agg.usage).toEqual({ prompt_tokens: 3, completion_tokens: 2 });
   });
 
+  it("keeps streamed tool calls when folding a completion", () => {
+    const agg = aggregateChatCompletion([
+      { id: "c", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "t1", type: "function", function: { name: "get_", arguments: '{"a"' } }] } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "time", arguments: ":1}" } }] }, finish_reason: "tool_calls" }] },
+    ]) as any;
+    expect(agg.choices[0].message.tool_calls).toEqual([
+      { id: "t1", type: "function", function: { name: "get_time", arguments: '{"a":1}' } },
+    ]);
+    expect(agg.choices[0].finish_reason).toBe("tool_calls");
+  });
+
   it("de-chunks an HTTP/1.1 response incrementally", () => {
     const raw =
       "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n" +

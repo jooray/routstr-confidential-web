@@ -143,7 +143,8 @@ const PREWARM_DEFAULTS = {
  * One armed session for the current (model, max_tokens), kept while the page
  * is visible, the user is active and the key is funded. A simplified version
  * of routstr-sdk's traffic-driven pool: nothing is armed before there is a
- * funded `sk-` key and a target model; an armed session is closed (the node
+ * funded `sk-` key, a target model and user activity (`activity()`, or a
+ * request); an armed session is closed (the node
  * releases its reservation) when the page is hidden, after `idleMs` without
  * activity, or `maxAgeMs` after setup.
  */
@@ -151,7 +152,8 @@ export class Prewarmer {
   cfg: typeof PREWARM_DEFAULTS;
   private armed?: Armed;
   private target?: { model: string; maxTokens: number };
-  private lastActivity = Date.now();
+  /** No activity yet: choosing a model or opening the page arms nothing. */
+  private lastActivity = 0;
   private maxBody = 0;
   /** Requests still waiting for a 2PC preparation (cold, or a claimed arm in progress). */
   private preparing = 0;
@@ -181,7 +183,7 @@ export class Prewarmer {
     if (!(this.cfg.maxAgeMs >= PREWARM_MIN_MAX_AGE_MS)) this.cfg.maxAgeMs = PREWARM_MIN_MAX_AGE_MS;
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") this.activity();
+        if (document.visibilityState === "visible") void this.ensure();
         else if (this.cfg.onlyWhenVisible) this.teardown("page hidden");
       });
     }
@@ -196,7 +198,7 @@ export class Prewarmer {
     const t = this.target;
     this.target = { model, maxTokens };
     if (this.armed && (t?.model !== model || t.maxTokens !== maxTokens)) this.teardown("target changed");
-    this.activity();
+    void this.ensure();
   }
 
   noteBody(len: number): void {
@@ -307,7 +309,9 @@ export class Prewarmer {
       const [offer, bal] = await Promise.all([this.client.offer(), this.client.api.balance(cred)]);
       const pricing = (await this.client.pricing(target.maxTokens)).find((p) => p.id === target.model);
       const available = bal.balance - bal.reserved;
-      const need = pricing?.reservationMsat ?? 1;
+      // Unknown pricing means an unknown reservation: do not arm blind.
+      const need = pricing?.reservationMsat;
+      if (need === undefined) return;
       if (available < need) {
         this.status = "waiting-funds";
         this.log("not arming: available balance below one reservation", { available, need });
@@ -447,6 +451,7 @@ export class ConfidentialClient {
       bodyLength,
       host: this.host,
       webSocketImpl: this.opts.webSocketImpl,
+      allowInsecureTransport: this.opts.allowInsecureTransport,
       onEvent: (e) => this.emit({ ...e, session: undefined }),
     });
   }
@@ -513,6 +518,7 @@ export class ConfidentialClient {
     const tRequest = Date.now();
     pw?.noteBody(body.length);
     pw?.setTarget(model, maxTokens);
+    pw?.activity();
     const lease = pw?.take(model, maxTokens, body.length);
     // Hold off arming the next session only until this request's own 2PC
     // preparation is done: for a claimed arm, when it is ready (the next one
@@ -546,7 +552,9 @@ export class ConfidentialClient {
           notify();
         },
       );
+    const aborted = () => new DOMException("aborted", "AbortError");
     const cold = () => {
+      if (signal?.aborted) return Promise.reject(aborted());
       const s = this.newSession(offer, auth, model, maxTokens, body.length);
       session = s;
       attach(s);
@@ -560,6 +568,11 @@ export class ConfidentialClient {
       } catch (e) {
         this.emit({ ev: "request", path: "cold", reason: `armed session failed: ${errorText(e)}` });
         return cold();
+      }
+      // Aborted while the arm was pending: abort() had no session to close.
+      if (signal?.aborted) {
+        s.close();
+        throw aborted();
       }
       session = s;
       attach(s);
@@ -580,7 +593,7 @@ export class ConfidentialClient {
     };
     const abort = () => {
       session?.close();
-      failure ??= new DOMException("aborted", "AbortError");
+      failure ??= aborted();
       ended = true;
       notify();
     };
@@ -611,7 +624,8 @@ export class ConfidentialClient {
     // Fail fast on a refusal before any response (e.g. 402 insufficient balance, 409 offer expired).
     const first = await Promise.race([head.then(() => "head" as const), verification.then(() => "done" as const)]).catch(
       async (e: unknown) => {
-        if (isOfferExpired(e) && !freshOffer) return "retry" as const;
+        // Retry only while nothing could have reached the provider.
+        if (isOfferExpired(e) && !freshOffer && !session?.bodyReleased) return "retry" as const;
         throw e;
       },
     );

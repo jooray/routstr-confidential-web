@@ -32,7 +32,7 @@ import {
   SessionProtocolError,
   SessionRejectedError,
 } from "./errors.js";
-import { matchHostname } from "./hosts.js";
+import { encryptedNodeTransport, matchHostname } from "./hosts.js";
 import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params.js";
 import { WasmProverBackend } from "./prover.js";
 import { checkAttestationBinding, checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt.js";
@@ -212,6 +212,11 @@ export interface ConfidentialSessionOptions {
   /** Use the pre-warmed proof channel (default true). */
   proofChannel?: boolean;
   webSocketImpl?: typeof WebSocket;
+  /**
+   * Development only: allow a plain-http node that is neither loopback nor an
+   * onion service. The credential then travels unencrypted.
+   */
+  allowInsecureTransport?: boolean;
   timeouts?: Partial<typeof DEFAULT_TIMEOUTS>;
   /** Structured events (never secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
@@ -428,6 +433,11 @@ export class ConfidentialSession {
     this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
     if (options.offer.v !== 2) {
       throw new SessionProtocolError(`the browser client speaks protocol v2 only (offer v=${options.offer.v})`);
+    }
+    if (!options.allowInsecureTransport && !encryptedNodeTransport(this.baseUrl)) {
+      throw new SessionProtocolError(
+        `refusing plain http to ${this.baseUrl}: the node credential would travel unencrypted`,
+      );
     }
     this.host = options.host;
     this.WS = options.webSocketImpl ?? WebSocket;
@@ -799,7 +809,11 @@ export class ConfidentialSession {
       return;
     }
     if (ch) this.event({ ev: "proof_channel_fallback", proof, err: String(ch.failure?.message ?? "") });
-    await this.prover.run(this.zkUrl(proof), { proof, role: cmd === "prove" ? "prover" : "verifier", params, witness });
+    await this.prover.run(
+      this.zkUrl(proof),
+      { proof, role: cmd === "prove" ? "prover" : "verifier", params, witness },
+      this.timeouts.proof,
+    );
     this.proofTimes[proof] = { ok: true, via: "per-proof", ms: Date.now() - t };
     this.absSpans.push({ name: PROOF_LABEL[proof], lane: "proofs", start: t, end: Date.now() });
   }

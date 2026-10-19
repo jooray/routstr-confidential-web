@@ -288,7 +288,9 @@ async fn run_channel(
             if want == ZRole::Prover && witness.is_none() {
                 anyhow::bail!("{proof}: prove needs a witness");
             }
-            match rt::timeout(Duration::from_secs(60), ch.request(&params, witness.as_ref())).await {
+            // The page's proof timeout (default 60 s, at most the session's 600 s).
+            let limit = cmd.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(60_000).clamp(1_000, 600_000);
+            match rt::timeout(Duration::from_millis(limit), ch.request(&params, witness.as_ref())).await {
                 Ok(r) => r,
                 Err(_) => {
                     ch.poison();

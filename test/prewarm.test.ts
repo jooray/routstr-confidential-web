@@ -44,10 +44,28 @@ function fakeClient() {
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 describe("pre-warm pool", () => {
+  it("arms nothing before user activity, or while the reservation is unknown", async () => {
+    const { client, sessions } = fakeClient();
+    const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.setTarget("m", 100); // choosing a model (e.g. at page load) is not activity
+    await tick();
+    expect(sessions.length).toBe(0);
+    client.pricing = async () => [{ id: "m" }] as never;
+    pw.activity();
+    await tick();
+    expect(sessions.length).toBe(0); // no pricing: no blind arm
+    client.pricing = async () => [{ id: "m", reservationMsat: 1000 }];
+    pw.activity();
+    await tick();
+    expect(sessions.length).toBe(1);
+    pw.stop?.();
+  });
+
   it("a request sent while a session is arming uses that session", async () => {
     const { client, sessions } = fakeClient();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
     pw.setTarget("m", 100);
+    pw.activity();
     await tick();
     expect(sessions.length).toBe(1); // arming started
     const lease = pw.take("m", 100, 300);
@@ -67,6 +85,7 @@ describe("pre-warm pool", () => {
     const { client, sessions } = fakeClient();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
     pw.setTarget("m", 100);
+    pw.activity();
     await tick();
     const lease = pw.take("m", 100, 300)!;
     pw.beginPreparing();
@@ -85,6 +104,7 @@ describe("pre-warm pool", () => {
     holdOffer();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
     pw.setTarget("m", 100);
+    pw.activity();
     await tick();
     expect(sessions.length).toBe(0); // still checking the offer
     const lease = pw.take("m", 100, 300);
@@ -116,6 +136,7 @@ describe("pre-warm pool", () => {
         await tick();
       };
       pw.setTarget("m", 100);
+      pw.activity();
       await killArmed();
       expect(sessions.length).toBe(1);
       expect(pw.status).toBe("backoff");

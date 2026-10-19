@@ -34,13 +34,15 @@ export function buildPinnedBody(request: Record<string, unknown>, model: string,
 }
 
 export function requestedMaxTokens(request: Record<string, unknown>, cap: number): number {
+  // The provider honours the tightest of the caps it is sent, so pin that one.
+  let asked: number | undefined;
   for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
     const v = request[k];
     if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-      return Math.max(1, Math.min(Math.trunc(v), cap));
+      asked = Math.min(asked ?? Infinity, Math.trunc(v));
     }
   }
-  return cap;
+  return asked === undefined ? cap : Math.max(1, Math.min(asked, cap));
 }
 
 /**
@@ -108,7 +110,16 @@ export class SseParser {
 /** Fold a streamed chat completion into one `chat.completion` object. */
 export function aggregateChatCompletion(events: Record<string, any>[]): Record<string, unknown> {
   let id: unknown, created: unknown, model: unknown, usage: unknown;
-  const choices = new Map<number, { role: string; content: string; reasoning: string; finish_reason: unknown }>();
+  const choices = new Map<
+    number,
+    {
+      role: string;
+      content: string;
+      reasoning: string;
+      finish_reason: unknown;
+      tool_calls: Map<number, { id?: unknown; type?: unknown; function: { name: string; arguments: string } }>;
+    }
+  >();
   for (const ev of events) {
     id ??= ev.id;
     created ??= ev.created;
@@ -118,7 +129,7 @@ export function aggregateChatCompletion(events: Record<string, any>[]): Record<s
       const idx = typeof c.index === "number" ? c.index : 0;
       let acc = choices.get(idx);
       if (!acc) {
-        acc = { role: "assistant", content: "", reasoning: "", finish_reason: null };
+        acc = { role: "assistant", content: "", reasoning: "", finish_reason: null, tool_calls: new Map() };
         choices.set(idx, acc);
       }
       const d = c.delta ?? {};
@@ -126,6 +137,18 @@ export function aggregateChatCompletion(events: Record<string, any>[]): Record<s
       if (typeof d.content === "string") acc.content += d.content;
       const r = d.reasoning_content ?? d.reasoning;
       if (typeof r === "string") acc.reasoning += r;
+      for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+        const ti = typeof tc.index === "number" ? tc.index : 0;
+        let t = acc.tool_calls.get(ti);
+        if (!t) {
+          t = { function: { name: "", arguments: "" } };
+          acc.tool_calls.set(ti, t);
+        }
+        if (tc.id !== undefined) t.id = tc.id;
+        if (tc.type !== undefined) t.type = tc.type;
+        if (typeof tc.function?.name === "string") t.function.name += tc.function.name;
+        if (typeof tc.function?.arguments === "string") t.function.arguments += tc.function.arguments;
+      }
       if (c.finish_reason != null) acc.finish_reason = c.finish_reason;
     }
   }
@@ -139,6 +162,11 @@ export function aggregateChatCompletion(events: Record<string, any>[]): Record<s
       .map(([index, acc]) => {
         const message: Record<string, unknown> = { role: acc.role, content: acc.content };
         if (acc.reasoning) message.reasoning_content = acc.reasoning;
+        if (acc.tool_calls.size > 0) {
+          message.tool_calls = [...acc.tool_calls.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, t]) => ({ id: t.id, type: t.type ?? "function", function: t.function }));
+        }
         return { index, message, finish_reason: acc.finish_reason };
       }),
   };

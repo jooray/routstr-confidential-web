@@ -145,7 +145,7 @@ export class ProofChannel {
         },
       });
     });
-    this.relay?.command({ cmd, id, proof, params, witness: witness ?? null });
+    this.relay?.command({ cmd, id, proof, params, witness: witness ?? null, timeout_ms: ms });
     const m = await p;
     if (!m.ok) throw new ProverError(`proof channel: ${proof} failed: ${m.err ?? "unknown"}`);
     if (cmd === "verify" && !(m.checks ?? []).every((c) => c.ok)) {
