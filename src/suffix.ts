@@ -65,39 +65,79 @@ export interface ParsedHttpResponse {
   body: Uint8Array;
   bodyText: string;
   contentType: string;
+  /**
+   * The body is all there: the chunked terminator arrived, or exactly the
+   * `Content-Length` bytes (a body without either ends with the connection).
+   */
+  complete: boolean;
 }
 
-/** Split the decrypted upstream plaintext into an HTTP/1.1 response. */
-export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
-  let headerEnd = -1;
-  for (let i = 0; i + 3 < bytes.length; i++) {
-    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) {
-      headerEnd = i;
-      break;
-    }
-  }
-  if (headerEnd < 0) {
-    throw new ResponseVerificationError("upstream response has no HTTP header terminator");
-  }
-  const headText = latin1(bytes.subarray(0, headerEnd));
-  const lines = headText.split("\r\n");
+/**
+ * Provider headers describing the operator's own account (its balance and
+ * rate-limit counters). The client decrypts them like any other byte of the
+ * response, but they are not the caller's business, so they are not exposed.
+ */
+export function isOperatorHeader(name: string): boolean {
+  const n = name.toLowerCase();
+  return n.startsWith("x-venice-balance-") || n.startsWith("x-ratelimit-");
+}
+
+/** One response head: status, reason and headers (lower-cased names). */
+function parseHead(bytes: Uint8Array, end: number): { status: number; statusText: string; headers: Record<string, string> } {
+  const lines = latin1(bytes.subarray(0, end)).split("\r\n");
   const statusLine = lines.shift() ?? "";
   const m = /^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/.exec(statusLine);
   if (!m) {
     throw new ResponseVerificationError(`malformed status line: ${JSON.stringify(statusLine)}`);
   }
-  const status = Number(m[1]);
-  const statusText = m[2] ?? "";
   const headers: Record<string, string> = {};
   for (const line of lines) {
     const idx = line.indexOf(":");
     if (idx <= 0) continue;
-    headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+    const name = line.slice(0, idx).trim().toLowerCase();
+    if (isOperatorHeader(name)) continue;
+    headers[name] = line.slice(idx + 1).trim();
   }
+  return { status: Number(m[1]), statusText: m[2] ?? "", headers };
+}
+
+function indexOfHeadEnd(bytes: Uint8Array, from = 0): number {
+  for (let i = from; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) return i;
+  }
+  return -1;
+}
+
+/**
+ * Split the decrypted upstream plaintext into an HTTP/1.1 response. Interim
+ * 1xx heads (e.g. `100 Continue`) are skipped: the status is the final one.
+ */
+export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
+  let start = 0;
+  let head: ReturnType<typeof parseHead>;
+  let headerEnd: number;
+  for (;;) {
+    headerEnd = indexOfHeadEnd(bytes, start);
+    if (headerEnd < 0) {
+      throw new ResponseVerificationError("upstream response has no HTTP header terminator");
+    }
+    head = parseHead(bytes.subarray(start), headerEnd - start);
+    if (head.status >= 200 || head.status < 100) break;
+    start = headerEnd + 4;
+  }
+  const { status, statusText, headers } = head;
   const rawBody = bytes.subarray(headerEnd + 4);
-  const body = /chunked/i.test(headers["transfer-encoding"] ?? "")
-    ? dechunkAll(rawBody)
-    : rawBody;
+  let body: Uint8Array;
+  let complete: boolean;
+  if (/chunked/i.test(headers["transfer-encoding"] ?? "")) {
+    const d = dechunkAll(rawBody);
+    body = d.body;
+    complete = d.done;
+  } else {
+    const declared = headers["content-length"];
+    body = rawBody;
+    complete = declared === undefined || (/^\d+$/.test(declared) && Number(declared) === rawBody.length);
+  }
   let text: string | undefined;
   return {
     status,
@@ -105,6 +145,7 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
     headers,
     raw: bytes,
     body,
+    complete,
     // Decoded on first use: an image body is megabytes of base64 that the
     // image path parses once and never needs as a string again.
     get bodyText() {
@@ -294,7 +335,7 @@ export const HOP_BY_HOP_HEADERS = new Set([
   "proxy-connection",
 ]);
 
-function dechunkAll(raw: Uint8Array): Uint8Array {
+function dechunkAll(raw: Uint8Array): { body: Uint8Array; done: boolean } {
   const d = new ChunkedDecoder();
   const parts = d.push(raw);
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -303,7 +344,7 @@ function dechunkAll(raw: Uint8Array): Uint8Array {
     out.set(p, o);
     o += p.length;
   }
-  return out;
+  return { body: out, done: d.done };
 }
 
 /**
@@ -326,18 +367,23 @@ export class IncrementalHttpResponse {
     merged.set(this.buf);
     merged.set(data, this.buf.length);
     this.buf = merged;
-    for (let i = 0; i + 3 < merged.length; i++) {
-      if (merged[i] === 13 && merged[i + 1] === 10 && merged[i + 2] === 13 && merged[i + 3] === 10) {
-        const parsed = parseHttpResponse(merged.subarray(0, i + 4));
-        this.head = { status: parsed.status, statusText: parsed.statusText, headers: parsed.headers };
-        this.chunked = /chunked/i.test(parsed.headers["transfer-encoding"] ?? "");
-        this.headDone = true;
-        const rest = merged.subarray(i + 4);
-        this.buf = new Uint8Array(0);
-        if (rest.length === 0) return [];
-        return this.chunked ? this.decoder.push(rest) : [rest];
-      }
+    let start = 0;
+    for (;;) {
+      const end = indexOfHeadEnd(merged, start);
+      if (end < 0) break;
+      const head = parseHead(merged.subarray(start), end - start);
+      start = end + 4;
+      // An interim 1xx head is not the response: keep reading.
+      if (head.status >= 100 && head.status < 200) continue;
+      this.head = head;
+      this.chunked = /chunked/i.test(head.headers["transfer-encoding"] ?? "");
+      this.headDone = true;
+      const rest = merged.subarray(start);
+      this.buf = new Uint8Array(0);
+      if (rest.length === 0) return [];
+      return this.chunked ? this.decoder.push(rest) : [rest];
     }
+    this.buf = merged.slice(start);
     return [];
   }
 

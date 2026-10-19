@@ -52,8 +52,11 @@ describe("pinned body", () => {
     expect(j).toMatchObject({ model: "m", max_tokens: 12, n: 1, stream: true });
   });
 
-  it("builds valid JSON with only pinned keys", () => {
-    expect(JSON.parse(dec(buildPinnedBody({ model: "m" }, "m", 3))).max_tokens).toBe(3);
+  it("needs a private field before the exact suffix", () => {
+    expect(() => buildPinnedBody({ model: "m" }, "m", 3)).toThrow(/messages/);
+    const body = dec(buildPinnedBody({ model: "m", messages: [] }, "m", 3));
+    expect(body.endsWith(canonicalSuffix("m", 3))).toBe(true);
+    expect(JSON.parse(body).max_tokens).toBe(3);
   });
 
   it("caps max_tokens at the offer cap", () => {
@@ -123,6 +126,23 @@ describe("streaming", () => {
     expect(out.map(dec).join("")).toBe('data: {"x":1}\n\n');
     expect(inc.complete).toBe(true);
     expect(() => new ChunkedDecoder().push(enc("zz\r\nhello\r\n"))).toThrow();
+  });
+
+  it("skips interim 1xx heads, hides operator headers and reports framing", () => {
+    const raw =
+      "HTTP/1.1 100 Continue\r\n\r\n" +
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\nx-venice-balance-usd: 12.5\r\nx-ratelimit-remaining-requests: 3\r\n\r\n{\"a\":1}";
+    const r = parseHttpResponse(enc(raw));
+    expect(r.status).toBe(200);
+    expect(r.bodyText).toBe('{"a":1}');
+    expect(r.complete).toBe(true);
+    expect(Object.keys(r.headers).sort()).toEqual(["content-length", "content-type"]);
+    expect(parseHttpResponse(enc("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nshort")).complete).toBe(false);
+    expect(parseHttpResponse(enc("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")).complete).toBe(false);
+    const inc = new IncrementalHttpResponse();
+    for (const b of enc(raw)) inc.push(new Uint8Array([b]));
+    expect(inc.head?.status).toBe(200);
+    expect(inc.head?.headers["x-venice-balance-usd"]).toBeUndefined();
   });
 
   it("finds the usage disclosure in the response", () => {

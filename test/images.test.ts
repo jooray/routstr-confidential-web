@@ -13,7 +13,9 @@ import {
 import { validateOfferShape, offerImages, type ConfidentialImagesOffer, type VerifiedOffer } from "../src/offer.js";
 import { verifyFlatReceipt } from "../src/receipt.js";
 import { base64ToBytes, planImageRequest } from "../src/images.js";
-import { imageOutcome } from "../src/session.js";
+import { decodeImageResponse, imageOutcome } from "../src/session.js";
+import { parseHttpResponse } from "../src/suffix.js";
+import { ProofChannel } from "../src/zkchan.js";
 import requestVectors from "./fixtures/image-request-vectors.json";
 import { ConfidentialSession } from "../src/session.js";
 import prod from "./fixtures/cypherpunk-offer.json";
@@ -33,6 +35,7 @@ const IMAGES: ConfidentialImagesOffer = {
   max_count: 4,
   count_key: "variants",
   fixed_pins: FIXED,
+  param_space: { resolution: ["1K", "2K", "4K"], quality: ["low", "medium", "high"], format: ["webp"] },
   price_list: {
     "z-image-turbo": [{ id: "webp", pins: [["format", "webp"]], msat_per_image: 12164 }],
     "nano-banana-pro": [
@@ -98,18 +101,48 @@ describe("offer image block", () => {
   it("validates the block and honours the capability list", () => {
     const base = { ...(prod as object) } as Record<string, unknown>;
     expect(() => validateOfferShape({ ...base, capabilities: ["chat", "images"], images: IMAGES })).not.toThrow();
+    const variant = (v: Record<string, unknown>) => ({ ...IMAGES, price_list: { m: [{ id: "a", pins: [["format", "webp"]], msat_per_image: 1000, ...v }] } });
     for (const bad of [
       { ...IMAGES, response_shape: "png" },
       { ...IMAGES, max_count: 0 },
+      { ...IMAGES, max_count: 5 },
+      { ...IMAGES, max_count: 1.5 },
+      { ...IMAGES, response_idle_s: 1 },
+      { ...IMAGES, response_idle_s: 601 },
       { ...IMAGES, count_key: "model" },
       { ...IMAGES, fixed_pins: [["x"]] },
+      // Fixed pins only switch extras off: anything else could turn a feature on.
+      { ...IMAGES, fixed_pins: [["enable_web_search", true]] },
+      { ...IMAGES, fixed_pins: [["embed_exif_metadata", "yes"]] },
+      { ...IMAGES, fixed_pins: [["seed", 1]] },
+      { ...IMAGES, fixed_pins: [["style_references", ["https://x"]]] },
+      { ...IMAGES, fixed_pins: [["variants", false]] },
+      { ...IMAGES, param_space: undefined },
+      { ...IMAGES, param_space: { format: [1] } },
       { ...IMAGES, price_list: { m: [] } },
-      { ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: -1 }] } },
-      { ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: Number.NaN }] } },
+      variant({ msat_per_image: -1 }),
+      variant({ msat_per_image: Number.NaN }),
+      variant({ msat_per_image: 0 }),
+      variant({ msat_per_image: 1.5 }),
+      variant({ max_count: 5 }),
+      variant({ pins: [["safe_mode", "false"]] }),
+      variant({ pins: [["aspect_ratio", "16:9"]] }),
+      variant({ pins: [["format", "png"]] }),
+      variant({ pins: [["resolution", 2]] }),
+      variant({ pins: [["format", "webp"], ["format", "webp"]] }),
+      variant({ pins: [["return_binary", false]] }),
+      { ...IMAGES, price_list: { m: [{ id: "a", pins: [], msat_per_image: 1 }, { id: "a", pins: [], msat_per_image: 2 }] } },
     ]) {
-      expect(() => validateOfferShape({ ...base, images: bad })).toThrow(/offer\.images/);
+      // A malformed image block refuses images, not the offer's chat.
+      expect(() => validateOfferShape({ ...base, capabilities: ["chat", "images"], images: bad })).not.toThrow();
+      expect(() => offerImages({ capabilities: ["chat", "images"], images: bad as never })).toThrow(/offer\.images/);
     }
     expect(offerImages({ capabilities: ["chat", "images"], images: IMAGES })).toEqual(IMAGES);
+    // The head template is checked against the upstream host and the image route.
+    expect(offerImages({ capabilities: ["images"], images: IMAGES, upstream_host: "api.venice.ai" })).toEqual(IMAGES);
+    expect(() => offerImages({ capabilities: ["images"], images: IMAGES, upstream_host: "api.other.example" })).toThrow(/head_template/);
+    const chatRoute = { ...IMAGES, head_template: IMAGES.head_template.replace("/api/v1/image/generate", "/api/v1/chat/completions") };
+    expect(() => offerImages({ capabilities: ["images"], images: chatRoute, upstream_host: "api.venice.ai" })).toThrow(/head_template/);
     // No capability list: a chat-only offer, whatever else it carries.
     expect(offerImages({ images: IMAGES })).toBeUndefined();
     expect(offerImages({ capabilities: ["chat"], images: IMAGES })).toBeUndefined();
@@ -181,6 +214,13 @@ describe("image sessions", () => {
     ).toThrow(/no variant/);
     const s = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant, count: 2 } });
     expect(s.suffix).toBe(imageSuffix(IMAGES, "z-image-turbo", variant, 2));
+    // A variant's own count cap is below the block's.
+    const capped = { ...variant, max_count: 1 };
+    const cappedOffer = offerWithImages({ images: { ...IMAGES, price_list: { ...IMAGES.price_list, "z-image-turbo": [capped] } } });
+    expect(() => new ConfidentialSession({ ...base, offer: cappedOffer, kind: "images", image: { variant: capped, count: 2 } })).toThrow(/outside 1\.\.1/);
+    // A node-chosen fixed pin that switches a feature on refuses the session.
+    const hostile = offerWithImages({ images: { ...IMAGES, fixed_pins: [["enable_web_search", true]] } });
+    expect(() => new ConfidentialSession({ ...base, offer: hostile, kind: "images", image: { variant, count: 1 } })).toThrow(/switch an extra off/);
   });
 
   it("are never armed ahead or claimed", async () => {
@@ -257,7 +297,7 @@ describe("client.images.generate", () => {
 
 describe("image request planning (shared vectors with the SDK)", () => {
   const images = requestVectors.images as never as Parameters<typeof planImageRequest>[0];
-  for (const v of requestVectors.vectors) {
+  for (const v of requestVectors.cases) {
     it(v.name, () => {
       const run = () => {
         const p = planImageRequest(images, { ...(v.body as Record<string, unknown>) });
@@ -269,6 +309,46 @@ describe("image request planning (shared vectors with the SDK)", () => {
       else expect(run()).toEqual(v.expect);
     });
   }
+});
+
+describe("an accepted image answer", () => {
+  const terms = { model: "z-image-turbo", count: 2, countKey: "variants", shape: "venice" as const, pins: [["format", "webp"]] as [string, unknown][] };
+  const http = (json: string, declared?: number) =>
+    parseHttpResponse(
+      new TextEncoder().encode(
+        `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${declared ?? new TextEncoder().encode(json).length}\r\n\r\n${json}`,
+      ),
+    );
+
+  it("has no warnings when it is what was pinned", () => {
+    const r = decodeImageResponse(http('{"images":["AAAA","AAAA"],"request":{"data":{"model":"z-image-turbo","variants":2}}}'), terms);
+    expect(r.images).toHaveLength(2);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it("reports a short count, another echoed model or count, a cut body, never throws", () => {
+    const short = decodeImageResponse(http('{"images":["AAAA"],"request":{"model":"other","variants":1}}'), terms);
+    expect(short.images).toHaveLength(1);
+    expect(short.warnings.join(" ")).toMatch(/1 of 2/);
+    expect(short.warnings.join(" ")).toMatch(/model "other"/);
+    expect(short.warnings.join(" ")).toMatch(/count 1/);
+    const cut = decodeImageResponse(http('{"images":["AA', 9999), terms);
+    expect(cut.images).toEqual([]);
+    expect(cut.warnings.join(" ")).toMatch(/declared length/);
+    expect(cut.warnings.join(" ")).toMatch(/not JSON/);
+  });
+});
+
+describe("proof channel verification", () => {
+  it("refuses a verification that reports no checks", async () => {
+    const ch = new ProofChannel({} as never);
+    const run = ch.run("verify", "pi_nk", {}, undefined, 1000);
+    (ch as unknown as { onControl(m: Record<string, unknown>): void }).onControl({ ev: "done", id: 1, ok: true, checks: [] });
+    await expect(run).rejects.toThrow(/checks failed/);
+    const ok = ch.run("verify", "pi_nk", {}, undefined, 1000);
+    (ch as unknown as { onControl(m: Record<string, unknown>): void }).onControl({ ev: "done", id: 2, ok: true, checks: [{ label: "x", ok: true }] });
+    await expect(ok).resolves.toBeTruthy();
+  });
 });
 
 describe("image response handling", () => {

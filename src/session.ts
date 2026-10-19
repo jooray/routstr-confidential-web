@@ -62,6 +62,7 @@ import {
   offerSessionFeeMsat,
   type ConfidentialImagesOffer,
   type ConfidentialImageVariant,
+  type ImagePin,
   type VerifiedOffer,
 } from "./offer.js";
 import type { WasmHost } from "./wasm/host.js";
@@ -214,6 +215,11 @@ export interface ConfidentialSessionResult {
   /** Image sessions: the variant and count that were pinned and charged. */
   imageVariant?: string;
   imageCount?: number;
+  /**
+   * Image sessions: what is wrong with an accepted answer (short count, an
+   * incomplete body, an echo naming another model or count). Already paid.
+   */
+  warnings?: string[];
 }
 
 /** What an image session asks for: a variant of the signed offer and a count. */
@@ -483,11 +489,13 @@ export class ConfidentialSession {
       const images = offerImages(options.offer);
       if (!images) throw new SessionProtocolError("the node's signed offer serves no confidential images");
       if (!options.image) throw new SessionProtocolError("an image session needs a variant and a count");
-      if (!(options.image.count >= 1 && options.image.count <= images.max_count)) {
-        throw new SessionProtocolError(`image count ${options.image.count} is outside 1..${images.max_count}`);
-      }
-      if (!images.price_list[options.model]?.some((v) => v.id === options.image!.variant.id)) {
+      const signed = images.price_list[options.model]?.find((v) => v.id === options.image!.variant.id);
+      if (!signed) {
         throw new SessionProtocolError(`the signed offer has no variant ${options.image.variant.id} for ${options.model}`);
+      }
+      const maxCount = Math.min(images.max_count, signed.max_count ?? images.max_count);
+      if (!(Number.isSafeInteger(options.image.count) && options.image.count >= 1 && options.image.count <= maxCount)) {
+        throw new SessionProtocolError(`image count ${options.image.count} is outside 1..${maxCount}`);
       }
       this.imagesOffer = images;
       this.image = options.image;
@@ -878,7 +886,7 @@ export class ConfidentialSession {
     }
     // An image session's credential record is the image route's head.
     const nkOffer = this.imagesOffer ? { ...this.offer, head_template: this.imagesOffer.head_template } : this.offer;
-    checkPiNKParams(commit.params, { offer: nkOffer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    checkPiNKParams(commit.params, { offer: nkOffer, hk: this.ap.hk, bodyLen: this.bodyLength, kind: this.kind });
     // The head-record commitment the attestation must name is the one π_NK
     // proves; the frame has to carry exactly it.
     const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
@@ -1109,10 +1117,17 @@ export class ConfidentialSession {
       ({ receipt, receiptJson, sigHex } = await this.waitReceipt(attJson));
 
       if (upstreamError) {
-        // Errors the provider answers before doing any work (4xx, 503) cost at
-        // most the session fee (the node's 2PC work), any other error at most
-        // the session's reservation.
-        usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, fee);
+        // A rejected request (4xx but 429) costs the abandon fee, a 429/503 the
+        // session fee, any other error at most the session's reservation.
+        usageMatch = checkUpstreamErrorReceipt(
+          receipt,
+          httpEarly.status,
+          fee,
+          offerAbandonFeeMsat(this.offer),
+          this.image
+            ? { model: this.model, variant: this.image.variant.id, count: this.image.count, msatPerImage: this.image.variant.msat_per_image }
+            : undefined,
+        );
       } else {
         ownUsage = usageEventFromDisclosure(r) ?? undefined;
         if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
@@ -1141,8 +1156,11 @@ export class ConfidentialSession {
     const http = httpEarly;
     let effectiveModel: string | undefined;
     let images: Blob[] | undefined;
+    let warnings: string[] | undefined;
     if (this.kind === "images") {
-      images = flatAccept ? this.decodeImages(http) : [];
+      // Accepted already (the charge was fixed; refusing would cost the
+      // reservation): a short or broken answer is reported, not thrown.
+      ({ images, warnings } = flatAccept ? this.decodeImages(http) : { images: [], warnings: undefined });
       if (flatAccept) {
         // The images are Blobs now; the plaintext copies can go.
         this.responseChunks = [];
@@ -1225,6 +1243,7 @@ export class ConfidentialSession {
       images,
       imageVariant: this.image?.variant.id,
       imageCount: this.image?.count,
+      warnings,
     };
   }
 
@@ -1247,19 +1266,15 @@ export class ConfidentialSession {
     return { receipt, receiptJson, sigHex: m.sig };
   }
 
-  /** The images of a 2xx image response, as Blobs of the pinned format. */
-  private decodeImages(http: ParsedHttpResponse): Blob[] {
-    let body: unknown;
-    try {
-      // Parsed from the bytes directly: the text exists only for this parse.
-      body = JSON.parse(new TextDecoder().decode(http.body));
-    } catch {
-      throw new ResponseVerificationError("image response body is not JSON");
-    }
-    const type = imageMimeType(this.image!.variant.pins);
-    return responseImages(body, this.imagesOffer!.response_shape).map(
-      (b64) => new Blob([base64ToBytes(b64) as BlobPart], { type }),
-    );
+  /** The images of a 2xx image response and what is wrong with it. */
+  private decodeImages(http: ParsedHttpResponse): { images: Blob[]; warnings: string[] } {
+    return decodeImageResponse(http, {
+      model: this.model,
+      count: this.image!.count,
+      countKey: this.imagesOffer!.count_key,
+      shape: this.imagesOffer!.response_shape,
+      pins: this.image!.variant.pins,
+    });
   }
 
   /** Cold path: arm, then claim. */
@@ -1308,7 +1323,57 @@ function countKeyUpdates(content: Uint8Array): number {
 /** A successful image response without its body: the images are returned as Blobs. */
 function imageHead(http: ParsedHttpResponse): ParsedHttpResponse {
   const empty = new Uint8Array(0);
-  return { status: http.status, statusText: http.statusText, headers: http.headers, raw: empty, body: empty, bodyText: "", contentType: http.contentType };
+  return {
+    status: http.status,
+    statusText: http.statusText,
+    headers: http.headers,
+    raw: empty,
+    body: empty,
+    bodyText: "",
+    contentType: http.contentType,
+    complete: http.complete,
+  };
+}
+
+/**
+ * The images of an accepted (2xx) image response, as Blobs of the pinned
+ * format, and what is wrong with the answer: an incomplete body, fewer images
+ * than the pinned count, or a provider echo (`request`) naming another model
+ * or count. The request is paid either way, so this reports and never throws.
+ */
+export function decodeImageResponse(
+  http: ParsedHttpResponse,
+  terms: { model: string; count: number; countKey: string; shape: "venice" | "openai"; pins: readonly ImagePin[] },
+): { images: Blob[]; warnings: string[] } {
+  const warnings: string[] = [];
+  if (!http.complete) warnings.push("the image response ended before its declared length");
+  let body: unknown;
+  try {
+    // Parsed from the bytes directly: the text exists only for this parse.
+    body = JSON.parse(new TextDecoder().decode(http.body));
+  } catch {
+    warnings.push("the image response body is not JSON");
+    return { images: [], warnings };
+  }
+  const type = imageMimeType(terms.pins);
+  let images: Blob[] = [];
+  try {
+    images = responseImages(body, terms.shape).map((b64) => new Blob([base64ToBytes(b64) as BlobPart], { type }));
+  } catch (e) {
+    warnings.push(`the image response has no readable images (${(e as Error).message})`);
+  }
+  if (images.length !== terms.count) warnings.push(`the provider returned ${images.length} of ${terms.count} images`);
+  const echo = (body as { request?: unknown } | null)?.request;
+  if (echo && typeof echo === "object") {
+    const e = echo as Record<string, unknown>;
+    const echoed = (e.data && typeof e.data === "object" ? e.data : e) as Record<string, unknown>;
+    if (echoed.model !== undefined && echoed.model !== terms.model) {
+      warnings.push(`the provider echoes model ${JSON.stringify(echoed.model)}, not ${terms.model}`);
+    }
+    const n = echoed[terms.countKey];
+    if (n !== undefined && n !== terms.count) warnings.push(`the provider echoes count ${JSON.stringify(n)}, not ${terms.count}`);
+  }
+  return { images, warnings };
 }
 
 /**

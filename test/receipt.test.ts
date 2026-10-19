@@ -92,6 +92,39 @@ describe("receipt verification", () => {
     expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 0 }), 500, 0)).toBe(false);
   });
 
+  it("bounds a rejected request by the abandon fee, a 429/503 by the session fee", () => {
+    const err = (status: number, cost: number) => ({ sid: "s1", model: "m", usage: { error_status: status }, cost_msats: cost }) as never;
+    // session fee 100, abandon fee 2000
+    expect(checkUpstreamErrorReceipt(err(400, 2000), 400, 100, 2000)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(404, 2000), 404, 100, 2000)).toBe(true);
+    // Less than the rule allows only favours the client (and a node not yet
+    // charging the abandon fee stays usable).
+    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, 2000)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(400, 2001), 400, 100, 2000)).toThrow(ReceiptVerificationError);
+    expect(checkUpstreamErrorReceipt(err(429, 100), 429, 100, 2000)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(503, 100), 503, 100, 2000)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(429, 2000), 429, 100, 2000)).toThrow(ReceiptVerificationError);
+    expect(checkUpstreamErrorReceipt(err(503, 0), 503, 100, 2000)).toBe(true);
+    // An abandon fee below the session fee counts as the session fee.
+    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, 0)).toBe(true);
+  });
+
+  it("holds an image session's error receipt to its terms", () => {
+    const image = { model: "z", variant: "webp", count: 2, msatPerImage: 12000 };
+    const err = (status: number, extra: Record<string, unknown>) =>
+      ({ sid: "s1", model: "z", kind: "images", variant: "webp", count: 2, usage: { error_status: status }, ...extra }) as never;
+    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 2000 }), 400, 0, 2000, image)).toBe(true);
+    // Another kind, model, variant or count: refused.
+    for (const other of [{ kind: undefined }, { model: "y" }, { variant: "1K-webp" }, { count: 1 }]) {
+      expect(() => checkUpstreamErrorReceipt(err(400, { cost_msats: 2000, ...other }), 400, 0, 2000, image)).toThrow(/image session/);
+    }
+    // Other 5xx: at most price × count + abandon fee, even under a larger named reservation.
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, 2000, image)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26001, reserved_msats: 1e12 }), 500, 0, 2000, image)).toThrow(
+      /image session/,
+    );
+  });
+
   it("accepts only a receipt signed for this session and attestation", () => {
     const { priv, pubHex } = makeKey();
     const aJson = '{"sid":"s1","x":1}';

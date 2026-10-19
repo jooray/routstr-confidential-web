@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams, firstTailOffset } from "../src/params.js";
+import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, checkPiNKParams, firstTailOffset } from "../src/params.js";
 import { SessionProtocolError } from "../src/errors.js";
 
 describe("π_NK statement rebuilt from the signed offer", () => {
   const offer = {
-    head_template: "POST / HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Length: {LEN}\r\n\r\n",
+    head_template:
+      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer {KEY:4}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
     upstream_host: "api.example.com",
     key_length: 4,
     key_alphabet: "[A-Za-z0-9_-]",
@@ -43,6 +44,42 @@ describe("π_NK statement rebuilt from the signed offer", () => {
     const a = structuredClone(honest);
     a.PiNK.key_alphabet = "[0-9]";
     expect(() => checkPiNKParams(a, { offer, hk, bodyLen })).toThrow(/alphabet/);
+  });
+});
+
+describe("head template", () => {
+  const head = (path: string, headers: string[]) => `POST ${path} HTTP/1.1\r\n${headers.join("\r\n")}\r\n\r\n`;
+  const STD = [
+    "Host: api.example.com",
+    "Authorization: Bearer {KEY:4}",
+    "Content-Type: application/json",
+    "Accept-Encoding: identity",
+    "Connection: close",
+    "Content-Length: {LEN}",
+  ];
+
+  it("takes exactly the expected headers on the kind's route", () => {
+    expect(() => checkHeadTemplate(head("/api/v1/chat/completions", STD), "api.example.com")).not.toThrow();
+    expect(() => checkHeadTemplate(head("/api/v1/image/generate", STD), "api.example.com", "images")).not.toThrow();
+    expect(() => checkHeadTemplate(head("/v1/images/generations", [...STD].reverse()), "API.example.com", "images")).not.toThrow();
+  });
+
+  it("refuses another route, a query, another or a missing header", () => {
+    const bad: [string, string[], "chat" | "images"][] = [
+      ["/api/v1/image/generate", STD, "chat"],
+      ["/api/v1/chat/completions", STD, "images"],
+      ["/api/v1/chat/completions?store=true", STD, "chat"],
+      ["/api/v1/chat/completions#x", STD, "chat"],
+      ["/api/v1/chat/completions", [...STD, "Expect: 100-continue"], "chat"],
+      ["/api/v1/chat/completions", [...STD, "X-Store: 1"], "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Accept-Encoding") ? "Accept-Encoding: gzip" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: keep-alive" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.filter((h) => !h.startsWith("Connection")), "chat"],
+      ["/api/v1/chat/completions", [...STD, "Connection: close"], "chat"],
+    ];
+    for (const [path, headers, kind] of bad) {
+      expect(() => checkHeadTemplate(head(path, headers), "api.example.com", kind)).toThrow(SessionProtocolError);
+    }
   });
 });
 

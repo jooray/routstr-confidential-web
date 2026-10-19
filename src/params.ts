@@ -229,12 +229,14 @@ export function checkPiNKParams(
     offer: { head_template?: string; key_length?: number; key_alphabet?: string; upstream_host?: string };
     hk: Uint8Array;
     bodyLen: number;
+    /** The session's kind: the template must name its route (default chat). */
+    kind?: "chat" | "images";
   },
 ): void {
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
   if (!p) fail("π_NK", "missing");
   const tpl = own.offer.head_template ?? "";
-  checkHeadTemplate(tpl, own.offer.upstream_host ?? "");
+  checkHeadTemplate(tpl, own.offer.upstream_host ?? "", own.kind ?? "chat");
   const keyLen = own.offer.key_length;
   if (typeof keyLen !== "number" || !Number.isInteger(keyLen) || keyLen <= 0) {
     fail("π_NK", "signed offer has no key length");
@@ -262,31 +264,56 @@ export function checkPiNKParams(
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) fail("π_NK", "c_commit missing");
 }
 
+/** The route a head template may name, per session kind. */
+const TEMPLATE_PATHS: Record<"chat" | "images", RegExp> = {
+  chat: /\/chat\/completions$/,
+  images: /\/(image\/generate|images\/generations)$/,
+};
+
 /**
  * The published head template must be one HTTP/1.1 POST request head for the
- * offer's upstream host: `Host` names that host, the body length is the
- * `Content-Length`, and exactly one key token and one length token appear.
- * (The node writes the head, so this is what π_NK lets us hold it to.)
+ * offer's upstream host, on the route of the session's kind (no query), with
+ * exactly these headers: `Host` (the upstream host), `Authorization` (the key
+ * token), `Content-Type: application/json`, `Accept-Encoding: identity`,
+ * `Connection: close` and `Content-Length` (the body length). Any other header
+ * could switch on a provider feature, an interim response or a compressed or
+ * kept-alive answer the session cannot settle. (The node writes the head, so
+ * this is what π_NK lets us hold it to.)
  */
-export function checkHeadTemplate(tpl: string, upstreamHost: string): void {
+export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat" | "images" = "chat"): void {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
   if (count(/\{KEY:\d+\}/g) !== 1) fail("π_NK", "template must carry exactly one {KEY:n} token");
   if (count(/\{LEN\}/g) !== 1) fail("π_NK", "template must carry exactly one {LEN} token");
   if (count(/[{}]/g) !== 4) fail("π_NK", "template carries other placeholders");
-  if (!/^POST \/[\x21-\x7e]* HTTP\/1\.1\r\n/.test(tpl)) fail("π_NK", "template is not an HTTP/1.1 POST");
+  const line = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1\r\n/.exec(tpl);
+  if (!line) fail("π_NK", "template is not an HTTP/1.1 POST");
+  const path = line![1]!;
+  if (/[?#]/.test(path)) fail("π_NK", "template path carries a query or fragment");
+  if (!TEMPLATE_PATHS[kind].test(path)) fail("π_NK", `template path ${path} is not a ${kind} route`);
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
     fail("π_NK", "template is not exactly one request head");
   }
-  const headers = tpl.slice(0, -4).split("\r\n").slice(1);
-  const values = (name: string) =>
-    headers
-      .filter((h) => h.slice(0, h.indexOf(":")).trim().toLowerCase() === name)
-      .map((h) => h.slice(h.indexOf(":") + 1).trim());
-  const host = values("host");
-  if (!upstreamHost || host.length !== 1 || host[0]!.toLowerCase() !== upstreamHost.toLowerCase()) {
-    fail("π_NK", "template Host is not the offer's upstream host");
+  const want: Record<string, (v: string) => boolean> = {
+    host: (v) => !!upstreamHost && v.toLowerCase() === upstreamHost.toLowerCase(),
+    authorization: (v) => /\{KEY:\d+\}/.test(v),
+    "content-type": (v) => v.toLowerCase() === "application/json",
+    "accept-encoding": (v) => v.toLowerCase() === "identity",
+    connection: (v) => v.toLowerCase() === "close",
+    "content-length": (v) => v === "{LEN}",
+  };
+  const seen = new Set<string>();
+  for (const h of tpl.slice(0, -4).split("\r\n").slice(1)) {
+    const colon = h.indexOf(":");
+    const name = colon > 0 ? h.slice(0, colon) : "";
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) fail("π_NK", "template carries a malformed header line");
+    const key = name.toLowerCase();
+    const check = want[key];
+    if (!check) fail("π_NK", `template sets a header outside the allowed set (${name})`);
+    if (seen.has(key)) fail("π_NK", `template sets ${name} twice`);
+    seen.add(key);
+    if (!check!(h.slice(colon + 1).trim())) fail("π_NK", `template ${name} has an unexpected value`);
   }
-  const len = values("content-length");
-  if (len.length !== 1 || len[0] !== "{LEN}") fail("π_NK", "template Content-Length is not the body length");
-  if (values("transfer-encoding").length > 0) fail("π_NK", "template sets Transfer-Encoding");
+  for (const key of Object.keys(want)) {
+    if (!seen.has(key)) fail("π_NK", `template lacks the ${key} header`);
+  }
 }

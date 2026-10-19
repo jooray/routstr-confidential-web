@@ -200,9 +200,19 @@ console.log(r.msatPerImage, r.costMsats, r.confidential.receipt);
   computes it up front). No usage proof runs on success: after the attestation
   the client sends `accept`, and the receipt must charge exactly that amount
   (`kind: "images"`, `variant`, `count`, `msat_per_image`).
-- **Errors**: a node without images throws `offer_no_images`. A provider HTTP
-  error throws `UpstreamImageError` (`.status`, `.result` with the verified
-  receipt); a 4xx or 503 costs at most the session fee, as for chat.
+- **Short answers**: the request is paid once accepted, so a problem with the
+  answer is reported, not thrown: `r.warnings` lists fewer images than asked
+  for, an incomplete body, or a provider echo naming another model or count.
+- **Errors**: a node without images throws `offer_no_images`, and a malformed
+  image block in its offer `offer_malformed` (chat keeps working). A provider
+  HTTP error throws `UpstreamImageError` (`.status`, `.result` with the
+  verified receipt); a rejected request (4xx but 429) costs the abandon fee, a
+  429 or 503 the session fee, as for chat.
+- **What the node may pin**: the client takes only fixed pins that switch a
+  provider extra off (`false`, `[]`) and variant pins on the price tiers
+  (`resolution`, `quality`, `format`, values from the offer's `param_space`),
+  and a head template on the image route with exactly the expected headers;
+  anything else refuses the image block.
 - **No pre-arm**: every image request runs its own cold session (about 22 MB
   down and 1.2 MB up of setup before the image) and never touches the chat
   pre-warm pool.

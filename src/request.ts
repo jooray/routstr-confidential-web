@@ -6,6 +6,7 @@
  */
 
 import { endsWith } from "./bytes.js";
+import { SessionProtocolError } from "./errors.js";
 import { canonicalSuffix } from "./suffix.js";
 
 /** Request keys the pinned suffix sets; they never come from the caller. */
@@ -25,12 +26,12 @@ export function buildPinnedBody(request: Record<string, unknown>, model: string,
   for (const [k, v] of Object.entries(request)) {
     if (!PINNED_KEYS.has(k)) priv[k] = v;
   }
+  // The body must end with the exact suffix π_C2S proves, leading comma
+  // included, so it needs at least one private field before it.
+  if (Object.keys(priv).length === 0) throw new SessionProtocolError("a confidential request needs its messages");
   const json = JSON.stringify(priv);
-  // Drop the closing brace: the suffix closes the object and wins last. With
-  // no private keys the suffix's leading comma must go too.
-  const suffix = canonicalSuffix(model, maxTokens);
-  const prefix = json.slice(0, -1);
-  return new TextEncoder().encode(prefix === "{" ? `{${suffix.slice(1)}` : prefix + suffix);
+  // Drop the closing brace: the suffix closes the object and wins last.
+  return new TextEncoder().encode(json.slice(0, -1) + canonicalSuffix(model, maxTokens));
 }
 
 export function requestedMaxTokens(request: Record<string, unknown>, cap: number): number {

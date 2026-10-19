@@ -107,7 +107,7 @@ export class ImageRequestError extends SessionProtocolError {}
 
 /** An OpenAI `size` ("WxH") as the node's resolution class, by area. */
 export function resolutionFromSize(size: string): string {
-  const m = /^(\d+)x(\d+)$/.exec(size);
+  const m = /^(\d+)[xX](\d+)$/.exec(size);
   if (!m) throw new ImageRequestError(`size ${JSON.stringify(size)} is not WIDTHxHEIGHT`);
   const area = Number(m[1]) * Number(m[2]);
   return area < 2 * 1024 * 1024 ? "1K" : area < 2 * 2048 * 2048 ? "2K" : "4K";
@@ -142,7 +142,15 @@ export function planImageRequest(
   if (!variants || variants.length === 0) {
     throw new ImageRequestError(`the node does not serve ${model} for confidential images`);
   }
-  const rawCount = body[images.count_key] ?? body.n ?? body.variants ?? body.count ?? 1;
+  if (typeof body.prompt !== "string" || !body.prompt.trim()) throw new ImageRequestError("an image request needs a prompt");
+  // The count may come under any of its names, but they must agree.
+  const counts = [...new Set([images.count_key, "n", "variants", "count"])]
+    .map((k) => body[k])
+    .filter((v) => v !== undefined);
+  if (counts.some((c) => JSON.stringify(c) !== JSON.stringify(counts[0]))) {
+    throw new ImageRequestError(`the request names conflicting image counts (${counts.map((c) => JSON.stringify(c)).join(", ")})`);
+  }
+  const rawCount = counts[0] ?? 1;
   if (typeof rawCount !== "number" || !Number.isSafeInteger(rawCount) || rawCount < 1 || rawCount > images.max_count) {
     throw new ImageRequestError(`count must be 1..${images.max_count}`);
   }
@@ -179,13 +187,20 @@ export function planImageRequest(
     throw new ImageRequestError(`${model} has no image variant with ${want.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")}`);
   }
   const variant = matching.reduce((a, b) => (b.msat_per_image < a.msat_per_image ? b : a));
+  if (variant.max_count !== undefined && rawCount > variant.max_count) {
+    throw new ImageRequestError(`${model} ${variant.id} takes at most ${variant.max_count} images per request`);
+  }
   if (hasAxis("resolution") && (body.width !== undefined || body.height !== undefined)) {
     throw new ImageRequestError(`${model} is priced by resolution tier: width/height cannot be private options`);
   }
   const selectors = new Set<string>([...IMAGE_SELECTOR_KEYS, images.count_key]);
+  const pinned = pinnedImageKeys(images, variant);
   const privateOptions: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(body)) {
-    if (!selectors.has(k) && v !== undefined) privateOptions[k] = v;
+    if (selectors.has(k) || v === undefined) continue;
+    // A pin would silently override the caller's own value: refused instead.
+    if (pinned.has(k)) throw new ImageRequestError(`${JSON.stringify(k)} is pinned by the offer; it cannot be a private option`);
+    privateOptions[k] = v;
   }
   return { model, variant, count: rawCount, privateOptions };
 }
@@ -200,7 +215,7 @@ export function buildImageBody(privateOptions: Record<string, unknown>, suffix: 
   for (const k of Object.keys(privateOptions)) {
     if (pinned.has(k)) throw new SessionProtocolError(`${JSON.stringify(k)} is pinned by the offer; it cannot be a private option`);
   }
-  if (typeof privateOptions.prompt !== "string" || !privateOptions.prompt) {
+  if (typeof privateOptions.prompt !== "string" || !privateOptions.prompt.trim()) {
     throw new SessionProtocolError("an image request needs a prompt");
   }
   const prefix = JSON.stringify(privateOptions);

@@ -148,7 +148,8 @@ export class ProofChannel {
     this.relay?.command({ cmd, id, proof, params, witness: witness ?? null, timeout_ms: ms });
     const m = await p;
     if (!m.ok) throw new ProverError(`proof channel: ${proof} failed: ${m.err ?? "unknown"}`);
-    if (cmd === "verify" && !(m.checks ?? []).every((c) => c.ok)) {
+    // A verification with no checks verified nothing: refused, never passed.
+    if (cmd === "verify" && (!m.checks?.length || !m.checks.every((c) => c.ok))) {
       throw new ProverError(`proof channel: ${proof} checks failed`);
     }
     return m;

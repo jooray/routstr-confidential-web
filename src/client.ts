@@ -144,6 +144,12 @@ export interface ImageGenerateResult {
   /** The signed per-image price and what the receipt charged (msats). */
   msatPerImage: number;
   costMsats: number;
+  /**
+   * What is wrong with the answer, if anything: fewer images than asked for,
+   * an incomplete body, or a provider echo naming another model or count. The
+   * request was charged at the signed price regardless.
+   */
+  warnings: string[];
   /** The verified session: receipt, proofs, provider certificate, timings. */
   confidential: ConfidentialSessionResult;
 }
@@ -609,6 +615,7 @@ export class ConfidentialClient {
       count,
       msatPerImage: variant.msat_per_image,
       costMsats: Number(result.receipt.cost_msats ?? 0),
+      warnings: result.warnings ?? [],
       confidential: result,
     };
   }

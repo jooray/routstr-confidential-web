@@ -16,6 +16,7 @@ import {
   verifySchnorrSignature,
 } from "./canonical.js";
 import { TrustedHostMatcher } from "./hosts.js";
+import { checkHeadTemplate } from "./params.js";
 import {
   OfferBadSignatureError,
   OfferMalformedError,
@@ -47,8 +48,10 @@ export type ImagePin = [string, unknown];
 export interface ConfidentialImageVariant {
   id: string;
   pins: ImagePin[];
-  /** Flat price per image, msats, from the signed offer (the charge rounds up). */
+  /** Flat price per image, msats, from the signed offer. */
   msat_per_image: number;
+  /** Most images per request for this variant (below the block's `max_count`). */
+  max_count?: number;
 }
 
 /** The signed offer's image block (capability `images`). */
@@ -234,7 +237,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
       throw new OfferMalformedError("offer.capabilities is not a list of strings");
     }
   }
-  if (offer.images !== undefined) validateImagesBlock(offer.images);
+  // The image block is checked when an image request uses it (`offerImages`):
+  // a malformed one refuses images, never the chat the offer also serves.
   if (
     offer.rate_surcharge_pct !== undefined &&
     (typeof offer.rate_surcharge_pct !== "number" ||
@@ -249,42 +253,103 @@ function isPin(p: unknown): p is ImagePin {
   return Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && p[0].length > 0;
 }
 
-function validateImagesBlock(images: unknown): void {
+/** Most images per request any offer may ask for. */
+export const IMAGE_MAX_COUNT = 4;
+/** The variant pins a client lets the node choose: price tiers and the format. */
+export const IMAGE_VARIANT_PIN_KEYS = ["resolution", "quality", "format"] as const;
+
+/** A fixed pin switches a provider extra off: `false` or an empty list. */
+function isOffValue(v: unknown): boolean {
+  return v === false || (Array.isArray(v) && v.length === 0);
+}
+
+/**
+ * The signed image block, checked before any image request uses it. The node
+ * chooses what the suffix pins, and the provider obeys the suffix, so only
+ * pins that switch extras off and pins that select a priced tier are taken:
+ * anything else could switch on a feature that sends the prompt elsewhere.
+ */
+export function validateImagesBlock(images: unknown, upstreamHost?: string): void {
   const bad = (what: string): never => {
     throw new OfferMalformedError(`offer.images: ${what}`);
   };
   if (!isObject(images)) bad("not an object");
   const im = images as Record<string, unknown>;
   if (typeof im.head_template !== "string" || !im.head_template) bad("head_template is not a non-empty string");
+  if (upstreamHost !== undefined) {
+    try {
+      checkHeadTemplate(im.head_template as string, upstreamHost, "images");
+    } catch (e) {
+      bad(`head_template: ${(e as Error).message}`);
+    }
+  }
   if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("unknown response_shape");
   if (
     im.response_idle_s !== undefined &&
-    (typeof im.response_idle_s !== "number" || !Number.isFinite(im.response_idle_s) || im.response_idle_s <= 0)
+    (typeof im.response_idle_s !== "number" ||
+      !Number.isSafeInteger(im.response_idle_s) ||
+      im.response_idle_s < 30 ||
+      im.response_idle_s > 600)
   ) {
-    bad("response_idle_s is not a positive number");
+    bad("response_idle_s is not an integer of 30 to 600");
   }
-  if (typeof im.max_count !== "number" || !Number.isSafeInteger(im.max_count) || im.max_count < 1) {
-    bad("max_count is not a positive integer");
+  if (
+    typeof im.max_count !== "number" ||
+    !Number.isSafeInteger(im.max_count) ||
+    im.max_count < 1 ||
+    im.max_count > IMAGE_MAX_COUNT
+  ) {
+    bad(`max_count is not an integer of 1 to ${IMAGE_MAX_COUNT}`);
   }
-  if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key || im.count_key === "model")) {
-    bad("count_key is invalid");
-  }
+  const countKey = im.count_key ?? "variants";
+  if (typeof countKey !== "string" || !countKey || countKey === "model") bad("count_key is invalid");
   if (!Array.isArray(im.fixed_pins) || !im.fixed_pins.every(isPin)) bad("fixed_pins is not a list of [key, value]");
+  const fixed = im.fixed_pins as ImagePin[];
+  for (const [k, v] of fixed) {
+    if (!isOffValue(v)) bad(`fixed pin ${JSON.stringify(k)} does not switch an extra off`);
+  }
+  const fixedKeys = fixed.map(([k]) => k);
+  const reserved = ["model", countKey as string, ...fixedKeys];
+  if (new Set(reserved).size !== reserved.length) bad("a fixed pin repeats the model, the count or another pin");
+  if (!isObject(im.param_space)) bad("param_space is not an object");
+  const space = im.param_space as Record<string, unknown>;
+  for (const [k, vals] of Object.entries(space)) {
+    if (!Array.isArray(vals) || !vals.every((x) => typeof x === "string")) bad(`param_space[${JSON.stringify(k)}] is not a list of strings`);
+  }
   if (!isObject(im.price_list)) bad("price_list is not an object");
   for (const [model, variants] of Object.entries(im.price_list as Record<string, unknown>)) {
-    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list[${JSON.stringify(model)}] has no variants`);
+    const at = `price_list[${JSON.stringify(model)}]`;
+    if (!Array.isArray(variants) || variants.length === 0) bad(`${at} has no variants`);
+    const ids = new Set<string>();
     for (const v of variants as unknown[]) {
+      if (!isObject(v) || typeof v.id !== "string" || !v.id || !Array.isArray(v.pins) || !v.pins.every(isPin)) {
+        bad(`${at} has a malformed variant`);
+      }
+      const vr = v as Record<string, unknown>;
+      if (ids.has(vr.id as string)) bad(`${at} repeats the variant id ${JSON.stringify(vr.id)}`);
+      ids.add(vr.id as string);
+      const price = vr.msat_per_image;
+      if (typeof price !== "number" || !Number.isSafeInteger(price) || price <= 0) {
+        bad(`${at} variant ${JSON.stringify(vr.id)} has no positive integer price`);
+      }
       if (
-        !isObject(v) ||
-        typeof v.id !== "string" ||
-        !v.id ||
-        !Array.isArray(v.pins) ||
-        !v.pins.every(isPin) ||
-        typeof v.msat_per_image !== "number" ||
-        !Number.isFinite(v.msat_per_image) ||
-        v.msat_per_image < 0
+        vr.max_count !== undefined &&
+        (typeof vr.max_count !== "number" ||
+          !Number.isSafeInteger(vr.max_count) ||
+          vr.max_count < 1 ||
+          vr.max_count > (im.max_count as number))
       ) {
-        bad(`price_list[${JSON.stringify(model)}] has a malformed variant`);
+        bad(`${at} variant ${JSON.stringify(vr.id)} has an invalid max_count`);
+      }
+      const keys = new Set<string>();
+      for (const [k, val] of vr.pins as ImagePin[]) {
+        if (!(IMAGE_VARIANT_PIN_KEYS as readonly string[]).includes(k)) bad(`${at} pins ${JSON.stringify(k)}, not a price tier`);
+        if (keys.has(k) || reserved.includes(k)) bad(`${at} pins ${JSON.stringify(k)} twice`);
+        keys.add(k);
+        const allowed = space[k];
+        if (typeof val !== "string" || !Array.isArray(allowed) || !allowed.includes(val)) {
+          bad(`${at} pins ${JSON.stringify(k)}=${JSON.stringify(val)} outside param_space`);
+        }
       }
     }
   }
@@ -294,9 +359,14 @@ function validateImagesBlock(images: unknown): void {
  * The offer's image block when the node serves images confidentially: only
  * with `capabilities` naming `images` (an offer without the field is chat
  * only). Defaults filled in: `count_key` "variants", `response_idle_s` 300.
+ * A malformed block throws `OfferMalformedError`: images are refused, the
+ * offer's chat is not affected.
  */
-export function offerImages(offer: Pick<ConfidentialOffer, "capabilities" | "images">): ConfidentialImagesOffer | undefined {
+export function offerImages(
+  offer: Pick<ConfidentialOffer, "capabilities" | "images"> & { upstream_host?: string },
+): ConfidentialImagesOffer | undefined {
   if (!offer.images || !offer.capabilities?.includes("images")) return undefined;
+  validateImagesBlock(offer.images, offer.upstream_host);
   return { ...offer.images, count_key: offer.images.count_key ?? "variants", response_idle_s: offer.images.response_idle_s ?? 300 };
 }
 

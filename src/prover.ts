@@ -48,7 +48,9 @@ export class WasmProverBackend {
             done = true;
             clearTimeout(t);
             const checks = (m.checks as { ok: boolean }[] | undefined) ?? [];
-            if (m.ok === true && checks.every((c) => c.ok)) resolve();
+            // The verifier must report checks: none at all verified nothing.
+            const checked = job.role !== "verifier" || checks.length > 0;
+            if (m.ok === true && checked && checks.every((c) => c.ok)) resolve();
             else reject(new ProverError(`${job.proof} failed: ${String(m.err ?? "checks failed")}`));
           },
         });
