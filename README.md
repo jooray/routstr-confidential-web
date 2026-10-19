@@ -175,6 +175,38 @@ const v = await stream.verification; // throws if any proof or receipt check fai
 console.log(v.provider?.chain[0]?.subject, v.receipt.cost_msats, v.timings);
 ```
 
+### Images
+
+When the node's signed offer lists `capabilities: ["chat", "images"]`, the same
+client generates images confidentially: the node sees the model, the priced
+variant (resolution tier, format) and the count, but not the prompt, the
+private options or the image.
+
+```ts
+const offer = await client.images.offer();         // undefined: the node offers no images
+const r = await client.images.generate({
+  model: "qwen-image-2-1-turbo",
+  prompt: "A lighthouse at dusk, oil painting",
+  count: 1,                  // 1..offer.max_count (4)
+  resolution: "1K",          // or variant: "1K-webp"; chooses a signed variant
+  aspectRatio: "16:9",       // private, like seed, negative_prompt, safe_mode
+});
+img.src = URL.createObjectURL(r.images[0]);        // image/webp
+console.log(r.msatPerImage, r.costMsats, r.confidential.receipt);
+```
+
+- **Price**: flat, `msat_per_image × count` (+ the session fee) from the signed
+  offer's `images.price_list` (`imageRequestCostMsat(offer, variant, count)`
+  computes it up front). No usage proof runs on success: after the attestation
+  the client sends `accept`, and the receipt must charge exactly that amount
+  (`kind: "images"`, `variant`, `count`, `msat_per_image`).
+- **Errors**: a node without images throws `offer_no_images`. A provider HTTP
+  error throws `UpstreamImageError` (`.status`, `.result` with the verified
+  receipt); a 4xx or 503 costs at most the session fee, as for chat.
+- **No pre-arm**: every image request runs its own cold session (about 22 MB
+  down and 1.2 MB up of setup before the image) and never touches the chat
+  pre-warm pool.
+
 Other entry points: `client.offer()`, `client.pricing(maxTokens)`,
 `client.prepare(model, maxTokens)` (pre-warm for the model the user picked),
 `client.activity()`, `client.setPrewarm(on)`, `client.api` (balance, Lightning,
