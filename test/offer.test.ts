@@ -133,3 +133,27 @@ describe("offer verification", () => {
     expect(o.notary_pubkey).toBe(PROD_PUBKEY);
   });
 });
+
+describe("trusted API routes", () => {
+  const tpl = (path: string) =>
+    `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\nContent-Length: {LEN}\r\n\r\n`;
+  const verify = (path: string, trustedHosts: string[], extra: Record<string, unknown> = {}) => {
+    const { offer, pubHex } = signedOffer({ head_template: tpl(path), ...extra });
+    return () => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts });
+  };
+
+  it("takes the trusted base plus the endpoint, nothing else", () => {
+    expect(verify("/api/v1/chat/completions", HOSTS)).not.toThrow();
+    expect(verify("/v1/chat/completions", HOSTS)).not.toThrow();
+    expect(verify("/api/v1/chat/completions", ["api.venice.ai/api/v1"])).not.toThrow();
+    expect(verify("/proxy/other-tenant/chat/completions", HOSTS)).toThrow(TrustedHostError);
+    expect(verify("/v1/chat/completions", ["api.venice.ai/api/v1"])).toThrow(/not one the trusted host allows/);
+  });
+
+  it("turns images off when only their route is not trusted", () => {
+    const images = { ...(prod as never as { images?: Record<string, unknown> }).images, head_template: tpl("/x/image/generate") };
+    const o = verify("/api/v1/chat/completions", HOSTS, { capabilities: ["chat", "images"], images })();
+    expect(o.images).toBeUndefined();
+  });
+});
+

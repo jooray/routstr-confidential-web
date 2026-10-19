@@ -264,6 +264,27 @@ export function checkPiNKParams(
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) fail("π_NK", "c_commit missing");
 }
 
+/** The endpoints a route ends in, per session kind (after the trusted API base). */
+const ROUTE_ENDPOINTS: Record<"chat" | "images", readonly string[]> = {
+  chat: ["/chat/completions"],
+  images: ["/image/generate", "/images/generations"],
+};
+
+/**
+ * Why a head template's route is not exactly one of the trusted API bases
+ * followed by the kind's endpoint (`/api/v1` + `/chat/completions`), or
+ * `undefined` when it is. The bases come from the caller's trusted-host
+ * entry (`TrustedHostMatcher.apiBases`), not from the node.
+ */
+export function headRouteProblem(tpl: string, bases: readonly string[], kind: "chat" | "images"): string | undefined {
+  const m = /^POST (\S+) HTTP\/1\.1\r\n/.exec(tpl);
+  if (!m) return "template is not an HTTP/1.1 POST";
+  const allowed = bases.flatMap((b) => ROUTE_ENDPOINTS[kind].map((end) => b + end));
+  return allowed.includes(m[1]!)
+    ? undefined
+    : `template route ${m[1]} is not one the trusted host allows (${allowed.join(", ")})`;
+}
+
 /** The route a head template may name, per session kind. */
 const TEMPLATE_PATHS: Record<"chat" | "images", RegExp> = {
   chat: /\/chat\/completions$/,
