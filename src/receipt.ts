@@ -190,6 +190,47 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
  * over the exact signed bytes, those bytes (not any unsigned envelope) are the
  * receipt, and it must name this session and this session's attestation.
  */
+/**
+ * A flat-priced (image) receipt: the charge is fixed at setup, so it must be
+ * exactly ceil(`msat_per_image × count + session fee`) at the signed offer's price,
+ * for the model, variant and count we asked for.
+ */
+export function verifyFlatReceipt(
+  receipt: ConfidentialReceipt,
+  own: { model: string; variant: string; count: number; msatPerImage: number; sessionFeeMsat?: number },
+): void {
+  const fee = Math.max(0, own.sessionFeeMsat ?? 0);
+  if (receipt.model !== own.model) {
+    throw new ReceiptVerificationError(`receipt is for model ${receipt.model}, not ${own.model}`);
+  }
+  if (receipt.kind !== undefined && receipt.kind !== "images") {
+    throw new ReceiptVerificationError(`receipt is for a ${String(receipt.kind)} session, not images`);
+  }
+  if (receipt.variant !== undefined && receipt.variant !== own.variant) {
+    throw new ReceiptVerificationError(`receipt names variant ${String(receipt.variant)}, not ${own.variant}`);
+  }
+  if (receipt.count !== undefined && receipt.count !== own.count) {
+    throw new ReceiptVerificationError(`receipt names ${String(receipt.count)} images, not ${own.count}`);
+  }
+  if (receipt.msat_per_image !== undefined && receipt.msat_per_image !== own.msatPerImage) {
+    throw new ReceiptVerificationError(
+      `receipt prices an image at ${String(receipt.msat_per_image)} msats, the signed offer at ${own.msatPerImage}`,
+    );
+  }
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    throw new ReceiptVerificationError(
+      `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
+    );
+  }
+  // The node charges the flat price rounded up to a whole msat.
+  const want = Math.ceil(own.msatPerImage * own.count + fee);
+  if (!isMsatAmount(receipt.cost_msats) || receipt.cost_msats !== want) {
+    throw new ReceiptVerificationError(
+      `receipt cost ${String(receipt.cost_msats)} msats != ${own.msatPerImage} × ${own.count} + ${fee} = ${want}`,
+    );
+  }
+}
+
 export function parseSignedReceipt(input: {
   receiptJson: string;
   sig?: string;

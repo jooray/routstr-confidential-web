@@ -20,9 +20,19 @@
  * is authenticated by AES-GCM under keys only this page holds.
  */
 
-import { ConfidentialError, SessionRejectedError } from "./errors.js";
+import { ConfidentialError, SessionRejectedError, UpstreamImageError } from "./errors.js";
 import { encryptedNodeTransport } from "./hosts.js";
-import { fetchConfidentialOffer, offerAbandonFeeMsat, verifyConfidentialOffer, type VerifiedOffer } from "./offer.js";
+import {
+  fetchConfidentialOffer,
+  offerAbandonFeeMsat,
+  offerImages,
+  offerSessionFeeMsat,
+  verifyConfidentialOffer,
+  type ConfidentialImagesOffer,
+  type ConfidentialImageVariant,
+  type VerifiedOffer,
+} from "./offer.js";
+import { buildImageBody, chooseImageVariant, imageSuffix, pinnedImageKeys } from "./images.js";
 import { NodeApi, type NodeModel } from "./node-api.js";
 import { modelPricing, type ModelPricing } from "./pricing.js";
 import { aggregateChatCompletion, buildPinnedBody, chooseBucket, padPinnedBody, requestedMaxTokens, SseParser } from "./request.js";
@@ -103,6 +113,47 @@ export interface ConfidentialStream extends AsyncIterable<ChatCompletionChunk> {
 }
 
 export type ChatCompletion = Record<string, unknown> & { confidential: ConfidentialSessionResult };
+
+/**
+ * A confidential image request. `model`, `count`, `variant` / `resolution` /
+ * `quality` / `format` choose the priced variant (pinned, visible to the
+ * node); `prompt`, `aspectRatio` and any other field are private options the
+ * node never sees (e.g. `seed`, `negative_prompt`, `safe_mode`).
+ */
+export interface ImageGenerateParams {
+  model: string;
+  prompt: string;
+  /** Images in one request, 1..`offer.images.max_count` (default 1). */
+  count?: number;
+  /** An offered variant id; else chosen from `resolution`/`quality`/`format`. */
+  variant?: string;
+  resolution?: string;
+  quality?: string;
+  format?: string;
+  /** Private: e.g. "16:9" (sent as `aspect_ratio`). */
+  aspectRatio?: string;
+  [k: string]: unknown;
+}
+
+export interface ImageGenerateResult {
+  /** The images, as received (the pinned format, e.g. image/webp). */
+  images: Blob[];
+  model: string;
+  variant: string;
+  count: number;
+  /** The signed per-image price and what the receipt charged (msats). */
+  msatPerImage: number;
+  costMsats: number;
+  /** The verified session: receipt, proofs, provider certificate, timings. */
+  confidential: ConfidentialSessionResult;
+}
+
+/** What one image request costs at the signed offer (msats), before it runs. */
+export function imageRequestCostMsat(offer: VerifiedOffer, variant: ConfidentialImageVariant, count: number): number {
+  return Math.ceil(variant.msat_per_image * count + offerSessionFeeMsat(offer));
+}
+
+const VARIANT_PARAMS = ["resolution", "quality", "format"] as const;
 
 type Head = { status: number; statusText: string; headers: Record<string, string> };
 
@@ -472,6 +523,95 @@ export class ConfidentialClient {
   /** Signal user activity (typing, focus) to the pre-warmer. */
   activity(): void {
     this.prewarmer?.activity();
+  }
+
+  /**
+   * Confidential image generation: one cold session per request (never
+   * pre-armed), flat-priced at the signed offer's per-image price.
+   */
+  readonly images = {
+    generate: (params: ImageGenerateParams, options?: { signal?: AbortSignal }) => this.generateImages(params, options?.signal, false),
+    /** The signed offer's image block (models, variants, prices), or undefined. */
+    offer: async (): Promise<ConfidentialImagesOffer | undefined> => offerImages(await this.offer()),
+  };
+
+  private async generateImages(
+    params: ImageGenerateParams,
+    signal: AbortSignal | undefined,
+    freshOffer: boolean,
+  ): Promise<ImageGenerateResult> {
+    const auth = this.credential;
+    if (!auth) throw new ConfidentialError("not_configured", "no credential: fund the wallet or paste an sk- key");
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    const offer = await this.offer(freshOffer);
+    const images = offerImages(offer);
+    if (!images) throw new ConfidentialError("offer_no_images", "the node offers no confidential image generation");
+    const { model, prompt, count: rawCount, variant: variantId, aspectRatio, ...rest } = params;
+    const count = rawCount ?? 1;
+    if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
+      throw new ConfidentialError("session_protocol", `count must be 1..${images.max_count}`);
+    }
+    if (!images.price_list[model]) {
+      throw new ConfidentialError("offer_no_images", `the node does not serve ${model} for confidential images`);
+    }
+    const wanted: Record<string, unknown> = {};
+    const priv: Record<string, unknown> = { prompt };
+    for (const [k, v] of Object.entries(rest)) {
+      if ((VARIANT_PARAMS as readonly string[]).includes(k)) wanted[k] = v;
+      else if (v !== undefined) priv[k] = v;
+    }
+    if (aspectRatio !== undefined) priv.aspect_ratio = aspectRatio;
+    const variant = chooseImageVariant(images, model, { variant: variantId, params: wanted });
+    const suffix = imageSuffix(images, model, variant, count);
+    const body = buildImageBody(priv, suffix, pinnedImageKeys(images, variant));
+    // No pre-warm: an image session is set up for this request only, and it
+    // must not arm (or claim) the chat pool.
+    const session = new ConfidentialSession({
+      baseUrl: this.node,
+      offer,
+      auth,
+      model,
+      maxTokens: 0,
+      kind: "images",
+      image: { variant, count },
+      bodyLength: body.length,
+      host: this.host,
+      webSocketImpl: this.opts.webSocketImpl,
+      allowInsecureTransport: this.opts.allowInsecureTransport,
+      onEvent: (e) => this.emit({ ...e, kind: "images", session: undefined }),
+    });
+    const abort = () => session.close();
+    signal?.addEventListener("abort", abort, { once: true });
+    let result: ConfidentialSessionResult;
+    try {
+      this.emit({ ev: "request", path: "cold", kind: "images", model, variant: variant.id, count });
+      result = await session.run(body);
+    } catch (e) {
+      session.close();
+      // Retry only while nothing could have reached the provider.
+      if (isOfferExpired(e) && !freshOffer && !session.bodyReleased && !signal?.aborted) {
+        return this.generateImages(params, signal, true);
+      }
+      throw e;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+    if (result.http.status >= 400) {
+      throw new UpstreamImageError(
+        result.http.status,
+        `the provider refused the image request: HTTP ${result.http.status} ${result.http.statusText}`.trim(),
+        result,
+      );
+    }
+    return {
+      images: result.images ?? [],
+      model,
+      variant: variant.id,
+      count,
+      msatPerImage: variant.msat_per_image,
+      costMsats: Number(result.receipt.cost_msats ?? 0),
+      confidential: result,
+    };
   }
 
   readonly chat = {

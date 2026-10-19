@@ -22,7 +22,9 @@ export type ConfidentialErrorCode =
   | "response_verification"
   | "timeout"
   | "not_configured"
-  | "unsupported_endpoint";
+  | "unsupported_endpoint"
+  | "offer_no_images"
+  | "upstream_error";
 
 export class ConfidentialError extends Error {
   readonly code: ConfidentialErrorCode;
@@ -152,5 +154,21 @@ export class ConfidentialTimeoutError extends ConfidentialError {
   constructor(message: string, detail?: string) {
     super("timeout", message, detail);
     this.name = "ConfidentialTimeoutError";
+  }
+}
+
+/**
+ * The provider answered an image request with an HTTP error. The session
+ * settled and its receipt verified (a 4xx/503 costs at most the session fee);
+ * `result` carries the receipt and the proofs.
+ */
+export class UpstreamImageError extends ConfidentialError {
+  readonly status: number;
+  readonly result: unknown;
+  constructor(status: number, message: string, result: unknown) {
+    super("upstream_error", message);
+    this.name = "UpstreamImageError";
+    this.status = status;
+    this.result = result;
   }
 }

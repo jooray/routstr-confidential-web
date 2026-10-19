@@ -40,6 +40,37 @@ export interface ConfidentialPriceEntry {
   out: number;
 }
 
+/** A JSON key/value pinned in the image suffix, as `[key, value]`. */
+export type ImagePin = [string, unknown];
+
+/** One priced variant of an image model (its pins choose the price tier). */
+export interface ConfidentialImageVariant {
+  id: string;
+  pins: ImagePin[];
+  /** Flat price per image, msats, from the signed offer (the charge rounds up). */
+  msat_per_image: number;
+}
+
+/** The signed offer's image block (capability `images`). */
+export interface ConfidentialImagesOffer {
+  /** Request head of the image route, `{KEY:n}` and `{LEN}` tokens as for chat. */
+  head_template: string;
+  /** Response JSON shape: `venice` (`{images:[base64]}`) or `openai` (`{data:[{b64_json}]}`). */
+  response_shape: "venice" | "openai";
+  /** Seconds the provider may stay silent before the response (default 300). */
+  response_idle_s?: number;
+  /** Most images per request. */
+  max_count: number;
+  /** The request key that carries the count (default `variants`, Venice's). */
+  count_key: string;
+  /** Pins every request carries, after the model and the count. */
+  fixed_pins: ImagePin[];
+  price_list: Record<string, ConfidentialImageVariant[]>;
+  /** The relay's parameter space and response cap (informational for the client). */
+  param_space?: Record<string, unknown[]>;
+  max_response_bytes?: number;
+}
+
 export interface ConfidentialOffer {
   v: number;
   min_v?: number;
@@ -54,6 +85,9 @@ export interface ConfidentialOffer {
   head_template: string;
   suffix_keys: string[];
   price_list: Record<string, ConfidentialPriceEntry>;
+  /** What the node serves confidentially (absent: chat only). */
+  capabilities?: string[];
+  images?: ConfidentialImagesOffer;
   mints?: string[];
   prewarm?: boolean;
   /**
@@ -195,6 +229,12 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.abandon_fee_msat is not a non-negative integer");
   }
+  if (offer.capabilities !== undefined) {
+    if (!Array.isArray(offer.capabilities) || !offer.capabilities.every((c) => typeof c === "string")) {
+      throw new OfferMalformedError("offer.capabilities is not a list of strings");
+    }
+  }
+  if (offer.images !== undefined) validateImagesBlock(offer.images);
   if (
     offer.rate_surcharge_pct !== undefined &&
     (typeof offer.rate_surcharge_pct !== "number" ||
@@ -203,6 +243,61 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.rate_surcharge_pct is not a non-negative number");
   }
+}
+
+function isPin(p: unknown): p is ImagePin {
+  return Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && p[0].length > 0;
+}
+
+function validateImagesBlock(images: unknown): void {
+  const bad = (what: string): never => {
+    throw new OfferMalformedError(`offer.images: ${what}`);
+  };
+  if (!isObject(images)) bad("not an object");
+  const im = images as Record<string, unknown>;
+  if (typeof im.head_template !== "string" || !im.head_template) bad("head_template is not a non-empty string");
+  if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("unknown response_shape");
+  if (
+    im.response_idle_s !== undefined &&
+    (typeof im.response_idle_s !== "number" || !Number.isFinite(im.response_idle_s) || im.response_idle_s <= 0)
+  ) {
+    bad("response_idle_s is not a positive number");
+  }
+  if (typeof im.max_count !== "number" || !Number.isSafeInteger(im.max_count) || im.max_count < 1) {
+    bad("max_count is not a positive integer");
+  }
+  if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key || im.count_key === "model")) {
+    bad("count_key is invalid");
+  }
+  if (!Array.isArray(im.fixed_pins) || !im.fixed_pins.every(isPin)) bad("fixed_pins is not a list of [key, value]");
+  if (!isObject(im.price_list)) bad("price_list is not an object");
+  for (const [model, variants] of Object.entries(im.price_list as Record<string, unknown>)) {
+    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list[${JSON.stringify(model)}] has no variants`);
+    for (const v of variants as unknown[]) {
+      if (
+        !isObject(v) ||
+        typeof v.id !== "string" ||
+        !v.id ||
+        !Array.isArray(v.pins) ||
+        !v.pins.every(isPin) ||
+        typeof v.msat_per_image !== "number" ||
+        !Number.isFinite(v.msat_per_image) ||
+        v.msat_per_image < 0
+      ) {
+        bad(`price_list[${JSON.stringify(model)}] has a malformed variant`);
+      }
+    }
+  }
+}
+
+/**
+ * The offer's image block when the node serves images confidentially: only
+ * with `capabilities` naming `images` (an offer without the field is chat
+ * only). Defaults filled in: `count_key` "variants", `response_idle_s` 300.
+ */
+export function offerImages(offer: Pick<ConfidentialOffer, "capabilities" | "images">): ConfidentialImagesOffer | undefined {
+  if (!offer.images || !offer.capabilities?.includes("images")) return undefined;
+  return { ...offer.images, count_key: offer.images.count_key ?? "variants", response_idle_s: offer.images.response_idle_s ?? 300 };
 }
 
 function feeValue(fee: unknown): number {

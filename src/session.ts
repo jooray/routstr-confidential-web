@@ -35,7 +35,14 @@ import {
 import { encryptedNodeTransport, matchHostname } from "./hosts.js";
 import { checkPiC2SParams, checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostRecord } from "./params.js";
 import { WasmProverBackend } from "./prover.js";
-import { checkAttestationBinding, checkUpstreamErrorReceipt, parseSignedReceipt, verifyReceipt } from "./receipt.js";
+import {
+  checkAttestationBinding,
+  checkUpstreamErrorReceipt,
+  parseSignedReceipt,
+  verifyFlatReceipt,
+  verifyReceipt,
+} from "./receipt.js";
+import { base64ToBytes, imageMimeType, imageSuffix, responseImages } from "./images.js";
 import {
   canonicalSuffix,
   disclosureTailLens,
@@ -49,7 +56,14 @@ import {
 } from "./suffix.js";
 import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc.js";
 import { ProofChannel } from "./zkchan.js";
-import { offerAbandonFeeMsat, offerSessionFeeMsat, type VerifiedOffer } from "./offer.js";
+import {
+  offerAbandonFeeMsat,
+  offerImages,
+  offerSessionFeeMsat,
+  type ConfidentialImagesOffer,
+  type ConfidentialImageVariant,
+  type VerifiedOffer,
+} from "./offer.js";
 import type { WasmHost } from "./wasm/host.js";
 import { makeTLSClient } from "./tls-fork/lib/index.js";
 import { setCryptoImplementation } from "./tls-fork/lib/crypto/index.js";
@@ -195,6 +209,17 @@ export interface ConfidentialSessionResult {
   waitedForArmMs?: number;
   protocol: number;
   nodePubkey: string;
+  /** Image sessions: the generated images (empty for an upstream error). */
+  images?: Blob[];
+  /** Image sessions: the variant and count that were pinned and charged. */
+  imageVariant?: string;
+  imageCount?: number;
+}
+
+/** What an image session asks for: a variant of the signed offer and a count. */
+export interface ImageSessionRequest {
+  variant: ConfidentialImageVariant;
+  count: number;
 }
 
 export interface ConfidentialSessionOptions {
@@ -204,7 +229,12 @@ export interface ConfidentialSessionOptions {
   /** The node credential (`sk-` key or Cashu token); sent only in-band in `setup.auth`. */
   auth: string;
   model: string;
+  /** Chat: the pinned max_tokens. Ignored for images. */
   maxTokens: number;
+  /** `chat` (default) or `images` (flat-priced, never armed ahead). */
+  kind?: "chat" | "images";
+  /** Required for `kind: "images"`. */
+  image?: ImageSessionRequest;
   /** Body length declared at setup (must equal the body passed to claim()). */
   bodyLength: number;
   suffix?: string;
@@ -239,6 +269,12 @@ export const DEFAULT_TIMEOUTS = {
   proofChannelReady: 120_000,
   proof: 90_000,
 };
+
+/**
+ * Server records kept for an image session: the most a π_C3S covers
+ * (MAX_C3S_RECORDS) plus the trailing records allowed after them.
+ */
+const RETAINED_SERVER_RECORDS = 64 + 17;
 
 class Bus {
   private pending = new Map<string, unknown[]>();
@@ -344,6 +380,11 @@ export class ConfidentialSession {
   readonly bodyLength: number;
   readonly suffix: string;
   readonly protocol = 2;
+  readonly kind: "chat" | "images";
+  private readonly image?: ImageSessionRequest;
+  private readonly imagesOffer?: ConfidentialImagesOffer;
+  /** Set by run(): an image session only ever runs cold, start to end. */
+  private coldRun = false;
   private readonly host: WasmHost;
   private readonly prover: WasmProverBackend;
   private twoPc?: TwoPcSession;
@@ -396,7 +437,12 @@ export class ConfidentialSession {
   private certChainHash?: Uint8Array;
   private epochBody = false;
   private bodyRecords: Uint8Array[] = [];
-  private responseBytes: Uint8Array = new Uint8Array(0);
+  /** Response plaintext bytes received (the records are in responseChunks). */
+  private responseLength = 0;
+  private responseJoined?: Uint8Array;
+  private progressAt = 0;
+  /** Server records dropped from the front of serverRecords (bounded retention). */
+  private serverRecordsDropped = 0;
   private tlsEnded = false;
   sid = "";
   ready: any = null;
@@ -430,7 +476,23 @@ export class ConfidentialSession {
     this.model = options.model;
     this.maxTokens = options.maxTokens;
     this.bodyLength = options.bodyLength;
-    this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
+    this.kind = options.kind ?? "chat";
+    if (this.kind === "images") {
+      const images = offerImages(options.offer);
+      if (!images) throw new SessionProtocolError("the node's signed offer serves no confidential images");
+      if (!options.image) throw new SessionProtocolError("an image session needs a variant and a count");
+      if (!(options.image.count >= 1 && options.image.count <= images.max_count)) {
+        throw new SessionProtocolError(`image count ${options.image.count} is outside 1..${images.max_count}`);
+      }
+      if (!images.price_list[options.model]?.some((v) => v.id === options.image!.variant.id)) {
+        throw new SessionProtocolError(`the signed offer has no variant ${options.image.variant.id} for ${options.model}`);
+      }
+      this.imagesOffer = images;
+      this.image = options.image;
+      this.suffix = imageSuffix(images, options.model, options.image.variant, options.image.count);
+    } else {
+      this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
+    }
     if (options.offer.v !== 2) {
       throw new SessionProtocolError(`the browser client speaks protocol v2 only (offer v=${options.offer.v})`);
     }
@@ -454,6 +516,12 @@ export class ConfidentialSession {
     this.errP.catch((e: Error) => {
       this.failure ??= e;
     });
+  }
+
+  /** The response plaintext so far, joined once (not per record). */
+  private get responseBytes(): Uint8Array {
+    this.responseJoined ??= concat(...this.responseChunks);
+    return this.responseJoined;
   }
 
   get healthy(): boolean {
@@ -610,7 +678,12 @@ export class ConfidentialSession {
         if (!this.ttft) this.ttft = Date.now();
         this.tLastData = Date.now();
         this.responseChunks.push(rec);
-        this.responseBytes = concat(this.responseBytes, rec);
+        this.responseLength += rec.length;
+        this.responseJoined = undefined;
+        if (this.responseLength - this.progressAt >= 256 * 1024) {
+          this.progressAt = this.responseLength;
+          this.event({ ev: "response_progress", bytes: this.responseLength });
+        }
         if (this.onResponseHead || this.onResponseBody) {
           try {
             const parts = this.incremental.push(rec);
@@ -646,7 +719,16 @@ export class ConfidentialSession {
       const len = (buf[3]! << 8) | buf[4]!;
       if (buf.length < 5 + len) break;
       this.recvRecords += 1;
-      if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len));
+      if (buf[0] === 0x17) {
+        this.serverRecords.push(buf.slice(5, 5 + len));
+        // An image response is megabytes of records, but a proof only ever
+        // covers the tail (the error head of a short error body): keep the
+        // last ones and count the rest.
+        if (this.kind === "images" && this.serverRecords.length > RETAINED_SERVER_RECORDS) {
+          this.serverRecords.shift();
+          this.serverRecordsDropped += 1;
+        }
+      }
       buf = buf.subarray(5 + len);
     }
     this.serverPending = buf.slice();
@@ -672,17 +754,31 @@ export class ConfidentialSession {
    */
   async arm(): Promise<void> {
     if (this.armStarted) throw new SessionProtocolError("arm() called twice");
+    if (this.kind === "images" && !this.coldRun) {
+      throw new SessionProtocolError("image sessions are never armed ahead; use run()");
+    }
     this.armStarted = true;
     await this.host.ready();
     await this.open();
-    const setup: Record<string, unknown> = {
-      type: "setup",
-      nonce_c: randomHex(32),
-      model: this.model,
-      max_tokens: this.maxTokens,
-      len: this.bodyLength,
-      armed: true,
-    };
+    const setup: Record<string, unknown> =
+      this.kind === "images"
+        ? {
+            type: "setup",
+            kind: "images",
+            nonce_c: randomHex(32),
+            model: this.model,
+            variant: this.image!.variant.id,
+            count: this.image!.count,
+            len: this.bodyLength,
+          }
+        : {
+            type: "setup",
+            nonce_c: randomHex(32),
+            model: this.model,
+            max_tokens: this.maxTokens,
+            len: this.bodyLength,
+            armed: true,
+          };
     if (this.offer.sig) setup.offer_sig = this.offer.sig;
     // Accept that offer's fees explicitly (the node refuses a setup that does
     // not, so a client unaware of fees is never charged one).
@@ -773,7 +869,9 @@ export class ConfidentialSession {
         throw new SessionProtocolError(`c_commit: ${k} differs from our 2PC output`);
       }
     }
-    checkPiNKParams(commit.params, { offer: this.offer, hk: this.ap.hk, bodyLen: this.bodyLength });
+    // An image session's credential record is the image route's head.
+    const nkOffer = this.imagesOffer ? { ...this.offer, head_template: this.imagesOffer.head_template } : this.offer;
+    checkPiNKParams(commit.params, { offer: nkOffer, hk: this.ap.hk, bodyLen: this.bodyLength });
     // The head-record commitment the attestation must name is the one π_NK
     // proves; the frame has to carry exactly it.
     const pinkCommit = hex(Uint8Array.from((commit.params as { PiNK: { c_commit: number[] } }).PiNK.c_commit));
@@ -824,6 +922,7 @@ export class ConfidentialSession {
    * arm passes the time before that wait, so the wait counts in the timings.
    */
   async claim(body: Uint8Array, tClaim = Date.now()): Promise<ConfidentialSessionResult> {
+    if (this.kind === "images") throw new SessionProtocolError("image sessions are never claimed; use run()");
     const armingBefore = this.armStarted;
     if (!this.armStarted) await this.arm();
     await this.prepareProofs();
@@ -841,7 +940,7 @@ export class ConfidentialSession {
     if (body.length !== this.bodyLength) {
       throw new SessionProtocolError(`body length ${body.length} != declared setup len ${this.bodyLength}`);
     }
-    if (this.ready.suffix !== undefined && this.ready.suffix !== this.suffix) {
+    if ((this.kind === "images" || this.ready.suffix !== undefined) && this.ready.suffix !== this.suffix) {
       throw new SessionProtocolError("node expects a different pinned suffix than ours");
     }
     const suffixBytes = new TextEncoder().encode(this.suffix);
@@ -884,10 +983,14 @@ export class ConfidentialSession {
     // The node attests after the provider closes the response, so the wait
     // lasts as long as the answer streams: time out only on silence.
     const attP = this.bus.wait("attestation");
+    // An image response sends nothing until the image is done.
+    const idleMs = this.imagesOffer
+      ? Math.max(this.timeouts.attestation, (this.imagesOffer.response_idle_s ?? 300) * 1000)
+      : this.timeouts.attestation;
     const att = (await Promise.race([
       attP,
       this.errP,
-      idleTimeout(this.timeouts.attestation, "attestation", () => Math.max(this.tLastData, this.tBodyWrite), attP),
+      idleTimeout(idleMs, "attestation", () => Math.max(this.tLastData, this.tBodyWrite), attP),
     ])) as { a?: unknown; a_json?: string; sig?: string };
     if (this.ready.pubkey !== this.offer.notary_pubkey) {
       throw new ReceiptVerificationError(
@@ -915,107 +1018,122 @@ export class ConfidentialSession {
     // An upstream HTTP error discloses only the response head.
     const httpEarly = parseHttpResponse(this.responseBytes);
     const upstreamError = httpEarly.status >= 400;
-    let r: Uint8Array | undefined;
-    let skip = 0;
-    if (upstreamError) {
-      const headEnd = indexOfCrlfCrlf(this.responseBytes);
-      if (headEnd < 0) throw new ResponseVerificationError("upstream error response has no head");
-      r = this.responseBytes.slice(0, headEnd + 4);
-      skip = this.responseBytes.length - r.length;
-    } else {
-      r = extractUsageDisclosure(this.responseBytes) ?? undefined;
-    }
-    if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
-    const tailLens = disclosureTailLens(
-      this.responseChunks.map((c) => c.length),
-      r.length + skip,
-    );
-    const epoch = serverTailEpoch(this.serverPost, tailLens.length);
-    const disclose: Record<string, unknown> = {
-      type: "disclose",
-      r: hex(r),
-      tail_lens: tailLens,
-      skip,
-      trailing: epoch.trailing,
-    };
-    if (epoch.keyUpdates > 0) {
-      disclose.key_updates = epoch.keyUpdates;
-      disclose.epoch_start = epoch.epochStart;
-    }
-    this.sendText(disclose);
-
-    const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
-    // Wire index of sequence 0 of the covered records' epoch: the records
-    // before the post-handshake ones are the encrypted server flight.
-    const handshakeRecords = this.serverRecords.length - this.serverPost.length;
-    checkPiC3SParams(c3.params, {
-      h2: this.ap!.h2,
-      serverRecords: this.serverRecords,
-      r,
-      skip,
-      keyUpdates: epoch.keyUpdates,
-      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
-      trailing: epoch.trailing,
-      tailLens,
-    });
-    await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
-    this.twoPc?.close();
-    this.zkChan?.close();
-    this.event({ ev: "pi_c3s_ok" });
-
-    const m = (await Promise.race([
-      this.bus.wait("receipt"),
-      this.errP,
-      timeout(this.timeouts.receipt, "receipt"),
-    ])) as { receipt: ConfidentialReceipt; receipt_json?: string; sig?: string };
-    const receiptJson = m.receipt_json ?? JSON.stringify(m.receipt);
-    const sigHex = m.sig;
-    const receipt = parseSignedReceipt({
-      receiptJson,
-      sig: sigHex,
-      pubkey: this.ready.pubkey,
-      sid: this.sid,
-      // The bytes whose signature and session binding were checked above.
-      attestationJson: attJson,
-    });
-    const receiptSigOk = verifySchnorrSignature(receiptJson, sigHex, this.ready.pubkey);
-    const fee = offerSessionFeeMsat(this.offer);
-
+    // A flat-priced (image) success needs no disclosure: the charge is fixed
+    // by the pinned request, so we accept and the node charges exactly it.
+    const flatAccept = this.kind === "images" && !upstreamError;
+    let receipt: ConfidentialReceipt;
+    let receiptJson: string;
+    let sigHex: string | undefined;
     let usageMatch: boolean;
     let costWithinOffer = true;
     let ownUsage: UpstreamUsageEvent | undefined;
-    if (upstreamError) {
-      // Errors the provider answers before doing any work (4xx, 503) cost at
-      // most the session fee (the node's 2PC work), any other error at most
-      // the session's reservation.
-      usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, fee);
-    } else {
-      ownUsage = usageEventFromDisclosure(r) ?? undefined;
-      if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
-      const checked = verifyReceipt({
-        receipt,
-        receiptJson,
-        sig: sigHex,
-        pubkey: this.ready.pubkey,
-        ownUsage,
-        priceEntry: this.offer.price_list[this.model],
+    const fee = offerSessionFeeMsat(this.offer);
+    if (flatAccept) {
+      this.sendText({ type: "accept" });
+      ({ receipt, receiptJson, sigHex } = await this.waitReceipt(attJson));
+      verifyFlatReceipt(receipt, {
+        model: this.model,
+        variant: this.image!.variant.id,
+        count: this.image!.count,
+        msatPerImage: this.image!.variant.msat_per_image,
         sessionFeeMsat: fee,
-        abandonFeeMsat: offerAbandonFeeMsat(this.offer),
       });
-      usageMatch = checked.usageMatch;
-      costWithinOffer = checked.costWithinOffer;
-      if (!costWithinOffer) {
-        throw new ReceiptVerificationError(
-          `receipt cost ${receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates`,
-        );
+      usageMatch = true;
+      this.twoPc?.close();
+      this.zkChan?.close();
+    } else {
+      let r: Uint8Array | undefined;
+      let skip = 0;
+      if (upstreamError) {
+        const headEnd = indexOfCrlfCrlf(this.responseBytes);
+        if (headEnd < 0) throw new ResponseVerificationError("upstream error response has no head");
+        r = this.responseBytes.slice(0, headEnd + 4);
+        skip = this.responseBytes.length - r.length;
+      } else {
+        r = extractUsageDisclosure(this.responseBytes) ?? undefined;
+      }
+      if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
+      const tailLens = disclosureTailLens(
+        this.responseChunks.map((c) => c.length),
+        r.length + skip,
+      );
+      const epoch = serverTailEpoch(this.serverPost, tailLens.length);
+      const disclose: Record<string, unknown> = {
+        type: "disclose",
+        r: hex(r),
+        tail_lens: tailLens,
+        skip,
+        trailing: epoch.trailing,
+      };
+      if (epoch.keyUpdates > 0) {
+        disclose.key_updates = epoch.keyUpdates;
+        disclose.epoch_start = epoch.epochStart;
+      }
+      this.sendText(disclose);
+
+      const c3 = await this.waitT("zk_params", this.timeouts.zkParams);
+      // Wire index of sequence 0 of the covered records' epoch: the records
+      // before the post-handshake ones are the encrypted server flight. (Indices
+      // into the retained records: an image session drops the oldest ones.)
+      const handshakeRecords = this.serverRecords.length + this.serverRecordsDropped - this.serverPost.length;
+      checkPiC3SParams(c3.params, {
+        h2: this.ap!.h2,
+        serverRecords: this.serverRecords,
+        r,
+        skip,
+        keyUpdates: epoch.keyUpdates,
+        epochBase:
+          handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart - this.serverRecordsDropped : undefined,
+        trailing: epoch.trailing,
+        tailLens,
+      });
+      await this.proofV2("pi_c3s", "prove", c3.params, { Secret: Array.from(this.ap!.serverAp0) });
+      this.twoPc?.close();
+      this.zkChan?.close();
+      this.event({ ev: "pi_c3s_ok" });
+
+      ({ receipt, receiptJson, sigHex } = await this.waitReceipt(attJson));
+
+      if (upstreamError) {
+        // Errors the provider answers before doing any work (4xx, 503) cost at
+        // most the session fee (the node's 2PC work), any other error at most
+        // the session's reservation.
+        usageMatch = checkUpstreamErrorReceipt(receipt, httpEarly.status, fee);
+      } else {
+        ownUsage = usageEventFromDisclosure(r) ?? undefined;
+        if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
+        const checked = verifyReceipt({
+          receipt,
+          receiptJson,
+          sig: sigHex,
+          pubkey: this.ready.pubkey,
+          ownUsage,
+          priceEntry: this.offer.price_list[this.model],
+          sessionFeeMsat: fee,
+          abandonFeeMsat: offerAbandonFeeMsat(this.offer),
+        });
+        usageMatch = checked.usageMatch;
+        costWithinOffer = checked.costWithinOffer;
+        if (!costWithinOffer) {
+          throw new ReceiptVerificationError(
+            `receipt cost ${receipt.cost_msats} msats exceeds the usage priced at the signed offer's rates`,
+          );
+        }
       }
     }
     if (!usageMatch) throw new ReceiptVerificationError("receipt usage does not match our own plaintext");
+    const receiptSigOk = verifySchnorrSignature(receiptJson, sigHex, this.ready.pubkey);
 
-    const http = parseHttpResponse(this.responseBytes);
-    const effectiveModel = effectiveModelFromText(http.bodyText);
-    if (effectiveModel !== undefined && effectiveModel !== this.model) {
-      throw new ResponseVerificationError(`effective model ${effectiveModel} != ${this.model}`);
+    const http = httpEarly;
+    let effectiveModel: string | undefined;
+    let images: Blob[] | undefined;
+    if (this.kind === "images") {
+      images = flatAccept ? this.decodeImages(http) : [];
+    } else {
+      effectiveModel = effectiveModelFromText(http.bodyText);
+      if (effectiveModel !== undefined && effectiveModel !== this.model) {
+        throw new ResponseVerificationError(`effective model ${effectiveModel} != ${this.model}`);
+      }
     }
 
     this.finished = true;
@@ -1062,7 +1180,7 @@ export class ConfidentialSession {
       model: this.model,
       effectiveModel,
       http,
-      responseText: http.bodyText,
+      responseText: this.kind === "images" ? "" : http.bodyText,
       receipt,
       receiptJson,
       receiptSig: sigHex,
@@ -1077,16 +1195,53 @@ export class ConfidentialSession {
       ttftMs: ttftAbs - tClaim,
       totalMs: tEnd - tClaim,
       timings,
-      proofs: ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
+      proofs: flatAccept ? ["twopc", "pi_nk", "pi_c2s"] : ["twopc", "pi_nk", "pi_c2s", "pi_c3s"],
       prewarmed,
       waitedForArmMs,
       protocol: 2,
       nodePubkey: this.ready.pubkey,
+      images,
+      imageVariant: this.image?.variant.id,
+      imageCount: this.image?.count,
     };
+  }
+
+  /** The signed receipt, bound to this session and its attestation. */
+  private async waitReceipt(attJson: string): Promise<{ receipt: ConfidentialReceipt; receiptJson: string; sigHex?: string }> {
+    const m = (await Promise.race([
+      this.bus.wait("receipt"),
+      this.errP,
+      timeout(this.timeouts.receipt, "receipt"),
+    ])) as { receipt: ConfidentialReceipt; receipt_json?: string; sig?: string };
+    const receiptJson = m.receipt_json ?? JSON.stringify(m.receipt);
+    const receipt = parseSignedReceipt({
+      receiptJson,
+      sig: m.sig,
+      pubkey: this.ready.pubkey,
+      sid: this.sid,
+      // The bytes whose signature and session binding were checked above.
+      attestationJson: attJson,
+    });
+    return { receipt, receiptJson, sigHex: m.sig };
+  }
+
+  /** The images of a 2xx image response, as Blobs of the pinned format. */
+  private decodeImages(http: ParsedHttpResponse): Blob[] {
+    let body: unknown;
+    try {
+      body = JSON.parse(http.bodyText);
+    } catch {
+      throw new ResponseVerificationError("image response body is not JSON");
+    }
+    const type = imageMimeType(this.image!.variant.pins);
+    return responseImages(body, this.imagesOffer!.response_shape).map(
+      (b64) => new Blob([base64ToBytes(b64) as BlobPart], { type }),
+    );
   }
 
   /** Cold path: arm, then claim. */
   async run(body: Uint8Array): Promise<ConfidentialSessionResult> {
+    this.coldRun = true;
     const tClaim = Date.now();
     await this.arm();
     await this.prepareProofs();

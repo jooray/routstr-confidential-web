@@ -10,14 +10,29 @@ export type {
   ChatCompletionCreateParams,
   ConfidentialClientOptions,
   ConfidentialStream,
+  ImageGenerateParams,
+  ImageGenerateResult,
   PrewarmOptions,
 } from "./client.js";
+export { imageRequestCostMsat } from "./client.js";
+export {
+  base64ToBytes,
+  buildImageBody,
+  chooseImageVariant,
+  imageMimeType,
+  imageSuffix,
+  pinnedImageKeys,
+  renderImageSuffix,
+  responseImages,
+  toOpenAiImages,
+} from "./images.js";
 export { ConfidentialSession, DEFAULT_TIMEOUTS } from "./session.js";
 export type {
   CertificateInfo,
   ConfidentialReceipt,
   ConfidentialSessionResult,
   ConfidentialSessionTimings,
+  ImageSessionRequest,
   ProofOutcome,
   ProviderVerification,
   TimingSpan,
@@ -33,8 +48,16 @@ export {
   CONFIDENTIAL_VERSION_MAX,
   CONFIDENTIAL_VERSION_MIN,
 } from "./offer.js";
-export type { ConfidentialOffer, ConfidentialPriceEntry, VerifiedOffer } from "./offer.js";
-export { parseSignedReceipt, verifyReceipt } from "./receipt.js";
+export type {
+  ConfidentialImagesOffer,
+  ConfidentialImageVariant,
+  ConfidentialOffer,
+  ConfidentialPriceEntry,
+  ImagePin,
+  VerifiedOffer,
+} from "./offer.js";
+export { offerImages } from "./offer.js";
+export { parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt.js";
 export { canonicalJson, npubToHex, verifySchnorrSignature } from "./canonical.js";
 export { canonicalSuffix } from "./suffix.js";
 export { buildPinnedBody, padPinnedBody, chooseBucket, requestedMaxTokens, SseParser, aggregateChatCompletion } from "./request.js";
