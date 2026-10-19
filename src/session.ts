@@ -1140,6 +1140,7 @@ export class ConfidentialSession {
     const tEnd = Date.now();
     const ttftAbs = this.ttft || tEnd;
     const lastData = this.tLastData || ttftAbs;
+    const isImage = this.kind === "images";
     const abs = [
       ...(this.tReady ? [{ name: "setup (node checks credential, reserves)", lane: "node" as const, start: this.tStart, end: this.tReady }] : []),
       ...(this.tKeyShare ? [{ name: "2PC preprocessing + key share", lane: "2pc" as const, start: this.tReady, end: this.tKeyShare }] : []),
@@ -1147,9 +1148,11 @@ export class ConfidentialSession {
       ...(this.tHs ? [{ name: "TLS handshake with provider", lane: "tls" as const, start: this.tHsStart, end: this.tHs }] : []),
       ...this.absSpans,
       ...(this.tRecordStart ? [{ name: "credential record (node)", lane: "node" as const, start: this.tRecordStart, end: this.tHeadWritten }] : []),
-      ...(this.tBodyWrite ? [{ name: "provider: time to first byte", lane: "provider" as const, start: this.tBodyWrite, end: ttftAbs }] : []),
-      { name: "response streaming", lane: "provider" as const, start: ttftAbs, end: lastData },
-      { name: "settlement (usage proof, receipt)", lane: "node" as const, start: lastData, end: tEnd },
+      ...(this.tBodyWrite
+        ? [{ name: isImage ? "provider: generating the image" : "provider: time to first byte", lane: "provider" as const, start: this.tBodyWrite, end: ttftAbs }]
+        : []),
+      { name: isImage ? "image download" : "response streaming", lane: "provider" as const, start: ttftAbs, end: lastData },
+      { name: isImage ? "settlement (accept, receipt)" : "settlement (usage proof, receipt)", lane: "node" as const, start: lastData, end: tEnd },
     ];
     const spans: TimingSpan[] = abs
       .filter((x) => x.start > 0 && x.end >= x.start)
