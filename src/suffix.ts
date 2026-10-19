@@ -98,13 +98,19 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
   const body = /chunked/i.test(headers["transfer-encoding"] ?? "")
     ? dechunkAll(rawBody)
     : rawBody;
+  let text: string | undefined;
   return {
     status,
     statusText,
     headers,
     raw: bytes,
     body,
-    bodyText: utf8(body),
+    // Decoded on first use: an image body is megabytes of base64 that the
+    // image path parses once and never needs as a string again.
+    get bodyText() {
+      text ??= utf8(body);
+      return text;
+    },
     contentType: headers["content-type"] ?? "",
   };
 }

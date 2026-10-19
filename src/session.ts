@@ -423,6 +423,8 @@ export class ConfidentialSession {
   private provider?: ProviderVerification;
 
   private responseChunks: Uint8Array[] = [];
+  /** The length of each response record, in order (the disclosure's tail). */
+  private responseRecordLens: number[] = [];
   private serverRecords: Uint8Array[] = [];
   /** Encrypted server records seen after the handshake (π_C3S key epoch). */
   private postHandshake = false;
@@ -520,7 +522,11 @@ export class ConfidentialSession {
 
   /** The response plaintext so far, joined once (not per record). */
   private get responseBytes(): Uint8Array {
-    this.responseJoined ??= concat(...this.responseChunks);
+    if (!this.responseJoined) {
+      this.responseJoined = concat(...this.responseChunks);
+      // Keep one copy: the records are only needed as lengths from here on.
+      this.responseChunks = [this.responseJoined];
+    }
     return this.responseJoined;
   }
 
@@ -678,6 +684,7 @@ export class ConfidentialSession {
         if (!this.ttft) this.ttft = Date.now();
         this.tLastData = Date.now();
         this.responseChunks.push(rec);
+        this.responseRecordLens.push(rec.length);
         this.responseLength += rec.length;
         this.responseJoined = undefined;
         if (this.responseLength - this.progressAt >= 256 * 1024) {
@@ -1020,7 +1027,13 @@ export class ConfidentialSession {
     const upstreamError = httpEarly.status >= 400;
     // A flat-priced (image) success needs no disclosure: the charge is fixed
     // by the pinned request, so we accept and the node charges exactly it.
-    const flatAccept = this.kind === "images" && !upstreamError;
+    // Only a 2xx is a success: anything else below 400 (a redirect) has no
+    // image, so it is neither accepted nor disclosed.
+    const outcome = imageOutcome(httpEarly.status);
+    if (this.kind === "images" && outcome === "invalid") {
+      throw new ResponseVerificationError(`image response HTTP ${httpEarly.status} is neither a success nor an error`);
+    }
+    const flatAccept = this.kind === "images" && outcome === "accept";
     let receipt: ConfidentialReceipt;
     let receiptJson: string;
     let sigHex: string | undefined;
@@ -1037,6 +1050,7 @@ export class ConfidentialSession {
         count: this.image!.count,
         msatPerImage: this.image!.variant.msat_per_image,
         sessionFeeMsat: fee,
+        abandonFeeMsat: offerAbandonFeeMsat(this.offer),
       });
       usageMatch = true;
       this.twoPc?.close();
@@ -1054,7 +1068,7 @@ export class ConfidentialSession {
       }
       if (!r) throw new ResponseVerificationError("could not extract a valid usage disclosure R");
       const tailLens = disclosureTailLens(
-        this.responseChunks.map((c) => c.length),
+        this.responseRecordLens,
         r.length + skip,
       );
       const epoch = serverTailEpoch(this.serverPost, tailLens.length);
@@ -1129,6 +1143,11 @@ export class ConfidentialSession {
     let images: Blob[] | undefined;
     if (this.kind === "images") {
       images = flatAccept ? this.decodeImages(http) : [];
+      if (flatAccept) {
+        // The images are Blobs now; the plaintext copies can go.
+        this.responseChunks = [];
+        this.responseJoined = undefined;
+      }
     } else {
       effectiveModel = effectiveModelFromText(http.bodyText);
       if (effectiveModel !== undefined && effectiveModel !== this.model) {
@@ -1182,7 +1201,7 @@ export class ConfidentialSession {
       uuid: this.uuid,
       model: this.model,
       effectiveModel,
-      http,
+      http: flatAccept ? imageHead(http) : http,
       responseText: this.kind === "images" ? "" : http.bodyText,
       receipt,
       receiptJson,
@@ -1232,7 +1251,8 @@ export class ConfidentialSession {
   private decodeImages(http: ParsedHttpResponse): Blob[] {
     let body: unknown;
     try {
-      body = JSON.parse(http.bodyText);
+      // Parsed from the bytes directly: the text exists only for this parse.
+      body = JSON.parse(new TextDecoder().decode(http.body));
     } catch {
       throw new ResponseVerificationError("image response body is not JSON");
     }
@@ -1283,4 +1303,21 @@ function countKeyUpdates(content: Uint8Array): number {
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!);
   }
   return n;
+}
+
+/** A successful image response without its body: the images are returned as Blobs. */
+function imageHead(http: ParsedHttpResponse): ParsedHttpResponse {
+  const empty = new Uint8Array(0);
+  return { status: http.status, statusText: http.statusText, headers: http.headers, raw: empty, body: empty, bodyText: "", contentType: http.contentType };
+}
+
+/**
+ * What an image session does with the provider's status: accept only a 2xx
+ * (the flat charge), disclose the head of an error (>= 400) for a release,
+ * and neither for anything else (a redirect carries no image).
+ */
+export function imageOutcome(status: number): "accept" | "error" | "invalid" {
+  if (status >= 200 && status < 300) return "accept";
+  if (status >= 400) return "error";
+  return "invalid";
 }

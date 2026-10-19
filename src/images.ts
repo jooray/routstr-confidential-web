@@ -88,6 +88,108 @@ export function chooseImageVariant(
   return match;
 }
 
+/** Keys that choose the variant and the count; never sent as private options. */
+export const IMAGE_SELECTOR_KEYS = [
+  "model",
+  "n",
+  "variants",
+  "count",
+  "resolution",
+  "quality",
+  "format",
+  "size",
+  "response_format",
+  "output_format",
+] as const;
+
+/** An image request the client refuses before any session is opened. */
+export class ImageRequestError extends SessionProtocolError {}
+
+/** An OpenAI `size` ("WxH") as the node's resolution class, by area. */
+export function resolutionFromSize(size: string): string {
+  const m = /^(\d+)x(\d+)$/.exec(size);
+  if (!m) throw new ImageRequestError(`size ${JSON.stringify(size)} is not WIDTHxHEIGHT`);
+  const area = Number(m[1]) * Number(m[2]);
+  return area < 2 * 1024 * 1024 ? "1K" : area < 2 * 2048 * 2048 ? "2K" : "4K";
+}
+
+export interface PlannedImageRequest {
+  model: string;
+  variant: ConfidentialImageVariant;
+  count: number;
+  /** The private options (the prompt among them), never the selectors. */
+  privateOptions: Record<string, unknown>;
+}
+
+const pinOf = (v: ConfidentialImageVariant, key: string): unknown => v.pins.find(([k]) => k === key)?.[1];
+
+/**
+ * Split a request (OpenAI or provider shaped) into the signed variant, the
+ * count and the private options. The rules match the SDK's request planner:
+ * every key that chooses the price is a selector and never private; a
+ * selector the model's variants cannot satisfy is refused, never dropped
+ * silently; among matching variants the cheapest wins; a tiered model refuses
+ * private `width`/`height`, which could pick a dearer size than the pinned tier.
+ */
+export function planImageRequest(
+  images: ConfidentialImagesOffer,
+  body: Record<string, unknown>,
+  variantId?: string,
+): PlannedImageRequest {
+  const model = body.model;
+  if (typeof model !== "string" || !model) throw new ImageRequestError("an image request needs a model");
+  const variants = images.price_list[model];
+  if (!variants || variants.length === 0) {
+    throw new ImageRequestError(`the node does not serve ${model} for confidential images`);
+  }
+  const rawCount = body[images.count_key] ?? body.n ?? body.variants ?? body.count ?? 1;
+  if (typeof rawCount !== "number" || !Number.isSafeInteger(rawCount) || rawCount < 1 || rawCount > images.max_count) {
+    throw new ImageRequestError(`count must be 1..${images.max_count}`);
+  }
+  for (const key of ["format", "output_format"]) {
+    const f = body[key];
+    if (f !== undefined && f !== "webp") throw new ImageRequestError(`only webp images are offered (${key}=${JSON.stringify(f)})`);
+  }
+  const hasAxis = (key: string) => variants.some((v) => pinOf(v, key) !== undefined);
+  let candidates = variants;
+  if (variantId !== undefined) {
+    const v = variants.find((x) => x.id === variantId);
+    if (!v) throw new ImageRequestError(`${model} has no image variant ${JSON.stringify(variantId)}`);
+    candidates = [v];
+  }
+  let resolution: unknown = typeof body.resolution === "string" ? body.resolution.toUpperCase() : body.resolution;
+  if (resolution === undefined && body.size !== undefined && body.size !== "auto") {
+    if (typeof body.size !== "string") throw new ImageRequestError("size must be a string");
+    const r = resolutionFromSize(body.size);
+    // Without a resolution axis a size only carries aspect intent: ignored.
+    if (hasAxis("resolution")) resolution = r;
+  }
+  const want: [string, unknown][] = [];
+  if (resolution !== undefined) {
+    if (!hasAxis("resolution")) throw new ImageRequestError(`${model} has no resolution tiers`);
+    want.push(["resolution", resolution]);
+  }
+  if (body.quality !== undefined) {
+    if (!hasAxis("quality")) throw new ImageRequestError(`${model} has no quality tiers`);
+    want.push(["quality", body.quality]);
+  }
+  if (hasAxis("format")) want.push(["format", "webp"]);
+  const matching = candidates.filter((v) => want.every(([k, val]) => JSON.stringify(pinOf(v, k)) === JSON.stringify(val)));
+  if (matching.length === 0) {
+    throw new ImageRequestError(`${model} has no image variant with ${want.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")}`);
+  }
+  const variant = matching.reduce((a, b) => (b.msat_per_image < a.msat_per_image ? b : a));
+  if (hasAxis("resolution") && (body.width !== undefined || body.height !== undefined)) {
+    throw new ImageRequestError(`${model} is priced by resolution tier: width/height cannot be private options`);
+  }
+  const selectors = new Set<string>([...IMAGE_SELECTOR_KEYS, images.count_key]);
+  const privateOptions: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (!selectors.has(k) && v !== undefined) privateOptions[k] = v;
+  }
+  return { model, variant, count: rawCount, privateOptions };
+}
+
 /**
  * The request body: the private options as a JSON object without its closing
  * brace, then the suffix. The private part must not carry the model, the count
@@ -107,11 +209,36 @@ export function buildImageBody(privateOptions: Record<string, unknown>, suffix: 
 
 /** Base64 (standard alphabet, padded or not) to bytes. */
 export function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64.replace(/\s+/g, ""));
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+  // Decoded straight into bytes: atob would hold a second, binary-string copy
+  // of a multi-megabyte image.
+  const out = new Uint8Array(Math.floor((b64.length * 3) / 4) + 3);
+  let n = 0;
+  let acc = 0;
+  let bits = 0;
+  for (let i = 0; i < b64.length; i++) {
+    const c = b64.charCodeAt(i);
+    const v = c < 128 ? B64[c]! : -1;
+    if (v === -2) continue; // whitespace
+    if (v === -3) break; // padding
+    if (v < 0) throw new SessionProtocolError("image response is not valid base64");
+    acc = ((acc << 6) | v) & 0x3fff;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[n++] = (acc >> bits) & 0xff;
+    }
+  }
+  return out.subarray(0, n);
 }
+
+const B64 = (() => {
+  const t = new Int8Array(128).fill(-1);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let i = 0; i < alphabet.length; i++) t[alphabet.charCodeAt(i)] = i;
+  for (const ws of [9, 10, 13, 32]) t[ws] = -2;
+  t[61] = -3; // "="
+  return t;
+})();
 
 /** The base64 images of a provider response, in either shape. */
 export function responseImages(body: unknown, shape: ConfidentialImagesOffer["response_shape"]): string[] {

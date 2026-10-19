@@ -19,6 +19,10 @@ export {
   base64ToBytes,
   buildImageBody,
   chooseImageVariant,
+  IMAGE_SELECTOR_KEYS,
+  ImageRequestError,
+  planImageRequest,
+  resolutionFromSize,
   imageMimeType,
   imageSuffix,
   pinnedImageKeys,
@@ -26,6 +30,7 @@ export {
   responseImages,
   toOpenAiImages,
 } from "./images.js";
+export type { PlannedImageRequest } from "./images.js";
 export { ConfidentialSession, DEFAULT_TIMEOUTS } from "./session.js";
 export type {
   CertificateInfo,

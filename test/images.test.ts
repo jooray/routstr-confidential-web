@@ -12,6 +12,9 @@ import {
 } from "../src/images.js";
 import { validateOfferShape, offerImages, type ConfidentialImagesOffer, type VerifiedOffer } from "../src/offer.js";
 import { verifyFlatReceipt } from "../src/receipt.js";
+import { base64ToBytes, planImageRequest } from "../src/images.js";
+import { imageOutcome } from "../src/session.js";
+import requestVectors from "./fixtures/image-request-vectors.json";
 import { ConfidentialSession } from "../src/session.js";
 import prod from "./fixtures/cypherpunk-offer.json";
 
@@ -207,12 +210,16 @@ describe("client.images.generate", () => {
   it("runs one cold image session and never touches the pre-warm pool", async () => {
     const c = client();
     const pw = c.prewarmer!;
-    const spies = [vi.spyOn(pw, "setTarget"), vi.spyOn(pw, "take"), vi.spyOn(pw, "activity"), vi.spyOn(pw, "beginPreparing")];
+    const spies = [vi.spyOn(pw, "setTarget"), vi.spyOn(pw, "take"), vi.spyOn(pw, "activity")];
+    const begin = vi.spyOn(pw, "beginPreparing");
+    const end = vi.spyOn(pw, "endPreparing");
+    let preparingDuringRun = -1;
     let seen: ConfidentialSession | undefined;
     let body = "";
     vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: ConfidentialSession, b: Uint8Array) {
       seen = this;
       body = new TextDecoder().decode(b);
+      preparingDuringRun = (pw as unknown as { preparing: number }).preparing;
       return {
         http: { status: 200, statusText: "OK" },
         images: [new Blob([new Uint8Array([1, 2])], { type: "image/webp" })],
@@ -225,6 +232,11 @@ describe("client.images.generate", () => {
     expect(out).toMatchObject({ variant: "1K-webp", count: 2, msatPerImage: 218000, costMsats: 436000 });
     expect(out.images).toHaveLength(1);
     for (const s of spies) expect(s).not.toHaveBeenCalled();
+    // The chat pool is held back while the image's own 2PC runs, and the
+    // image does not count as chat activity when it ends.
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(preparingDuringRun).toBe(1);
+    expect(end).toHaveBeenCalledWith(false);
     pw.stop();
   });
 
@@ -240,5 +252,46 @@ describe("client.images.generate", () => {
     } as never);
     await expect(c.images.generate({ model: "z-image-turbo", prompt: "x" })).rejects.toMatchObject({ code: "upstream_error", status: 400 });
     c.prewarmer!.stop();
+  });
+});
+
+describe("image request planning (shared vectors with the SDK)", () => {
+  const images = requestVectors.images as never as Parameters<typeof planImageRequest>[0];
+  for (const v of requestVectors.vectors) {
+    it(v.name, () => {
+      const run = () => {
+        const p = planImageRequest(images, { ...(v.body as Record<string, unknown>) });
+        // The body builder refuses pinned keys among the private options.
+        buildImageBody(p.privateOptions, imageSuffix(images, p.model, p.variant, p.count), pinnedImageKeys(images, p.variant));
+        return { variant: p.variant.id, count: p.count, private: Object.keys(p.privateOptions).sort() };
+      };
+      if ("error" in v.expect) expect(run).toThrow();
+      else expect(run()).toEqual(v.expect);
+    });
+  }
+});
+
+describe("image response handling", () => {
+  it("accepts only a 2xx; discloses an error; neither for anything else", () => {
+    expect(imageOutcome(200)).toBe("accept");
+    expect(imageOutcome(204)).toBe("accept");
+    expect(imageOutcome(302)).toBe("invalid");
+    expect(imageOutcome(0)).toBe("invalid");
+    expect(imageOutcome(100)).toBe("invalid");
+    expect(imageOutcome(400)).toBe("error");
+    expect(imageOutcome(503)).toBe("error");
+  });
+
+  it("decodes base64 straight to bytes, padded or not, with whitespace", () => {
+    const bytes = new Uint8Array(1000).map((_, i) => (i * 37) % 256);
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    const b64 = btoa(bin);
+    expect(Array.from(base64ToBytes(b64))).toEqual(Array.from(bytes));
+    expect(Array.from(base64ToBytes(b64.replace(/=+$/, "")))).toEqual(Array.from(bytes));
+    expect(Array.from(base64ToBytes(b64.slice(0, 40) + "\n" + b64.slice(40)))).toEqual(Array.from(bytes));
+    expect(Array.from(base64ToBytes("TWFu"))).toEqual([77, 97, 110]);
+    expect(Array.from(base64ToBytes("TWE="))).toEqual([77, 97]);
+    expect(() => base64ToBytes("TW*u")).toThrow();
   });
 });

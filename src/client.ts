@@ -32,7 +32,7 @@ import {
   type ConfidentialImageVariant,
   type VerifiedOffer,
 } from "./offer.js";
-import { buildImageBody, chooseImageVariant, imageSuffix, pinnedImageKeys } from "./images.js";
+import { buildImageBody, imageSuffix, pinnedImageKeys, planImageRequest } from "./images.js";
 import { NodeApi, type NodeModel } from "./node-api.js";
 import { modelPricing, type ModelPricing } from "./pricing.js";
 import { aggregateChatCompletion, buildPinnedBody, chooseBucket, padPinnedBody, requestedMaxTokens, SseParser } from "./request.js";
@@ -153,7 +153,6 @@ export function imageRequestCostMsat(offer: VerifiedOffer, variant: Confidential
   return Math.ceil(variant.msat_per_image * count + offerSessionFeeMsat(offer));
 }
 
-const VARIANT_PARAMS = ["resolution", "quality", "format"] as const;
 
 type Head = { status: number; statusText: string; headers: Record<string, string> };
 
@@ -270,10 +269,15 @@ export class Prewarmer {
     this.preparing++;
   }
 
-  /** That preparation is done (or failed): arm the next session right away. */
-  endPreparing(): void {
+  /**
+   * That preparation is done (or failed): arm the next session right away.
+   * An image request passes `activity: false`: it held the pool back while it
+   * ran, but it is not chat activity and must not start a chat arm itself.
+   */
+  endPreparing(activity = true): void {
     this.preparing = Math.max(0, this.preparing - 1);
-    this.activity();
+    if (activity) this.activity();
+    else void this.ensure();
   }
 
   private visible(): boolean {
@@ -546,24 +550,14 @@ export class ConfidentialClient {
     const offer = await this.offer(freshOffer);
     const images = offerImages(offer);
     if (!images) throw new ConfidentialError("offer_no_images", "the node offers no confidential image generation");
-    const { model, prompt, count: rawCount, variant: variantId, aspectRatio, ...rest } = params;
-    const count = rawCount ?? 1;
-    if (!Number.isSafeInteger(count) || count < 1 || count > images.max_count) {
-      throw new ConfidentialError("session_protocol", `count must be 1..${images.max_count}`);
+    const { variant: variantId, aspectRatio, ...request } = params;
+    if (!images.price_list[params.model]) {
+      throw new ConfidentialError("offer_no_images", `the node does not serve ${params.model} for confidential images`);
     }
-    if (!images.price_list[model]) {
-      throw new ConfidentialError("offer_no_images", `the node does not serve ${model} for confidential images`);
-    }
-    const wanted: Record<string, unknown> = {};
-    const priv: Record<string, unknown> = { prompt };
-    for (const [k, v] of Object.entries(rest)) {
-      if ((VARIANT_PARAMS as readonly string[]).includes(k)) wanted[k] = v;
-      else if (v !== undefined) priv[k] = v;
-    }
-    if (aspectRatio !== undefined) priv.aspect_ratio = aspectRatio;
-    const variant = chooseImageVariant(images, model, { variant: variantId, params: wanted });
+    if (aspectRatio !== undefined) request.aspect_ratio = aspectRatio;
+    const { model, variant, count, privateOptions } = planImageRequest(images, request, variantId);
     const suffix = imageSuffix(images, model, variant, count);
-    const body = buildImageBody(priv, suffix, pinnedImageKeys(images, variant));
+    const body = buildImageBody(privateOptions, suffix, pinnedImageKeys(images, variant));
     // No pre-warm: an image session is set up for this request only, and it
     // must not arm (or claim) the chat pool.
     const session = new ConfidentialSession({
@@ -582,6 +576,10 @@ export class ConfidentialClient {
     });
     const abort = () => session.close();
     signal?.addEventListener("abort", abort, { once: true });
+    // Hold the chat pre-warmer back while the image's own 2PC runs: two
+    // ~22 MB preparations at once would slow this one and cost the data twice.
+    const pw = this.prewarmer;
+    pw?.beginPreparing();
     let result: ConfidentialSessionResult;
     try {
       this.emit({ ev: "request", path: "cold", kind: "images", model, variant: variant.id, count });
@@ -595,6 +593,7 @@ export class ConfidentialClient {
       throw e;
     } finally {
       signal?.removeEventListener("abort", abort);
+      pw?.endPreparing(false);
     }
     if (result.http.status >= 400) {
       throw new UpstreamImageError(

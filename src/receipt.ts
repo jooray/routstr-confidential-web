@@ -197,37 +197,43 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
  */
 export function verifyFlatReceipt(
   receipt: ConfidentialReceipt,
-  own: { model: string; variant: string; count: number; msatPerImage: number; sessionFeeMsat?: number },
+  own: {
+    model: string;
+    variant: string;
+    count: number;
+    /** From the signed offer we verified. */
+    msatPerImage: number;
+    sessionFeeMsat?: number;
+    abandonFeeMsat?: number;
+  },
 ): void {
   const fee = Math.max(0, own.sessionFeeMsat ?? 0);
-  if (receipt.model !== own.model) {
-    throw new ReceiptVerificationError(`receipt is for model ${receipt.model}, not ${own.model}`);
-  }
-  if (receipt.kind !== undefined && receipt.kind !== "images") {
-    throw new ReceiptVerificationError(`receipt is for a ${String(receipt.kind)} session, not images`);
-  }
-  if (receipt.variant !== undefined && receipt.variant !== own.variant) {
-    throw new ReceiptVerificationError(`receipt names variant ${String(receipt.variant)}, not ${own.variant}`);
-  }
-  if (receipt.count !== undefined && receipt.count !== own.count) {
-    throw new ReceiptVerificationError(`receipt names ${String(receipt.count)} images, not ${own.count}`);
-  }
-  if (receipt.msat_per_image !== undefined && receipt.msat_per_image !== own.msatPerImage) {
-    throw new ReceiptVerificationError(
-      `receipt prices an image at ${String(receipt.msat_per_image)} msats, the signed offer at ${own.msatPerImage}`,
-    );
+  const fail = (what: string): never => {
+    throw new ReceiptVerificationError(`flat receipt: ${what}`);
+  };
+  // Every image field is required: a receipt without them would not show
+  // what was billed, even when its cost happens to match.
+  if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+  if ((receipt.usage as unknown as { flat?: unknown } | undefined)?.flat !== true) fail("usage is not flat");
+  if (receipt.model !== own.model) fail(`model ${String(receipt.model)} is not ${own.model}`);
+  if (receipt.variant !== own.variant) fail(`variant ${String(receipt.variant)} is not ${own.variant}`);
+  if (receipt.count !== own.count) fail(`count ${String(receipt.count)} is not ${own.count}`);
+  if (receipt.msat_per_image !== own.msatPerImage) {
+    fail(`price ${String(receipt.msat_per_image)} msats per image is not the signed ${own.msatPerImage}`);
   }
   if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
-    throw new ReceiptVerificationError(
-      `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
-    );
+    fail(`session fee ${receipt.session_fee_msat} msats exceeds the signed ${fee}`);
   }
-  // The node charges the flat price rounded up to a whole msat.
+  if (
+    typeof receipt.abandon_fee_msat === "number" &&
+    receipt.abandon_fee_msat > Math.max(fee, own.abandonFeeMsat ?? 0)
+  ) {
+    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
+  }
+  // The node charges the price × count plus the fee, rounded up to whole msats.
   const want = Math.ceil(own.msatPerImage * own.count + fee);
   if (!isMsatAmount(receipt.cost_msats) || receipt.cost_msats !== want) {
-    throw new ReceiptVerificationError(
-      `receipt cost ${String(receipt.cost_msats)} msats != ${own.msatPerImage} × ${own.count} + ${fee} = ${want}`,
-    );
+    fail(`cost ${String(receipt.cost_msats)} msats is not ${want} (price × count + session fee)`);
   }
 }
 
