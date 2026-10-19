@@ -110,6 +110,10 @@ describe("offer verification", () => {
     for (const bad of [-1, 1.5, "10"]) {
       expect(() => validateOfferShape({ ...shape, session_fee_msat: bad })).toThrow(OfferMalformedError);
     }
+    // suffix_keys must be exactly the keys the canonical suffix pins.
+    for (const keys of [[], ["model", "max_tokens", "stream"], ["venice_parameters", "stream_options", "stream", "n", "max_completion_tokens", "max_tokens", "model"]]) {
+      expect(() => validateOfferShape({ ...shape, suffix_keys: keys })).toThrow(/suffix_keys/);
+    }
     // Unknown extra fields are tolerated.
     const extra = signedOffer({ some_future_field: { x: 1 } });
     expect(() =>

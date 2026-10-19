@@ -113,12 +113,64 @@ async fn suffix_mismatch_gives_zero_bit() {
     let (params, witness) = fixtures::pi_c2s();
     let Params::PiC2S(mut p) = params else { unreachable!() };
     let n = p.expected.len();
-    p.expected = vec![b'z'; n];
+    p.expected = vec![b'z'; n - 1];
+    p.expected.push(0x17);
     let res = run_pair_ideal(&Params::PiC2S(p), &witness).await.unwrap();
     assert!(check(&res, "h1").ok);
     let last = res.last().unwrap();
     assert!(!last.ok);
     assert_eq!(last.got, "00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c2s_record_must_be_application_data() {
+    // The suffix inside a record whose inner content type is handshake (0x16)
+    // or padding (0): the compared range ends with that byte, so no equality.
+    let (params, witness) = fixtures::pi_c2s();
+    let Params::PiC2S(p) = params else { unreachable!() };
+    for flip in [0x17 ^ 0x16, 0x17] {
+        let mut wrong = p.clone();
+        *wrong.ct_window.last_mut().unwrap() ^= flip;
+        let res = run_pair_ideal(&Params::PiC2S(wrong), &witness).await.unwrap();
+        assert_eq!(res.last().unwrap().got, "00", "inner type {:#04x} must not verify", 0x17 ^ flip);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c2s_geometry_is_bound_to_the_record() {
+    // A wrong sequence number or window offset gives a different keystream.
+    let (params, witness) = fixtures::pi_c2s_after(64);
+    let Params::PiC2S(p) = params else { unreachable!() };
+    let mutations: Vec<(&str, Box<dyn Fn(&mut zkbench::statements::PiC2S)>)> = vec![
+        ("seq + 1", Box::new(|q| q.seq += 1)),
+        ("seq - 1", Box::new(|q| q.seq -= 1)),
+        ("off + 1", Box::new(|q| q.off += 1)),
+        ("off - 1", Box::new(|q| q.off -= 1)),
+    ];
+    for (name, m) in mutations {
+        let mut q = p.clone();
+        m(&mut q);
+        let res = run_pair_ideal(&Params::PiC2S(q), &witness).await.unwrap();
+        assert_eq!(res.last().unwrap().got, "00", "{name} must not verify");
+    }
+    // A compared range that does not end the window, or does not end with
+    // the content type, is refused before any proof runs.
+    for m in [
+        (|q: &mut zkbench::statements::PiC2S| q.sel_start -= 1) as fn(&mut _),
+        |q| {
+            q.w += 1;
+            q.ct_window.push(0);
+        },
+        |q| {
+            q.expected.pop();
+            q.sel_len -= 1;
+            q.sel_start += 1;
+        },
+    ] {
+        let mut q = p.clone();
+        m(&mut q);
+        assert!(run_pair_ideal(&Params::PiC2S(q), &witness).await.is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -168,9 +220,12 @@ async fn c3s_usage_mismatch_and_error_head_skip() {
     p.skip = r.len() - 40;
     let res = run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await;
     assert!(passed(&res), "{res:?}");
-    p.skip += 1;
-    let res = run_pair_ideal(&Params::PiC3S(p), &witness).await.unwrap();
-    assert!(!res.last().unwrap().ok);
+    for skip in [p.skip + 1, p.skip - 1] {
+        let mut q = p.clone();
+        q.skip = skip;
+        let res = run_pair_ideal(&Params::PiC3S(q), &witness).await.unwrap();
+        assert!(!res.last().unwrap().ok, "skip {skip} must not verify");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -450,4 +505,73 @@ fn cu_prover_job_refuses_params_for_another_proof() {
         assert!(out.is_empty(), "{role}: wrote protocol bytes");
         assert!(err.contains("its params are for pi_c3s"), "{role}: {err}");
     }
+}
+
+// --- image requests (docs/CONFIDENTIAL-IMAGES.md) ---------------------------
+// The same statements with an images head and suffix: no circuit change.
+
+/// The shared test vector (model z-image-turbo, 2 variants, WebP).
+const IMAGES_SUFFIX: &[u8] = br#","model":"z-image-turbo","variants":2,"return_binary":false,"enhance_prompt":false,"enable_web_search":false,"style_references":[],"format":"webp"}"#;
+
+/// π_C2S parameters shaped as the sidecar builds them: the window ends at the
+/// record end and the compared range runs through the inner content type.
+fn images_c2s(suffix_in_record: &[u8], expected_suffix: &[u8]) -> (Params, Witness) {
+    use cu_crypto::aesgcm;
+    let v = fixtures::v2_secrets();
+    let secret = cu_crypto::keyschedule::Secret::new(v.c_ap_1);
+    let mut inner = br#"{"prompt":"a red apple","aspect_ratio":"16:9","safe_mode":true"#.to_vec();
+    inner.extend_from_slice(suffix_in_record);
+    inner.push(0x17);
+    let seq = 0;
+    let ks = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), seq, inner.len());
+    let ct: Vec<u8> = inner.iter().zip(&ks).map(|(a, b)| a ^ b).collect();
+    let w = (expected_suffix.len() + 1 + 13).min(inner.len());
+    let off = inner.len() - w;
+    let sel_start = w - 1 - expected_suffix.len();
+    let mut expected = expected_suffix.to_vec();
+    expected.push(0x17);
+    (
+        Params::PiC2S(zkbench::statements::PiC2S {
+            h1: v.h1(),
+            seq,
+            ct_window: ct[off..off + w].to_vec(),
+            off,
+            w,
+            sel_start,
+            sel_len: expected.len(),
+            expected,
+        }),
+        Witness::Secret(v.c_ap_1),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images_suffix_proves_and_a_swapped_count_does_not() {
+    let (params, witness) = images_c2s(IMAGES_SUFFIX, IMAGES_SUFFIX);
+    let res = run_pair_ideal(&params, &witness).await;
+    assert!(passed(&res), "{res:?}");
+    // The client sent 4 variants while the node pinned 2: one bit, zero.
+    let sent = String::from_utf8(IMAGES_SUFFIX.to_vec()).unwrap().replace(r#""variants":2"#, r#""variants":4"#);
+    let (params, witness) = images_c2s(sent.as_bytes(), IMAGES_SUFFIX);
+    let res = run_pair_ideal(&params, &witness).await.unwrap();
+    assert_eq!(res.last().unwrap().got, "00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images_head_template_proves_under_pi_nk() {
+    let v = fixtures::v2_secrets();
+    let mut parts = fixtures::pi_nk_parts();
+    let chat = b"POST /api/v1/chat/completions ".as_slice();
+    let images = b"POST /api/v1/image/generate ".as_slice();
+    assert!(parts.template.starts_with(chat));
+    let shift = images.len() as isize - chat.len() as isize;
+    let mut t = images.to_vec();
+    t.extend_from_slice(&parts.template[chat.len()..]);
+    parts.template = t;
+    parts.key_offsets = parts.key_offsets.iter().map(|o| (*o as isize + shift) as usize).collect();
+    let c1 = fixtures::pi_nk_ciphertext(&v, &parts.template, &parts.key_offsets, &parts.key);
+    let params = Params::PiNK(fixtures::pi_nk_params(&v, &parts, &c1));
+    let witness = Witness::NodeKey { k0: v.k0, iv0: v.iv0, key: parts.key.clone() };
+    let res = run_pair_ideal(&params, &witness).await;
+    assert!(passed(&res), "{res:?}");
 }

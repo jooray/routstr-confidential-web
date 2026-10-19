@@ -498,8 +498,9 @@ export class ConfidentialSession {
         throw new SessionProtocolError(`image count ${options.image.count} is outside 1..${maxCount}`);
       }
       this.imagesOffer = images;
-      this.image = options.image;
-      this.suffix = imageSuffix(images, options.model, options.image.variant, options.image.count);
+      // Pins, price and caps from the signed variant, never the caller's copy.
+      this.image = { ...options.image, variant: signed };
+      this.suffix = imageSuffix(images, options.model, signed, options.image.count);
     } else {
       this.suffix = options.suffix ?? canonicalSuffix(options.model, options.maxTokens);
     }
@@ -811,7 +812,8 @@ export class ConfidentialSession {
     if (this.ready.v !== 2) {
       throw new SessionProtocolError(`node started a v${this.ready.v ?? 1} session for a v2 offer`);
     }
-    if (this.ready.pubkey !== undefined && this.ready.pubkey !== this.offer.notary_pubkey) {
+    // A missing key is refused here too, before the 2PC and any provider traffic.
+    if (this.ready.pubkey !== this.offer.notary_pubkey) {
       throw new SessionProtocolError("the session key differs from the signed offer's key");
     }
 

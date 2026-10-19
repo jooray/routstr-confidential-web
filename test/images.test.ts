@@ -214,6 +214,10 @@ describe("image sessions", () => {
     ).toThrow(/no variant/);
     const s = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant, count: 2 } });
     expect(s.suffix).toBe(imageSuffix(IMAGES, "z-image-turbo", variant, 2));
+    // A caller's doctored copy of the variant does not reach the suffix.
+    const doctored = { ...variant, pins: [["resolution", "4K"]] as [string, string][], msat_per_image: 1 };
+    const d = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant: doctored, count: 2 } });
+    expect(d.suffix).toBe(imageSuffix(IMAGES, "z-image-turbo", variant, 2));
     // A variant's own count cap is below the block's.
     const capped = { ...variant, max_count: 1 };
     const cappedOffer = offerWithImages({ images: { ...IMAGES, price_list: { ...IMAGES.price_list, "z-image-turbo": [capped] } } });

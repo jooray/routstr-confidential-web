@@ -70,6 +70,12 @@ describe("head template", () => {
       ["/api/v1/chat/completions", STD, "images"],
       ["/api/v1/chat/completions?store=true", STD, "chat"],
       ["/api/v1/chat/completions#x", STD, "chat"],
+      // Not canonical: a provider may normalise these onto another route.
+      ["/api/v1/chat/completions/../../image/generate", STD, "images"],
+      ["/api/v1/./chat/completions", STD, "chat"],
+      ["/api//v1/chat/completions", STD, "chat"],
+      ["/api/v1/%63hat/completions", STD, "chat"],
+      ["/api/v1;x/chat/completions", STD, "chat"],
       ["/api/v1/chat/completions", [...STD, "Expect: 100-continue"], "chat"],
       ["/api/v1/chat/completions", [...STD, "X-Store: 1"], "chat"],
       ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Accept-Encoding") ? "Accept-Encoding: gzip" : h)), "chat"],

@@ -87,6 +87,11 @@ describe("receipt verification", () => {
     expect(() =>
       checkUpstreamErrorReceipt(err(500, { cost_msats: 10, reserved_msats: 9000, session_fee_msat: 5 }), 500, 0),
     ).toThrow(/session fee/);
+    // The abandon fee it names is bounded by the signed one, as in the SDK.
+    expect(() =>
+      checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2001 }), 400, 100, 2000),
+    ).toThrow(/abandon fee/);
+    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2000 }), 400, 100, 2000)).toBe(true);
     // The status must be the one we saw, as a number.
     expect(checkUpstreamErrorReceipt(err("500", { cost_msats: 0 }), 500, 0)).toBe(false);
     expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 0 }), 500, 0)).toBe(false);

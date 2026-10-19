@@ -148,6 +148,11 @@ export function checkUpstreamErrorReceipt(
       `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
     );
   }
+  if (typeof receipt.abandon_fee_msat === "number" && receipt.abandon_fee_msat > abandon) {
+    throw new ReceiptVerificationError(
+      `receipt names an abandon fee of ${receipt.abandon_fee_msat} msats, more than the signed one`,
+    );
+  }
   const cost = receipt.cost_msats;
   if (!isMsatAmount(cost)) {
     throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
