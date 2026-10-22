@@ -138,7 +138,8 @@ describe("offer verification", () => {
 
 describe("trusted API routes", () => {
   const tpl = (path: string) =>
-    `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\nContent-Length: {LEN}\r\n\r\n`;
+    `POST ${path} HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\n` +
+    `Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n`;
   const verify = (path: string, trustedHosts: string[], extra: Record<string, unknown> = {}) => {
     const { offer, pubHex } = signedOffer({ head_template: tpl(path), ...extra });
     return () => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts });
@@ -150,6 +151,33 @@ describe("trusted API routes", () => {
     expect(verify("/api/v1/chat/completions", ["api.venice.ai/api/v1"])).not.toThrow();
     expect(verify("/proxy/other-tenant/chat/completions", HOSTS)).toThrow(TrustedHostError);
     expect(verify("/v1/chat/completions", ["api.venice.ai/api/v1"])).toThrow(/not one the trusted host allows/);
+  });
+
+  it("refuses a chat head template outside the head syntax before any setup", () => {
+    const head = (headers: string) => `POST /api/v1/chat/completions HTTP/1.1\r\n${headers}\r\n\r\n`;
+    const std = [
+      "Host: api.venice.ai",
+      "Authorization: Bearer {KEY:63}",
+      "Content-Type: application/json",
+      "Accept-Encoding: identity",
+      "Connection: close",
+      "Content-Length: {LEN}",
+    ];
+    const check = (headers: string[]) => {
+      const { offer, pubHex } = signedOffer({ head_template: head(headers.join("\r\n")) });
+      return () => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS });
+    };
+    expect(check(std)).not.toThrow();
+    for (const bad of [
+      std.filter((h) => !h.startsWith("Content-Type")),
+      [...std, "X-Store: 1"],
+      std.map((h) => (h.startsWith("Connection") ? "Connection : close" : h)),
+      std.map((h) => (h.startsWith("Connection") ? "Connection: close\nX-Store: 1" : h)),
+      std.map((h) => (h.startsWith("Authorization") ? "Authorization: Token {KEY:63}" : h)),
+      std.map((h) => (h.startsWith("Host") ? "Host: api.other.example" : h)),
+    ]) {
+      expect(check(bad)).toThrow(OfferMalformedError);
+    }
   });
 
   it("turns images off when only their route is not trusted", () => {

@@ -283,23 +283,42 @@ export const DEFAULT_TIMEOUTS = {
  */
 const RETAINED_SERVER_RECORDS = 64 + 17;
 
+/** Frames of one type the node may send ahead of the wait for them. */
+const BUS_MAX_PENDING_PER_TYPE = 16;
+/** Frames of all types queued at once. */
+const BUS_MAX_PENDING = 256;
+/** A session id as the sidecar makes it (a SHA-256, hex). */
+const SID_RE = /^[0-9a-f]{64}$/;
+
 class Bus {
   private pending = new Map<string, unknown[]>();
   private waiters = new Map<string, ((m: unknown) => void)[]>();
+  private queued = 0;
+
+  /** `onOverflow` fails the session: the node sent more frames than it may. */
+  constructor(private readonly onOverflow: (type: string) => void) {}
 
   emit(msg: { type: string }): void {
     const w = this.waiters.get(msg.type);
     if (w && w.length) w.shift()!(msg);
     else {
       const p = this.pending.get(msg.type) ?? [];
+      if (p.length >= BUS_MAX_PENDING_PER_TYPE || this.queued >= BUS_MAX_PENDING) {
+        this.onOverflow(msg.type);
+        return;
+      }
       p.push(msg);
+      this.queued += 1;
       this.pending.set(msg.type, p);
     }
   }
 
   wait(type: string): Promise<unknown> {
     const p = this.pending.get(type);
-    if (p && p.length) return Promise.resolve(p.shift());
+    if (p && p.length) {
+      this.queued -= 1;
+      return Promise.resolve(p.shift());
+    }
     return new Promise((res) => {
       const w = this.waiters.get(type) ?? [];
       w.push(res);
@@ -370,15 +389,20 @@ function indexOfCrlfCrlf(b: Uint8Array): number {
  * the arm was running waited `waitedForArmMs` for it.
  */
 /**
- * The node's `ready` frame: a v2 session under the signed offer's key. A
- * missing key is refused too, here, before the 2PC and any provider traffic.
+ * The node's `ready` frame: a v2 session under the signed offer's key, with a
+ * session id in the sidecar's format (it goes into URLs and is bound into the
+ * attestation and the receipt). A missing key is refused too, here, before
+ * the 2PC and any provider traffic.
  */
-export function checkReady(ready: { v?: unknown; pubkey?: unknown }, offer: { notary_pubkey: string }): void {
+export function checkReady(ready: { v?: unknown; pubkey?: unknown; sid?: unknown }, offer: { notary_pubkey: string }): void {
   if (ready.v !== 2) {
     throw new SessionProtocolError(`node started a v${String(ready.v ?? 1)} session for a v2 offer`);
   }
   if (ready.pubkey !== offer.notary_pubkey) {
     throw new SessionProtocolError("the session key differs from the signed offer's key");
+  }
+  if (typeof ready.sid !== "string" || !SID_RE.test(ready.sid)) {
+    throw new SessionProtocolError("node announced a malformed session id");
   }
 }
 
@@ -433,7 +457,9 @@ export class ConfidentialSession {
   private wsReady: Promise<void>;
   private wsResolve!: () => void;
   private outbox: Uint8Array[] = [];
-  private bus = new Bus();
+  private bus = new Bus((type) =>
+    this.errRej(new SessionProtocolError(`node sent too many unanswered ${JSON.stringify(type).slice(0, 64)} frames`)),
+  );
   private errRej!: (e: Error) => void;
   private errP!: Promise<never>;
   private tls!: TlsHandle;
@@ -608,7 +634,7 @@ export class ConfidentialSession {
   private zkUrl(proof: string): string {
     // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
     const token = typeof this.ready?.zk_token === "string" ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : "";
-    return `${this.wsBase()}/v1/confidential/zk?proof=${proof}&session_id=${this.sid}${token}`;
+    return `${this.wsBase()}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&session_id=${encodeURIComponent(this.sid)}${token}`;
   }
 
   setResponseHandlers(
@@ -644,6 +670,10 @@ export class ConfidentialSession {
           m = JSON.parse(d);
         } catch {
           this.errRej(new SessionProtocolError("non-JSON control frame"));
+          return;
+        }
+        if (typeof m !== "object" || m === null || typeof m.type !== "string") {
+          this.errRej(new SessionProtocolError("control frame without a type"));
           return;
         }
         this.event({ ev: "frame", in: m.type });
@@ -832,10 +862,10 @@ export class ConfidentialSession {
     this.sendText(setup);
 
     this.ready = await this.waitT("ready", this.timeouts.ready);
+    checkReady(this.ready, this.offer);
     this.sid = this.ready.sid;
     this.tReady = Date.now();
     this.event({ ev: "ready", sid: this.sid, v: this.ready.v ?? 1 });
-    checkReady(this.ready, this.offer);
 
     const twoPc = new TwoPcSession(this.host, this.WS);
     this.twoPc = twoPc;

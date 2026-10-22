@@ -26,7 +26,7 @@ import {
   OfferUnsupportedVersionError,
   TrustedHostError,
 } from "./errors.js";
-import { type ChatSuffixSpec, validateChatSuffix } from "./suffix.js";
+import { type ChatSuffixSpec, pinKeyProblem, validateChatSuffix } from "./suffix.js";
 
 /** Protocol versions this client speaks. */
 /** The browser client implements only protocol v2 (two-party handshake). */
@@ -38,6 +38,8 @@ export interface ConfidentialPriceEntry {
   in: number;
   /** msats per 1k cached input tokens. */
   cached_in?: number;
+  /** msats per 1k prompt tokens written to the provider's prompt cache. */
+  cache_write?: number;
   /** msats per 1k output tokens. */
   out: number;
 }
@@ -210,7 +212,8 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   }
   for (const [model, entry] of Object.entries(offer.price_list)) {
     const rate = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
-    if (!isObject(entry) || !rate(entry.in) || !rate(entry.out) || (entry.cached_in !== undefined && !rate(entry.cached_in))) {
+    const optional = (v: unknown) => v === undefined || rate(v);
+    if (!isObject(entry) || !rate(entry.in) || !rate(entry.out) || !optional(entry.cached_in) || !optional(entry.cache_write)) {
       throw new OfferMalformedError(`offer.price_list[${JSON.stringify(model)}] is not a set of non-negative rates`);
     }
   }
@@ -271,8 +274,9 @@ function isOffValue(v: unknown): boolean {
 /**
  * The signed image block, checked before any image request uses it. The node
  * chooses what the suffix pins, and the provider obeys the suffix, so only
- * pins that switch extras off and pins that select a priced tier are taken:
- * anything else could switch on a feature that sends the prompt elsewhere.
+ * pins that switch extras off (under no key that negates a feature or names
+ * a protection) and pins that select a priced tier are taken: anything else
+ * could switch on a feature that sends the prompt elsewhere.
  */
 export function validateImagesBlock(images: unknown, upstreamHost?: string): void {
   const bad = (what: string): never => {
@@ -312,6 +316,8 @@ export function validateImagesBlock(images: unknown, upstreamHost?: string): voi
   const fixed = im.fixed_pins as ImagePin[];
   for (const [k, v] of fixed) {
     if (!isOffValue(v)) bad(`fixed pin ${JSON.stringify(k)} does not switch an extra off`);
+    const keyProblem = pinKeyProblem(k, v);
+    if (keyProblem) bad(`fixed pin ${JSON.stringify(k)}: ${keyProblem}`);
   }
   const fixedKeys = fixed.map(([k]) => k);
   const reserved = ["model", countKey as string, ...fixedKeys];
@@ -504,6 +510,14 @@ export function verifyConfidentialOffer(
     throw new OfferUnpinnedError(
       "no pinnedPubkey configured and allowUnpinned is not set",
     );
+  }
+
+  // The node writes the chat request head too: the same syntax as the image
+  // head, checked before any setup (π_NK checks it again per session).
+  try {
+    checkHeadTemplate(offer.head_template, offer.upstream_host, "chat");
+  } catch (e) {
+    throw new OfferMalformedError(`offer.head_template: ${(e as Error).message}`);
   }
 
   // Fail closed at runtime too (plain-JS callers bypass the TS type): an

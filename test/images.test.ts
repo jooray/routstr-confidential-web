@@ -117,6 +117,13 @@ describe("offer image block", () => {
       { ...IMAGES, fixed_pins: [["seed", 1]] },
       { ...IMAGES, fixed_pins: [["style_references", ["https://x"]]] },
       { ...IMAGES, fixed_pins: [["variants", false]] },
+      // No key that negates a feature (false under it switches it on) or names a protection.
+      { ...IMAGES, fixed_pins: [["disable_watermark", false]] },
+      { ...IMAGES, fixed_pins: [["No_Logo", false]] },
+      { ...IMAGES, fixed_pins: [["hide_watermark", false]] },
+      { ...IMAGES, fixed_pins: [["safe_mode", false]] },
+      { ...IMAGES, fixed_pins: [["content_filter", []]] },
+      { ...IMAGES, fixed_pins: [["nsfw", false]] },
       { ...IMAGES, param_space: undefined },
       { ...IMAGES, param_space: { format: [1] } },
       { ...IMAGES, price_list: { m: [] } },

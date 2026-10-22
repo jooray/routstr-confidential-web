@@ -7,6 +7,7 @@ import {
   checkUpstreamErrorReceipt,
   feeOnlyChargeOk,
   maxChargeMsats,
+  errorStatusChargeMsat,
   parseSignedReceipt,
   verifyReceipt,
 } from "../src/receipt.js";
@@ -204,5 +205,26 @@ describe("receipt verification", () => {
     expect(Math.ceil((1.1 * 9999 + 1.1 * 1) / 1000)).toBe(12); // what the node charges
     expect(maxChargeMsats({ in: 1.1, cached_in: 1.1, out: 0 }, usage)).toBe(12);
     expect(maxChargeMsats({ in: 1.1, out: 0 }, { prompt_tokens: 10000, completion_tokens: 0 })).toBe(11);
+  });
+
+  it("bounds prompt-cache writes at the signed cache_write rate (the node's vectors)", () => {
+    const rates = { in: 10_000, cached_in: 2_500, cache_write: 12_500, out: 100_000 };
+    const venice = {
+      prompt_tokens: 1000,
+      completion_tokens: 8,
+      prompt_tokens_details: { cached_tokens: 200, cache_creation_input_tokens: 600 },
+      cache_creation_input_tokens: 600,
+    };
+    expect(maxChargeMsats(rates, venice)).toBe(10_800);
+    const allWritten = { ...venice, prompt_tokens_details: { cache_creation_input_tokens: 1000 } };
+    expect(maxChargeMsats(rates, allWritten)).toBe(13_300);
+    const { cache_write: _cw, ...old } = rates;
+    expect(maxChargeMsats(old, allWritten)).toBe(10_800);
+  });
+
+  it("charges the node's own provider-key errors the session fee", () => {
+    for (const s of [401, 402, 403, 429, 503]) expect(errorStatusChargeMsat(s, 2000, 5000)).toBe(2000);
+    expect(errorStatusChargeMsat(400, 2000, 5000)).toBe(5000);
+    expect(errorStatusChargeMsat(500, 2000, 5000)).toBeUndefined();
   });
 });

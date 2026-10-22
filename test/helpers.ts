@@ -27,7 +27,8 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
     key_length: 63,
     key_alphabet: "[A-Za-z0-9_-]",
     head_template:
-      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\nContent-Length: {LEN}\r\n\r\n",
+      "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:63}\r\n" +
+      "Content-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
     suffix_keys: ["model", "max_tokens", "max_completion_tokens", "n", "stream", "stream_options", "venice_parameters"],
     chat: VENICE_CHAT,
     price_list: {

@@ -78,10 +78,27 @@ describe("head template", () => {
       ["/api/v1;x/chat/completions", STD, "chat"],
       ["/api/v1/chat/completions", [...STD, "Expect: 100-continue"], "chat"],
       ["/api/v1/chat/completions", [...STD, "X-Store: 1"], "chat"],
+      // Names of Object.prototype members are not allowed headers either.
+      ["/api/v1/chat/completions", [...STD, "Constructor: x"], "chat"],
+      ["/api/v1/chat/completions", [...STD, "toString: x"], "chat"],
       ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Accept-Encoding") ? "Accept-Encoding: gzip" : h)), "chat"],
       ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: keep-alive" : h)), "chat"],
       ["/api/v1/chat/completions", STD.filter((h) => !h.startsWith("Connection")), "chat"],
       ["/api/v1/chat/completions", [...STD, "Connection: close"], "chat"],
+      // Only plain `Name: value` lines, CR LF only, Authorization exactly Bearer {KEY:n}.
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection : close" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection:close" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection:  close" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: close " : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection:\tclose" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? " Connection: close" : h)), "chat"],
+      ["/api/v1/chat/completions", [...STD.slice(0, 2), " x", ...STD.slice(2)], "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: close\nX-Store: 1" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: close\rX-Store: 1" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Connection") ? "Connection: close\u0000" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Authorization") ? "Authorization: {KEY:4}" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Authorization") ? "Authorization: Basic {KEY:4}" : h)), "chat"],
+      ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Authorization") ? "Authorization: Bearer {KEY:4} x" : h)), "chat"],
     ];
     for (const [path, headers, kind] of bad) {
       expect(() => checkHeadTemplate(head(path, headers), "api.example.com", kind)).toThrow(SessionProtocolError);

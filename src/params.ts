@@ -291,6 +291,9 @@ const TEMPLATE_PATHS: Record<"chat" | "images", RegExp> = {
   images: /\/(image\/generate|images\/generations)$/,
 };
 
+/** One header line of a head template. */
+const TEMPLATE_HEADER_LINE = /^([A-Za-z0-9-]+): ([\x21-\x7e]+(?: [\x21-\x7e]+)*)$/;
+
 /**
  * The published head template must be one HTTP/1.1 POST request head for the
  * offer's upstream host, on the route of the session's kind (no query), with
@@ -298,8 +301,9 @@ const TEMPLATE_PATHS: Record<"chat" | "images", RegExp> = {
  * token), `Content-Type: application/json`, `Accept-Encoding: identity`,
  * `Connection: close` and `Content-Length` (the body length). Any other header
  * could switch on a provider feature, an interim response or a compressed or
- * kept-alive answer the session cannot settle. (The node writes the head, so
- * this is what π_NK lets us hold it to.)
+ * kept-alive answer the session cannot settle. Each line is in the plain
+ * `Name: value` form ending in CR LF, with no other control byte. (The node
+ * writes the head, so this is what π_NK lets us hold it to.)
  */
 export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat" | "images" = "chat"): void {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
@@ -317,9 +321,12 @@ export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
     fail("π_NK", "template is not exactly one request head");
   }
+  // No control byte but the CR LF that ends each line (no bare CR or LF, no
+  // tab, no NUL): a provider and a proxy may split such a head differently.
+  if (/[\x00-\x1f\x7f]/.test(tpl.replace(/\r\n/g, ""))) fail("π_NK", "template carries a control byte");
   const want: Record<string, (v: string) => boolean> = {
     host: (v) => !!upstreamHost && v.toLowerCase() === upstreamHost.toLowerCase(),
-    authorization: (v) => /\{KEY:\d+\}/.test(v),
+    authorization: (v) => /^Bearer \{KEY:\d+\}$/.test(v),
     "content-type": (v) => v.toLowerCase() === "application/json",
     "accept-encoding": (v) => v.toLowerCase() === "identity",
     connection: (v) => v.toLowerCase() === "close",
@@ -327,15 +334,18 @@ export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat
   };
   const seen = new Set<string>();
   for (const h of tpl.slice(0, -4).split("\r\n").slice(1)) {
-    const colon = h.indexOf(":");
-    const name = colon > 0 ? h.slice(0, colon) : "";
-    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) fail("π_NK", "template carries a malformed header line");
+    // `Name: value`: no space before the colon, one after it, no leading or
+    // trailing whitespace, no folded continuation line.
+    const hm = TEMPLATE_HEADER_LINE.exec(h);
+    if (!hm) fail("π_NK", "template carries a malformed header line");
+    const name = hm![1]!;
     const key = name.toLowerCase();
-    const check = want[key];
+    // An own key only: `want.constructor` must not admit a `Constructor` header.
+    const check = Object.hasOwn(want, key) ? want[key] : undefined;
     if (!check) fail("π_NK", `template sets a header outside the allowed set (${name})`);
     if (seen.has(key)) fail("π_NK", `template sets ${name} twice`);
     seen.add(key);
-    if (!check!(h.slice(colon + 1).trim())) fail("π_NK", `template ${name} has an unexpected value`);
+    if (!check!(hm![2]!)) fail("π_NK", `template ${name} has an unexpected value`);
   }
   for (const key of Object.keys(want)) {
     if (!seen.has(key)) fail("π_NK", `template lacks the ${key} header`);
