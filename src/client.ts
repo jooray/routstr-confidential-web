@@ -199,7 +199,8 @@ const PREWARM_DEFAULTS = {
  * One armed session for the current (model, max_tokens), kept while the page
  * is visible, the user is active and the key is funded. A simplified version
  * of routstr-sdk's traffic-driven pool: nothing is armed before there is a
- * funded `sk-` key, a target model and user activity (`activity()`, or a
+ * funded `sk-` key, a target model, a first chat request with that key (so
+ * the first one is cold) and recent user activity (`activity()`, or a
  * request); an armed session is closed (the node
  * releases its reservation) when the page is hidden, after `idleMs` without
  * activity, or `maxAgeMs` after setup.
@@ -210,6 +211,8 @@ export class Prewarmer {
   private target?: { model: string; maxTokens: number };
   /** No activity yet: choosing a model or opening the page arms nothing. */
   private lastActivity = 0;
+  /** The credential of the last chat request: no arm before a first request with the current one. */
+  private requestedWith?: string;
   private maxBody = 0;
   /** Requests still waiting for a 2PC preparation (cold, or a claimed arm in progress). */
   private preparing = 0;
@@ -264,6 +267,11 @@ export class Prewarmer {
   activity(): void {
     this.lastActivity = Date.now();
     void this.ensure();
+  }
+
+  /** A chat request was sent with the current credential: from now on activity may arm. */
+  noteRequest(): void {
+    this.requestedWith = this.client.credential;
   }
 
   /**
@@ -361,7 +369,7 @@ export class Prewarmer {
     if (Date.now() < this.backoffUntil) return;
     const cred = this.client.credential;
     const target = this.target;
-    if (!cred || !cred.startsWith("sk-") || !target) return;
+    if (!cred || !cred.startsWith("sk-") || !target || this.requestedWith !== cred) return;
     this.arming = true;
     let registered: (a: Armed | undefined) => void = () => {};
     this.armWait = new Promise<Armed | undefined>((r) => (registered = r));
@@ -666,6 +674,7 @@ export class ConfidentialClient {
     pw?.setTarget(model, maxTokens);
     pw?.activity();
     const lease = pw?.take(model, maxTokens, body.length);
+    pw?.noteRequest();
     // Hold off arming the next session only until this request's own 2PC
     // preparation is done: for a claimed arm, when it is ready (the next one
     // then starts while this answer streams); for a cold request, at its end.

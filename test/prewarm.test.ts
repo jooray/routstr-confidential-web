@@ -44,9 +44,29 @@ function fakeClient() {
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 describe("pre-warm pool", () => {
+  it("arms nothing before the first chat request with the current key", async () => {
+    const { client, sessions } = fakeClient();
+    const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.setTarget("m", 100);
+    pw.activity(); // typing, focus or setting the credential
+    await tick();
+    expect(sessions.length).toBe(0);
+    pw.noteRequest();
+    pw.activity();
+    await tick();
+    expect(sessions.length).toBe(1);
+    pw.teardown("test");
+    client.credential = "sk-other"; // a new key starts cold again
+    pw.activity();
+    await tick();
+    expect(sessions.length).toBe(1);
+    pw.stop?.();
+  });
+
   it("arms nothing before user activity, or while the reservation is unknown", async () => {
     const { client, sessions } = fakeClient();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.noteRequest(); // after a first request with this key
     pw.setTarget("m", 100); // choosing a model (e.g. at page load) is not activity
     await tick();
     expect(sessions.length).toBe(0);
@@ -64,6 +84,7 @@ describe("pre-warm pool", () => {
   it("a request sent while a session is arming uses that session", async () => {
     const { client, sessions } = fakeClient();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.noteRequest(); // after a first request with this key
     pw.setTarget("m", 100);
     pw.activity();
     await tick();
@@ -84,6 +105,7 @@ describe("pre-warm pool", () => {
   it("the next session starts arming as soon as the claimed one is ready", async () => {
     const { client, sessions } = fakeClient();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.noteRequest(); // after a first request with this key
     pw.setTarget("m", 100);
     pw.activity();
     await tick();
@@ -103,6 +125,7 @@ describe("pre-warm pool", () => {
     const { client, sessions, holdOffer, releaseOffer } = fakeClient();
     holdOffer();
     const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.noteRequest(); // after a first request with this key
     pw.setTarget("m", 100);
     pw.activity();
     await tick();
@@ -127,6 +150,7 @@ describe("pre-warm pool", () => {
     try {
       const { client, sessions } = fakeClient();
       const pw = new Prewarmer(client as never, { onlyWhenVisible: false, backoffMs: 30_000 });
+      pw.noteRequest(); // after a first request with this key
       const killArmed = async () => {
         await tick();
         sessions[sessions.length - 1]!.finish();

@@ -117,9 +117,10 @@ Other caveats:
   provider certificate the page validated is shown for every answer.
 - **Pre-warming.** An armed session holds a reservation, and the node may keep
   an abandon fee (2 sats on `routstr.cypherpunk.today`) when an armed session
-  is never used. The library arms only while the page is visible, the key has
-  enough available balance and the user is active, at most one session at a
-  time. It does not arm if the abandon fee is above `maxAbandonFeeMsat`
+  is never used. The library arms only after a first chat request with the
+  current key (that one runs cold), and then only while the page is visible,
+  the key has enough available balance and the user is active, at most one
+  session at a time. It does not arm if the abandon fee is above `maxAbandonFeeMsat`
   (default 5 sats). An armed session that dies before use backs arming off
   (30 s, doubling to 10 min, reset by a request an armed session served). It
   can be turned off.
@@ -160,7 +161,7 @@ const client = createConfidentialClient({
   nodePubkeys: ["2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7"],
   trustedHosts: ["api.venice.ai"],
   credential: "sk-…",            // or client.setCredential(...) later
-  prewarm: true,                 // one armed session while visible + funded
+  prewarm: true,                 // after a first request: one armed session while visible + funded
   onEvent: (e) => console.debug(e), // progress events, never secrets
 });
 

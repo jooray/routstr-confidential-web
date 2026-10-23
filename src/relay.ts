@@ -12,6 +12,14 @@ import type { DriverHandle, DriverKind, DriverOptions, WasmHost } from "./wasm/h
 export const CHANNEL_NET = 0;
 export const CHANNEL_CONTROL = 1;
 
+/**
+ * Most bytes one driver socket may receive. An honest 2PC moves ~22 MB to the
+ * client and a proof channel or per-proof job a few MB; the drivers' own
+ * per-channel caps bound the payload, and this bounds the wire bytes too
+ * (a node sending tiny mux frames multiplies them).
+ */
+export const MAX_RELAY_INBOUND = 64 << 20;
+
 export interface RelayOptions {
   host: WasmHost;
   kind: DriverKind;
@@ -24,6 +32,8 @@ export interface RelayOptions {
   closeIsNormal?(): boolean;
   /** Label for errors. */
   label: string;
+  /** Overrides {@link MAX_RELAY_INBOUND} (tests). */
+  maxInbound?: number;
 }
 
 export class DriverRelay {
@@ -51,6 +61,7 @@ export class DriverRelay {
       this.outbox.length = 0;
     };
     ws.onmessage = (ev: MessageEvent) => {
+      if (this.closed) return;
       const d = ev.data as ArrayBuffer | string;
       if (typeof d === "string") {
         this.o.onFailure(new ProverError(`${this.o.label} websocket sent a text frame`));
@@ -58,6 +69,11 @@ export class DriverRelay {
       }
       const bytes = new Uint8Array(d);
       this.bytesRecv += bytes.length;
+      if (this.bytesRecv > (this.o.maxInbound ?? MAX_RELAY_INBOUND)) {
+        this.o.onFailure(new ProverError(`${this.o.label}: node sent more than ${this.o.maxInbound ?? MAX_RELAY_INBOUND} bytes`));
+        this.close();
+        return;
+      }
       this.driver?.push(CHANNEL_NET, bytes);
     };
     ws.onerror = () => {

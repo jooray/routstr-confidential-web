@@ -283,6 +283,12 @@ export const DEFAULT_TIMEOUTS = {
  */
 const RETAINED_SERVER_RECORDS = 64 + 17;
 
+/**
+ * TLS bytes from the node queued for processing. Decryption keeps up with any
+ * honest link, so a backlog this large means the node is flooding the session.
+ */
+export const MAX_PENDING_TLS_BYTES = 32 << 20;
+
 /** Frames of one type the node may send ahead of the wait for them. */
 const BUS_MAX_PENDING_PER_TYPE = 16;
 /** Frames of all types queued at once. */
@@ -466,6 +472,8 @@ export class ConfidentialSession {
   private handshakeP!: Promise<void>;
   private handshakeDone!: () => void;
   private flushChain: Promise<void> = Promise.resolve();
+  /** TLS bytes received and not yet processed (see MAX_PENDING_TLS_BYTES). */
+  private pendingTls = 0;
   private provider?: ProviderVerification;
 
   private responseChunks: Uint8Array[] = [];
@@ -685,6 +693,11 @@ export class ConfidentialSession {
         return;
       }
       const bytes = new Uint8Array(d);
+      if (this.pendingTls + bytes.length > MAX_PENDING_TLS_BYTES) {
+        this.errRej(new SessionProtocolError("node sent TLS bytes faster than they could be processed"));
+        return;
+      }
+      this.pendingTls += bytes.length;
       this.trackServerRecords(bytes);
       this.flushChain = this.flushChain
         .then(() => this.tls.handleReceivedBytes(bytes))
@@ -694,6 +707,9 @@ export class ConfidentialSession {
               ? new ResponseVerificationError(`TLS record failed: ${e.message}`)
               : new ResponseVerificationError(String(e)),
           );
+        })
+        .finally(() => {
+          this.pendingTls -= bytes.length;
         });
     };
     return Promise.race([this.wsReady, this.errP]);
