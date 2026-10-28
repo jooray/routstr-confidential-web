@@ -228,3 +228,19 @@ describe("receipt verification", () => {
     expect(errorStatusChargeMsat(500, 2000, 5000)).toBeUndefined();
   });
 });
+
+describe("receipt model", () => {
+  const ownUsage = { model: "Vendor/Model-1", usage: { prompt_tokens: 3, completion_tokens: 2 } } as never;
+  const receipt = (model: string) =>
+    ({ sid: "s1", model, cost_msats: 5, usage: { model: "Vendor/Model-1", usage: { prompt_tokens: 3, completion_tokens: 2 } } }) as never;
+
+  it("accepts a receipt naming the pinned model when the provider reports another spelling", () => {
+    const priceEntry = { in: 1000, out: 1000 };
+    expect(verifyReceipt({ receipt: receipt("model-1"), ownUsage, pinnedModel: "model-1", priceEntry }).usageMatch).toBe(true);
+    // the provider's own spelling (an older node) is still accepted
+    expect(verifyReceipt({ receipt: receipt("Vendor/Model-1"), ownUsage, pinnedModel: "model-1", priceEntry }).usageMatch).toBe(true);
+    // a third model is not
+    expect(verifyReceipt({ receipt: receipt("other"), ownUsage, pinnedModel: "model-1", priceEntry }).usageMatch).toBe(false);
+    expect(verifyReceipt({ receipt: receipt("model-1"), ownUsage, priceEntry }).usageMatch).toBe(false);
+  });
+});

@@ -217,8 +217,9 @@ export interface ConfidentialSessionResult {
   imageVariant?: string;
   imageCount?: number;
   /**
-   * Image sessions: what is wrong with an accepted answer (short count, an
-   * incomplete body, an echo naming another model or count). Already paid.
+   * What is wrong with an accepted answer, already paid for. Image sessions:
+   * a short count, an incomplete body, an echo naming another model or count.
+   * Chat: the provider reports a model other than the pinned one.
    */
   warnings?: string[];
 }
@@ -525,6 +526,8 @@ export class ConfidentialSession {
   private absSpans: { name: string; lane: TimingSpan["lane"]; start: number; end: number }[] = [];
   private finished = false;
   private c2Failed = false;
+  /** Set by close(): sticky, so a session closed before it opened never opens. */
+  private closed = false;
 
   constructor(options: ConfidentialSessionOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
@@ -598,7 +601,16 @@ export class ConfidentialSession {
   }
 
   get healthy(): boolean {
-    return !this.failure && !this.finished && !(this.twoPc?.failed ?? false);
+    return !this.closed && !this.failure && !this.finished && !(this.twoPc?.failed ?? false);
+  }
+
+  /** True once close() was called: the session never opens (again). */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new SessionProtocolError("session closed by the client");
   }
 
   get failureReason(): Error | undefined {
@@ -655,7 +667,8 @@ export class ConfidentialSession {
 
   /** Open the control/relay socket. */
   async open(): Promise<void> {
-    if (this.ws) return this.wsReady;
+    this.assertOpen();
+    if (this.ws) return Promise.race([this.wsReady, this.errP]);
     const ws = new this.WS(this.controlUrl());
     this.ws = ws;
     ws.binaryType = "arraybuffer";
@@ -845,8 +858,11 @@ export class ConfidentialSession {
     if (this.kind === "images" && !this.coldRun) {
       throw new SessionProtocolError("image sessions are never armed ahead; use run()");
     }
+    this.assertOpen();
     this.armStarted = true;
     await this.host.ready();
+    // close() may have run while the wasm host was starting.
+    this.assertOpen();
     await this.open();
     const setup: Record<string, unknown> =
       this.kind === "images"
@@ -1006,6 +1022,7 @@ export class ConfidentialSession {
    */
   async claim(body: Uint8Array, tClaim = Date.now()): Promise<ConfidentialSessionResult> {
     if (this.kind === "images") throw new SessionProtocolError("image sessions are never claimed; use run()");
+    this.assertOpen();
     const armingBefore = this.armStarted;
     if (!this.armStarted) await this.arm();
     await this.prepareProofs();
@@ -1020,6 +1037,8 @@ export class ConfidentialSession {
     waitedForArmMs?: number,
   ): Promise<ConfidentialSessionResult> {
     if (!this.prepared) throw new SessionProtocolError("finish before prepareProofs");
+    // Never release the credential record for a session the caller closed.
+    this.assertOpen();
     if (body.length !== this.bodyLength) {
       throw new SessionProtocolError(`body length ${body.length} != declared setup len ${this.bodyLength}`);
     }
@@ -1205,6 +1224,7 @@ export class ConfidentialSession {
           sig: sigHex,
           pubkey: this.ready.pubkey,
           ownUsage,
+          pinnedModel: this.model,
           priceEntry: this.offer.price_list[this.model],
           sessionFeeMsat: fee,
           abandonFeeMsat: offerAbandonFeeMsat(this.offer),
@@ -1235,9 +1255,14 @@ export class ConfidentialSession {
         this.responseJoined = undefined;
       }
     } else {
+      // π_C2S proved which model the request named, and the node settled at
+      // that model's signed rates. A provider echoing another spelling (an
+      // alias, a canonical id, a redirect) is reported, not thrown: the
+      // answer is here and already paid for.
       effectiveModel = effectiveModelFromText(http.bodyText);
       if (effectiveModel !== undefined && effectiveModel !== this.model) {
-        throw new ResponseVerificationError(`effective model ${effectiveModel} != ${this.model}`);
+        warnings = [`the provider reports model ${JSON.stringify(effectiveModel)}, the request pinned ${this.model}`];
+        this.event({ ev: "model_mismatch", pinned: this.model, reported: effectiveModel });
       }
     }
 
@@ -1356,8 +1381,16 @@ export class ConfidentialSession {
     return this.finish(body, tClaim, false);
   }
 
-  /** Abort an unclaimed session; the node releases its reservation (minus any session fee). */
+  /**
+   * Abort the session; the node releases its reservation (minus any fee)
+   * while the body is unreleased. Sticky: a session closed before its socket
+   * exists never opens one, and every later step fails.
+   */
   close(): void {
+    if (!this.closed) {
+      this.closed = true;
+      this.errRej(new SessionProtocolError("session closed by the client"));
+    }
     this.twoPc?.close();
     this.zkChan?.close();
     try {

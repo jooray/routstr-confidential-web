@@ -258,6 +258,11 @@ function parseHead(bytes: Uint8Array, end: number): { status: number; statusText
   return { status: Number(m[1]), statusText: m[2] ?? "", headers };
 }
 
+/** An interim 1xx status: another head follows. 101 switches protocols and is final. */
+export function isInterimStatus(status: number): boolean {
+  return status >= 100 && status < 200 && status !== 101;
+}
+
 function indexOfHeadEnd(bytes: Uint8Array, from = 0): number {
   for (let i = from; i + 3 < bytes.length; i++) {
     if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) return i;
@@ -268,6 +273,7 @@ function indexOfHeadEnd(bytes: Uint8Array, from = 0): number {
 /**
  * Split the decrypted upstream plaintext into an HTTP/1.1 response. Interim
  * 1xx heads (e.g. `100 Continue`) are skipped: the status is the final one.
+ * `101 Switching Protocols` is final (nothing HTTP follows it).
  */
 export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
   let start = 0;
@@ -279,7 +285,7 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
       throw new ResponseVerificationError("upstream response has no HTTP header terminator");
     }
     head = parseHead(bytes.subarray(start), headerEnd - start);
-    if (head.status >= 200 || head.status < 100) break;
+    if (!isInterimStatus(head.status)) break;
     start = headerEnd + 4;
   }
   const { status, statusText, headers } = head;
@@ -531,7 +537,7 @@ export class IncrementalHttpResponse {
       const head = parseHead(merged.subarray(start), end - start);
       start = end + 4;
       // An interim 1xx head is not the response: keep reading.
-      if (head.status >= 100 && head.status < 200) continue;
+      if (isInterimStatus(head.status)) continue;
       this.head = head;
       this.chunked = /chunked/i.test(head.headers["transfer-encoding"] ?? "");
       this.headDone = true;

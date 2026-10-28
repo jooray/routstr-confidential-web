@@ -47,8 +47,18 @@ export interface PrewarmOptions {
   maxAgeMs?: number;
   /** No activity (request, typing, focus) for this long: tear down, stop arming. */
   idleMs?: number;
-  /** Arm only while `document.visibilityState === "visible"` (default true). */
+  /**
+   * Arm only while `document.visibilityState === "visible"` (default true).
+   * Hiding the page closes the armed session; showing it again arms nothing
+   * until the next `activity()` or request.
+   */
   onlyWhenVisible?: boolean;
+  /**
+   * Pre-warm on a metered connection too: when the browser reports
+   * `navigator.connection.saveData` or a cellular connection (default false).
+   * Each arm costs about 22 MB.
+   */
+  allowMetered?: boolean;
   /** Smallest armed body length (bytes). */
   minBucket?: number;
   /** Retry delay after a failed arm (doubles up to 10 min). */
@@ -108,7 +118,11 @@ export interface ConfidentialStream extends AsyncIterable<ChatCompletionChunk> {
   verification: Promise<ConfidentialSessionResult>;
   /** The upstream HTTP status and headers. */
   head: Promise<{ status: number; statusText: string; headers: Record<string, string> }>;
-  /** Abort the session. */
+  /**
+   * Stop the answer. Before the body is released this closes the session;
+   * after it, only this stream ends (with an AbortError) and the session
+   * settles in the background, `verification` resolving with its receipt.
+   */
   abort(): void;
 }
 
@@ -193,7 +207,21 @@ const PREWARM_DEFAULTS = {
   minBucket: 4096,
   backoffMs: 30_000,
   maxAbandonFeeMsat: 5000,
+  allowMetered: false,
 };
+
+/**
+ * The browser says the connection is metered: Save-Data is on, or the link is
+ * cellular (Network Information API; false where the browser has none).
+ */
+export function meteredConnection(nav: unknown = typeof navigator !== "undefined" ? navigator : undefined): boolean {
+  try {
+    const c = (nav as { connection?: { saveData?: unknown; type?: unknown } } | undefined)?.connection;
+    return !!c && (c.saveData === true || c.type === "cellular");
+  } catch {
+    return false;
+  }
+}
 
 /**
  * One armed session for the current (model, max_tokens), kept while the page
@@ -211,6 +239,11 @@ export class Prewarmer {
   private target?: { model: string; maxTokens: number };
   /** No activity yet: choosing a model or opening the page arms nothing. */
   private lastActivity = 0;
+  /**
+   * The page was hidden since the last activity: showing it again (or the
+   * periodic tick) must not arm; the next real activity or request does.
+   */
+  private hiddenSinceActivity = false;
   /** The credential of the last chat request: no arm before a first request with the current one. */
   private requestedWith?: string;
   /**
@@ -235,7 +268,7 @@ export class Prewarmer {
   private deaths = 0;
   private timer?: ReturnType<typeof setInterval>;
   private stopped = false;
-  status: "off" | "idle" | "arming" | "armed" | "waiting-funds" | "backoff" = "off";
+  status: "off" | "idle" | "arming" | "armed" | "waiting-funds" | "backoff" | "metered" = "off";
 
   constructor(
     private readonly client: ConfidentialClient,
@@ -247,9 +280,14 @@ export class Prewarmer {
     if (this.cfg.maxAgeMs === undefined) this.cfg.maxAgeMs = PREWARM_DEFAULTS.maxAgeMs;
     if (!(this.cfg.maxAgeMs >= PREWARM_MIN_MAX_AGE_MS)) this.cfg.maxAgeMs = PREWARM_MIN_MAX_AGE_MS;
     if (typeof document !== "undefined") {
+      // Each hide closes the armed session (its abandon fee) and each re-arm
+      // costs ~22 MB: switching apps on a phone must not repeat that, so a
+      // page shown again waits for real activity before it arms.
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") void this.ensure();
-        else if (this.cfg.onlyWhenVisible) this.teardown("page hidden");
+        if (document.visibilityState !== "visible" && this.cfg.onlyWhenVisible) {
+          this.hiddenSinceActivity = true;
+          this.teardown("page hidden");
+        }
       });
     }
     this.timer = setInterval(() => this.tick(), 15_000);
@@ -272,6 +310,7 @@ export class Prewarmer {
 
   activity(): void {
     this.lastActivity = Date.now();
+    if (this.visible()) this.hiddenSinceActivity = false;
     void this.ensure();
   }
 
@@ -371,8 +410,16 @@ export class Prewarmer {
 
   async ensure(): Promise<void> {
     if (this.stopped || !this.cfg.enabled || this.arming || this.armed || this.preparing > 0) return;
-    if (!this.visible() || Date.now() - this.lastActivity > this.cfg.idleMs) return;
+    if (!this.visible() || this.hiddenSinceActivity || Date.now() - this.lastActivity > this.cfg.idleMs) return;
     if (Date.now() < this.backoffUntil) return;
+    if (!this.cfg.allowMetered && meteredConnection()) {
+      if (this.status !== "metered") {
+        this.status = "metered";
+        this.log("not arming: the connection is metered (Save-Data or cellular)");
+      }
+      return;
+    }
+    if (this.status === "metered") this.status = "idle";
     const cred = this.client.credential;
     const target = this.target;
     if (!cred || !cred.startsWith("sk-") || !target || this.requestedWith !== cred) return;
@@ -594,26 +641,53 @@ export class ConfidentialClient {
       allowInsecureTransport: this.opts.allowInsecureTransport,
       onEvent: (e) => this.emit({ ...e, kind: "images", session: undefined }),
     });
-    const abort = () => session.close();
+    // Aborted while the offer was fetched: never open the session.
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    // Before release, an abort closes the session (the node releases the
+    // reservation, less any abandon fee). After it the provider has the
+    // request: the caller gets an AbortError at once and the session settles
+    // in the background (accept, or the error head), which never costs more
+    // than closing it would.
+    let rejectAborted!: (e: unknown) => void;
+    const abortedP = new Promise<never>((_, rej) => (rejectAborted = rej));
+    abortedP.catch(() => {});
+    let detached = false;
+    const abort = () => {
+      // First, so the caller sees an AbortError rather than the closed session's error.
+      rejectAborted(new DOMException("aborted", "AbortError"));
+      if (session.bodyReleased) {
+        detached = true;
+        this.emit({ ev: "request_aborted", kind: "images", released: true, msg: "settling in the background" });
+      } else {
+        session.close();
+        this.emit({ ev: "request_aborted", kind: "images", released: false });
+      }
+    };
     signal?.addEventListener("abort", abort, { once: true });
     // Hold the chat pre-warmer back while the image's own 2PC runs: two
     // ~22 MB preparations at once would slow this one and cost the data twice.
     const pw = this.prewarmer;
     pw?.beginPreparing();
     let result: ConfidentialSessionResult;
-    try {
-      this.emit({ ev: "request", path: "cold", kind: "images", model, variant: variant.id, count });
-      result = await session.run(body);
-    } catch (e) {
+    this.emit({ ev: "request", path: "cold", kind: "images", model, variant: variant.id, count });
+    const runP = session.run(body);
+    // Whoever ends first, the session is closed once it has settled.
+    const settled = runP.finally(() => {
       session.close();
+      signal?.removeEventListener("abort", abort);
+      pw?.endPreparing(false);
+    });
+    settled.catch(() => {});
+    try {
+      result = await Promise.race([runP, abortedP]);
+    } catch (e) {
+      if (!detached) session.close();
       // Retry only while nothing could have reached the provider.
       if (isOfferExpired(e) && !freshOffer && !session.bodyReleased && !signal?.aborted) {
+        await settled.catch(() => {});
         return this.generateImages(params, signal, true);
       }
       throw e;
-    } finally {
-      signal?.removeEventListener("abort", abort);
-      pw?.endPreparing(false);
     }
     if (result.http.status >= 400) {
       throw new UpstreamImageError(
@@ -704,18 +778,26 @@ export class ConfidentialClient {
     let resolveHead!: (h: Head) => void;
     const head = new Promise<Head>((r) => (resolveHead = r));
     let session: ConfidentialSession | undefined;
+    /** The caller aborted (signal or `stream.abort()`): sticky. */
+    let callerAborted = false;
+    /** Aborted after release: the caller's stream is cut off, the session settles on its own. */
+    let detached = false;
+    const isAborted = () => callerAborted || !!signal?.aborted;
+    let rejectAborted!: (e: unknown) => void;
+    const abortedP = new Promise<never>((_, rej) => (rejectAborted = rej));
+    abortedP.catch(() => {});
     const attach = (s: ConfidentialSession) =>
       s.setResponseHandlers(
         (h) => resolveHead(h),
         (chunk) => {
-          if (!chunk.length) return;
+          if (!chunk.length || detached) return;
           for (const ev of sse.push(chunk)) queue.push(ev as ChatCompletionChunk);
           notify();
         },
       );
     const aborted = () => new DOMException("aborted", "AbortError");
     const cold = () => {
-      if (signal?.aborted) return Promise.reject(aborted());
+      if (isAborted()) return Promise.reject(aborted());
       const s = this.newSession(offer, auth, model, maxTokens, body.length);
       session = s;
       attach(s);
@@ -727,11 +809,12 @@ export class ConfidentialClient {
       try {
         s = await lease!;
       } catch (e) {
+        if (isAborted()) throw aborted();
         this.emit({ ev: "request", path: "cold", reason: `armed session failed: ${errorText(e)}` });
         return cold();
       }
       // Aborted while the arm was pending: abort() had no session to close.
-      if (signal?.aborted) {
+      if (isAborted()) {
         s.close();
         throw aborted();
       }
@@ -745,16 +828,32 @@ export class ConfidentialClient {
       } catch (e) {
         // Before the credential record is released nothing reached the
         // provider: retry once on a cold session. Never after.
-        if (s.bodyReleased || signal?.aborted) throw e;
+        if (s.bodyReleased || isAborted()) throw e;
         s.close();
         pw?.armedFailed(`armed session failed before release: ${errorText(e)}`);
         this.emit({ ev: "request", path: "cold", reason: `warm session failed before release: ${errorText(e)}` });
         return cold();
       }
     };
+    // Before release nothing reached the provider: close at once (the node
+    // releases the reservation, less any abandon fee). After it the provider
+    // has the request: closing would leave the node to charge the whole
+    // reservation, so only the caller's stream ends and the session drains
+    // (its answer is capped by the pinned max_tokens) and settles on the
+    // usage actually reported. `verification` still settles with its result.
     const abort = () => {
-      session?.close();
+      if (callerAborted) return;
+      callerAborted = true;
       failure ??= aborted();
+      rejectAborted(aborted());
+      if (session?.bodyReleased) {
+        detached = true;
+        queue.length = 0;
+        this.emit({ ev: "request_aborted", released: true, msg: "settling in the background" });
+      } else {
+        session?.close();
+        this.emit({ ev: "request_aborted", released: false });
+      }
       ended = true;
       notify();
     };
@@ -783,10 +882,14 @@ export class ConfidentialClient {
     verification.catch(() => {});
 
     // Fail fast on a refusal before any response (e.g. 402 insufficient balance, 409 offer expired).
-    const first = await Promise.race([head.then(() => "head" as const), verification.then(() => "done" as const)]).catch(
+    const first = await Promise.race([
+      head.then(() => "head" as const),
+      verification.then(() => "done" as const),
+      abortedP,
+    ]).catch(
       async (e: unknown) => {
         // Retry only while nothing could have reached the provider.
-        if (isOfferExpired(e) && !freshOffer && !session?.bodyReleased) return "retry" as const;
+        if (isOfferExpired(e) && !freshOffer && !session?.bodyReleased && !isAborted()) return "retry" as const;
         throw e;
       },
     );

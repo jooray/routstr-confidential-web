@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { Prewarmer } from "../src/client";
+import { meteredConnection, Prewarmer } from "../src/client";
 
 /** A fake session whose arm() resolves when the test says so. */
 function fakeSession(len: number) {
@@ -228,5 +228,69 @@ describe("pre-warm options", () => {
     const unset = new Prewarmer(client as never, { onlyWhenVisible: false, enabled: false, maxAgeMs: undefined });
     expect(unset.cfg.maxAgeMs).toBe(480_000);
     unset.stop();
+  });
+});
+
+describe("pre-warm and the page's visibility", () => {
+  it("showing the page again arms nothing until real activity", async () => {
+    const doc = Object.assign(new EventTarget(), { visibilityState: "visible" });
+    vi.stubGlobal("document", doc);
+    try {
+      const { client, sessions } = fakeClient();
+      const pw = new Prewarmer(client as never, {});
+      pw.noteRequest();
+      pw.setTarget("m", 100);
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(1);
+      doc.visibilityState = "hidden";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(sessions[0]!.s.closed).toBe(true); // hidden: torn down
+      doc.visibilityState = "visible";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      await tick();
+      (pw as unknown as { tick(): void }).tick(); // nor does the periodic check
+      await tick();
+      expect(sessions.length).toBe(1);
+      pw.activity(); // the user types again
+      await tick();
+      expect(sessions.length).toBe(2);
+      pw.stop();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("pre-warm on a metered connection", () => {
+  it("detects Save-Data and cellular, and tolerates browsers without the API", () => {
+    expect(meteredConnection({})).toBe(false);
+    expect(meteredConnection(undefined)).toBe(false);
+    expect(meteredConnection({ connection: { saveData: true } })).toBe(true);
+    expect(meteredConnection({ connection: { type: "cellular" } })).toBe(true);
+    expect(meteredConnection({ connection: { type: "wifi", saveData: false } })).toBe(false);
+    const throwing = { get connection() { throw new Error("no"); } };
+    expect(meteredConnection(throwing)).toBe(false);
+  });
+
+  it("does not arm while metered unless allowed", async () => {
+    vi.stubGlobal("navigator", { connection: { saveData: true } });
+    try {
+      const { client, sessions } = fakeClient();
+      const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+      pw.noteRequest();
+      pw.setTarget("m", 100);
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(0);
+      expect(pw.status).toBe("metered");
+      pw.cfg.allowMetered = true;
+      pw.activity();
+      await tick();
+      expect(sessions.length).toBe(1);
+      pw.stop();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

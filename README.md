@@ -122,8 +122,17 @@ Other caveats:
   the key has enough available balance and the user is active, at most one
   session at a time. It does not arm if the abandon fee is above `maxAbandonFeeMsat`
   (default 5 sats). An armed session that dies before use backs arming off
-  (30 s, doubling to 10 min, reset by a request an armed session served). It
-  can be turned off.
+  (30 s, doubling to 10 min, reset by a request an armed session served).
+  Hiding the page closes the armed session, and showing it again arms nothing
+  until the next activity or request. It does not arm on a metered connection
+  (`navigator.connection.saveData`, or a cellular link where the browser
+  reports one) unless `allowMetered` is set. It can be turned off.
+- **Stopping an answer.** An abort before the request body is released closes
+  the session (the node keeps at most the abandon fee). After release the
+  provider already has the request, so an abort only ends the caller's stream:
+  the session drains in the background (capped by the pinned `max_tokens`)
+  and settles on the usage the provider reported, and `verification` still
+  resolves with its receipt. Closing it would cost the whole reservation.
 - The 2PC has **no external review** yet (see routstr-confidential). The
   client's selective-failure leakage bound is ≤ log2 6 bits per session, about
   fresh single-use values.

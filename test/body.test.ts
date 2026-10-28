@@ -147,6 +147,14 @@ describe("streaming", () => {
     expect(inc.head?.headers["x-venice-balance-usd"]).toBeUndefined();
   });
 
+  it("treats 101 Switching Protocols as the final status", () => {
+    const raw = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    expect(parseHttpResponse(enc(raw)).status).toBe(101);
+    const inc = new IncrementalHttpResponse();
+    inc.push(enc(raw));
+    expect(inc.head?.status).toBe(101);
+  });
+
   it("finds the usage disclosure in the response", () => {
     const usage = '{"id":"x","model":"m","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}';
     const body = `data: {"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\ndata: ${usage}\n\ndata: [DONE]\n\n`;
