@@ -121,6 +121,26 @@ describe("pre-warm pool", () => {
     pw.stop?.();
   });
 
+  it("sizes the next arm for the latest body, not the largest one seen", async () => {
+    const { client, sessions } = fakeClient();
+    const pw = new Prewarmer(client as never, { onlyWhenVisible: false });
+    pw.noteRequest();
+    pw.setTarget("m", 100);
+    pw.noteBody(300_000); // a message with an image
+    pw.activity();
+    await tick();
+    expect(sessions[0]!.s.bodyLength).toBe(524_288);
+    sessions[0]!.finish();
+    await tick();
+    pw.noteBody(2_000); // a new chat, text only: the big arm still serves it
+    expect(pw.take("m", 100, 2_000)).toBeDefined();
+    pw.activity();
+    await tick();
+    await tick();
+    expect(sessions[1]!.s.bodyLength).toBe(4096); // and the next arm is small again
+    pw.stop?.();
+  });
+
   it("a request in the window before the arm is registered waits for it", async () => {
     const { client, sessions, holdOffer, releaseOffer } = fakeClient();
     holdOffer();

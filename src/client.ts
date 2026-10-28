@@ -213,7 +213,13 @@ export class Prewarmer {
   private lastActivity = 0;
   /** The credential of the last chat request: no arm before a first request with the current one. */
   private requestedWith?: string;
-  private maxBody = 0;
+  /**
+   * The body length of the latest request. The next arm is sized for it (a
+   * conversation's body only grows, and chooseBucket adds headroom), not for
+   * the largest body ever seen: one message with an image would otherwise pad
+   * every later prepared session, in a new chat too, to that image's size.
+   */
+  private lastBody = 0;
   /** Requests still waiting for a 2PC preparation (cold, or a claimed arm in progress). */
   private preparing = 0;
   /** Set while ensure() is between its first check and registering the armed session. */
@@ -261,7 +267,7 @@ export class Prewarmer {
   }
 
   noteBody(len: number): void {
-    this.maxBody = Math.max(this.maxBody, len);
+    this.lastBody = len;
   }
 
   activity(): void {
@@ -393,7 +399,7 @@ export class Prewarmer {
         this.log("not arming: the node's abandon fee exceeds maxAbandonFeeMsat", { abandonFee });
         return;
       }
-      const len = chooseBucket(this.maxBody, { minBucket: this.cfg.minBucket });
+      const len = chooseBucket(this.lastBody, { minBucket: this.cfg.minBucket });
       const session = this.client.newSession(offer, cred, target.model, target.maxTokens, len);
       this.status = "arming";
       this.log("arming", { model: target.model, body_len: len });
