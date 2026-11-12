@@ -1,7 +1,8 @@
 // Protocol-v3 live check in headless browsers: harness/live.html (the library
 // from dist/, the wasm in its Web Worker) against a local node on a real
-// provider. Cases as scripts/live-v3.mjs: chat-2 (three requests on one
-// framing-"2" connection), chat-1.1 (HTTP/2 off), image (one, the cheapest
+// provider. Cases as scripts/live-v3.mjs: chat-2 (five requests on one
+// framing-"2" connection, CONF_PAUSE_MS apart, the proof channel topped up in
+// between), error-head (a provider 400 disclosed from its record's byte 0), chat-1.1 (HTTP/2 off), image (one, the cheapest
 // variant; real money), refused (402, top-up, the same request again on the
 // same connection).
 //
@@ -46,6 +47,7 @@ const push = (name, r) =>
     total_ms: r.totalMs,
     up: mb(r.sent),
     down: mb(r.recv),
+    zk_down: r.zkRecv,
     setup_up: mb(r.setupSent),
     setup_down: mb(r.setupRecv),
     cost_msat: r.costMsats,
@@ -59,7 +61,15 @@ const cfg = (http, k = key) => ({ node, pubkey, key: k, model, http });
 for (const name of cases) {
   try {
     if (name === "chat-2") {
-      for (let i = 1; i <= 3; i++) push(name, await page.evaluate(([c, i]) => window.live.chat(c, `Say the number ${i} in one word.`), [cfg("2"), i]));
+      const pause = Number(process.env.CONF_PAUSE_MS ?? 2000);
+      for (let i = 1; i <= 5; i++) {
+        if (i > 1) await new Promise((res) => setTimeout(res, pause));
+        push(name, await page.evaluate(([c, i]) => window.live.chat(c, `Say the number ${i} in one word.`), [cfg("2"), i]));
+      }
+    } else if (name === "error-head") {
+      const r = await page.evaluate((c) => window.live.chat(c, "Say no.", "err", { temperature: "hot" }), cfg("2"));
+      push(name, r);
+      if (!(r.status >= 400)) throw new Error(`expected a provider error, got ${r.status}`);
     } else if (name === "chat-1.1") {
       push(name, await page.evaluate((c) => window.live.chat(c, "Say hello in one word."), cfg("1.1")));
     } else if (name === "image") {
@@ -82,6 +92,8 @@ await page.evaluate(() => window.live.close());
 console.log(`engine: ${engine} (${browser.version()})`);
 console.table(rows);
 for (const e of events) if (["deposit", "request_refused", "framing_fallback", "certificate_verified"].includes(e.ev)) console.log(JSON.stringify(e));
+const tops = events.filter((e) => e.ev === "topup");
+if (tops.length) console.log(`top-ups (off the request path): ${tops.length}, ${tops.reduce((a, t) => a + t.bytes, 0)} B`);
 await browser.close();
 server.close();
 process.exit(rows.some((r) => r.status === "FAIL") ? 1 : 0);

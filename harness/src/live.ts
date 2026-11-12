@@ -47,6 +47,7 @@ function summary(r: ConfidentialRequestResult, note = "") {
     totalMs: Math.round(r.totalMs),
     sent: r.bytes.sent,
     recv: r.bytes.recv,
+    zkRecv: r.bytes.channels?.zkRecv,
     setupSent: r.setupBytes?.sent,
     setupRecv: r.setupBytes?.recv,
     costMsats: r.costMsats,
@@ -58,9 +59,9 @@ function summary(r: ConfidentialRequestResult, note = "") {
   };
 }
 
-async function chat(cfg: Cfg, text: string, id?: string) {
+async function chat(cfg: Cfg, text: string, id?: string, extra: Record<string, unknown> = {}) {
   const c = client(cfg, id);
-  const stream = await c.chat.completions.create({ model: cfg.model, messages: [{ role: "user", content: text }], max_tokens: 24, stream: true });
+  const stream = await c.chat.completions.create({ model: cfg.model, messages: [{ role: "user", content: text }], max_tokens: 24, stream: true, ...extra });
   let txt = "";
   for await (const ch of stream) txt += ch.choices[0]?.delta?.content ?? "";
   const r = await stream.verification;
