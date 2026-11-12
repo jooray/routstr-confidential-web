@@ -88,8 +88,24 @@ provider (`api.venice.ai`; `scripts/live-v3.mjs`, `scripts/browser-live-v3.mjs`)
    settlement. A stream ends cleanly only after all of these pass.
 9. **Next request.** Framing `"2"`: the connection goes back to the pool and
    the next request runs on it (no 2PC, no π_NK) until the node's idle limit,
-   `h2.max_requests` or `h2.max_lifetime_s`. Framing `"1.1"`: the connection
-   ends after its request.
+   `h2.max_requests` or `h2.max_lifetime_s`. While it idles (after the head and
+   after each settled request) the page asks the node to **top up the proof
+   channel** (one Ferret step, about 0.6 MB from the node, granted only while
+   the chain holds less than one request's worth), so the next request's proofs
+   use preprocessed correlations and its download is about what the request
+   needs (PROTOCOL-V3.md §9.2). A request that starts during a top-up waits for
+   it (about 0.9 s in wasm). Framing `"1.1"`: the connection ends after its
+   request.
+
+An error head is disclosed from byte 0 of the record that holds the response
+HEADERS frame; the frames before it in that record may only be ones that carry
+nothing of the page's (stream-0 SETTINGS, PING, GOAWAY, WINDOW_UPDATE on stream
+0 or the request's stream, the node's probe stream). A long body is proven in
+as many π_WIN batches as the node asks for, and the page never sends an HTTP/2
+WINDOW_UPDATE of its own. A request refused with `offer_expired` is sent again
+with the same number after the offer is refetched; `offer_changed` closes the
+connection and the request opens a new one. A connection the node closes
+(`closed`, any reason, `evicted` included) leaves the pool.
 
 The protocol and its security argument are in routstr-confidential:
 `docs/TWOPC-DESIGN.md` and `paper/`.
@@ -140,7 +156,13 @@ Other caveats:
 - **Linkability.** Requests on one framing-`"2"` connection share a TLS
   connection to the provider, which can tell they come from one client (as
   requests under one API key already are). `reuseScope` separates what must
-  not be linked; `http2.reuse: "none"` opens a connection per request.
+  not be linked; `http2.reuse: "none"` opens a connection per request (and a
+  connection kept before reuse was turned off is never handed out again).
+- **Body size.** The body length is exact unless `padBucket` is set (a
+  multiple of N bytes, or `"pow2"`): the body is then padded with JSON
+  whitespace before the pinned suffix. Off by default; it hides the size from
+  observers of the connections and the provider, not from the node (which
+  learns the token count at settlement), and costs upload.
 - **Pre-warming.** An armed connection holds the connection deposit and is
   bound to the credential only; the node keeps the deposit when an armed
   connection is never used. The library arms only after a first settled chat
@@ -357,8 +379,8 @@ npm run harness:build && node scripts/browser-bench.mjs chromium,firefox,webkit 
 node scripts/ws-tcp-relay.mjs 7451 & node scripts/tls-check.mjs
 
 # Protocol v3 live, against a local node + sidecar on the real provider (keys from the environment, never printed):
-npm run build && CONF_NODE=http://127.0.0.1:8451 CONF_KEY=sk-… node scripts/live-v3.mjs chat-2 chat-1.1 image refused   # in Node
-npm run harness:build && CONF_KEY=sk-… node scripts/browser-live-v3.mjs chat-2 chat-1.1 image refused                   # headless Chromium (ENGINE=firefox|webkit)
+npm run build && CONF_NODE=http://127.0.0.1:8451 CONF_KEY=sk-… node scripts/live-v3.mjs chat-2 big batches error-head pad chat-1.1 image refused   # in Node
+npm run harness:build && CONF_KEY=sk-… node scripts/browser-live-v3.mjs chat-2 error-head chat-1.1 image refused                                  # headless Chromium (ENGINE=firefox|webkit)
 
 ```
 
@@ -377,14 +399,22 @@ connection's setup (2PC preprocessing, key share, proof channel, handshake,
 
 | case | framing | n | connection | first token | total | request up / down | setup up / down |
 |---|---|---|---|---|---|---|---|
-| chat | 2 | 1 | new | 4.98 s | 5.26 s | 0.08 / 0.02 MB | 2.55 / 17.96 MB |
-| chat | 2 | 2 | reused | 0.57 s | 0.87 s | 0.08 / 0.02 MB | — |
-| chat | 2 | 3 | reused | 1.08 s | 1.70 s | 0.09 / 1.46 MB¹ | — |
-| chat, HTTP/2 off | 1.1 | 1 | new | 4.10 s | 4.44 s | 0.08 / 0.10 MB | 2.55 / 17.88 MB |
-| refused (402), top-up, again | 2 | 1 | the same | 0.72 s | 1.06 s | 0.08 / 0.02 MB | — |
-| image | 2 | 1 | new | 10.76 s | 10.84 s | 0.04 / 0.05 MB | 2.55 / 17.96 MB |
+| chat | 2 | 1 | new | 4.81 s | 5.16 s | 0.08 / 0.02 MB | 2.55 / 17.96 MB |
+| chat | 2 | 2 | reused | 0.49 s | 0.84 s | 0.08 / 0.02 MB | — |
+| chat | 2 | 3 | reused | 0.61 s | 1.36 s | 0.08 / 0.02 MB | — |
+| chat | 2 | 4 | reused | 0.65 s | 0.96 s | 0.08 / 0.02 MB | — |
+| chat | 2 | 5 | reused | 0.61 s | 1.39 s | 0.08 / 0.02 MB | — |
+| error head (provider 400) | 2 | 1 | new | 4.25 s | 4.52 s | 0.13 / 0.02 MB | 2.55 / 17.96 MB |
+| chat, HTTP/2 off | 1.1 | 1 | new | 4.09 s | 4.29 s | 0.08 / 0.09 MB | 2.55 / 17.88 MB |
+| refused (402), top-up, again | 2 | 1 | the same | 0.83 s | 2.08 s | 0.08 / 0.02 MB | — |
+| image (earlier run) | 2 | 1 | new | 10.76 s | 10.84 s | 0.04 / 0.05 MB | 2.55 / 17.96 MB |
 
-¹ the proof channel extending its correlations online on the third request.
+The five chat requests ran 2 s apart. Between them the proof channel was topped
+up three times (0.61 MB each, off the request path); before the top-up, the
+third request of a connection downloaded 1.46 MB on its path while the channel
+extended its correlations online. In Node (`scripts/live-v3.mjs batches`) a
+4.6 MB body (padded) in 4 KiB records was proven in two π_WIN batches (2200 +
+49 windows).
 
 The v2 numbers below are kept for comparison (they name v2's π_C2S and the
 22.1 MB of v2 garbled tables).
