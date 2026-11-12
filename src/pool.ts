@@ -442,6 +442,8 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         this.backoff(entry.key);
       }
       this.remove(entry);
+      // A key that just lost its last open connection may want a spare (armWithoutOpen).
+      this.replenish();
     });
   }
 

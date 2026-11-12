@@ -243,7 +243,7 @@ export function requestResult(
     attestationSigOk: true,
     usageMatch: true,
     costWithinOffer: true,
-    costMsats: r.costMsats,
+    costMsats: r.costMsats ?? (typeof r.receipt.cost_msats === "number" ? r.receipt.cost_msats : undefined),
     ownUsage: r.ownUsage ?? (status < 300 ? (r.receipt.usage as UpstreamUsageEvent | undefined) : undefined),
     provider: conn.provider,
     deposit: { msat: conn.depositMsat, releasedMsat: backMsat, outcome: conn.deposit },
