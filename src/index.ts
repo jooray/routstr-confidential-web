@@ -87,6 +87,8 @@ export {
   offerSupportsHttp2,
   offerSupportsHttp2Images,
   offerSupportsImages,
+  pinnedModelId,
+  upstreamModelsProblem,
   validateImagesOffer,
   verifyConfidentialOffer,
   verifyOfferSignature,

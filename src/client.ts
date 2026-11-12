@@ -47,6 +47,7 @@ import {
   offerFramingsFor,
   offerImages,
   offerSessionFeeMsat,
+  pinnedModelId,
   verifyConfidentialOffer,
   type ConfidentialFraming,
   type ConfidentialImagesOffer,
@@ -946,7 +947,8 @@ export class ConfidentialClient {
       throw new ConfidentialError("offer_malformed", `the node does not serve ${model} confidentially`);
     }
     const maxTokens = requestedMaxTokens(params, Number(offer.max_tokens_cap ?? 4096));
-    const body = buildPinnedBody(params, model, maxTokens, offer.chat);
+    // The suffix pins the provider's id (`upstream_models`); the request names the public one.
+    const body = buildPinnedBody(params, pinnedModelId(offer, model), maxTokens, offer.chat);
     const pw = this.prewarmer;
     // The request's start: it may first wait for a connection, and that wait belongs in its timings.
     const tRequest = Date.now();
