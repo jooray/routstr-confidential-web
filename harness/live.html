@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' blob:; connect-src 'self' https: wss: http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; style-src 'self' 'unsafe-inline'" />
+    <title>v3 live check</title>
+  </head>
+  <body style="font: 14px system-ui; padding: 16px">
+    <h1 style="font-size: 16px">Confidential client: protocol v3 live check (test harness)</h1>
+    <p>Driven by <code>scripts/browser-live-v3.mjs</code> against a local node; the wasm runs in the library's Web Worker.</p>
+    <pre id="out">waiting for the driver…</pre>
+    <script type="module" src="./src/live.ts"></script>
+  </body>
+</html>
