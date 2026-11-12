@@ -39,6 +39,7 @@
 
 import { createHash, randomUUID, type Sha256Hash } from "./hash.js";
 import { concat, hex } from "./bytes.js";
+import { padBody, type PadBucket } from "./suffix.js";
 import { verifySchnorrSignature } from "./canonical.js";
 import {
   ConfidentialError,
@@ -63,6 +64,7 @@ import {
   checkPiWinFinalRecord,
   checkPiWinParams,
   decodeBlock,
+  errorHeadPrefixProblem,
   frame,
   frameHeader,
   latin1,
@@ -188,6 +190,12 @@ export interface ConfidentialConnectionOptions {
    * is sent. Default `DEFAULT_MAX_CONNECTION_DEPOSIT_MSAT`.
    */
   maxDepositMsat?: number;
+  /**
+   * Framing "2": top the proof channel up after the head and after each
+   * settled request (PROTOCOL-V3.md §9.2), so later requests' proofs do not
+   * extend their correlations on the request path. Default true.
+   */
+  topUp?: boolean;
   /** Structured event sink (never receives secrets). */
   onEvent?: (event: Record<string, unknown>) => void;
 }
@@ -228,6 +236,11 @@ export interface ConnectionRequestOptions {
   image?: { variant: string; count: number };
   /** The whole JSON body; it must end with the canonical suffix. */
   body: Uint8Array;
+  /**
+   * Optional body-size bucket (`paddedBodyLength`; off when absent): the body
+   * is padded with JSON whitespace before the suffix to the bucket.
+   */
+  padBucket?: PadBucket;
   onResponseHead?: (head: { status: number; statusText: string; headers: Record<string, string> }) => void;
   onResponseBody?: (chunk: Uint8Array) => void;
 }
@@ -499,6 +512,7 @@ export class ConfidentialConnection {
   private readonly prover: WasmProverBackend;
   private readonly twoPcFactory?: () => TwoPcSession;
   private readonly proofChannelFactory?: () => ProofChannel;
+  private readonly topUpOn: boolean;
   private readonly expectedPubkey: string;
   private readonly timeouts: typeof TIMEOUTS;
   private readonly chunk: number;
@@ -647,6 +661,7 @@ export class ConfidentialConnection {
     this.WS = options.webSocketImpl ?? WebSocket;
     this.twoPcFactory = options.twoPcFactory;
     this.proofChannelFactory = options.proofChannelFactory;
+    this.topUpOn = options.topUp ?? true;
     this.expectedPubkey = options.expectedPubkey ?? options.offer.notary_pubkey;
     this.timeouts = { ...TIMEOUTS, ...(options.timeouts ?? {}) };
     this.prover = new WasmProverBackend(this.host, this.timeouts.proof, this.WS);
@@ -1259,6 +1274,7 @@ export class ConfidentialConnection {
       claimMs: this.tOpen - t0,
     });
     this.event({ ev: "open", http: "2", ...this.setupTimings });
+    this.topUp();
   }
 
   private sendSettingsSeen(): void {
@@ -1389,6 +1405,29 @@ export class ConfidentialConnection {
     const p = this.proofChain.then(run, run);
     this.proofChain = p.catch(() => {});
     return p;
+  }
+
+  /**
+   * Framing "2", idle (after the head, after a settled request): top the
+   * proof channel up for the next request (§9.2). Queued with the proofs, so
+   * the next request's first proof waits for it (it is not cancelled: the
+   * extension runs in lockstep with the node). A failed top-up fails the
+   * channel and so the connection, as a failed proof would.
+   */
+  private topUp(): void {
+    const ch = this.zkChan;
+    if (!this.topUpOn || this.framing !== "2" || !ch?.used || ch.failed || this.failure || !this.usable) return;
+    const run = async (): Promise<void> => {
+      if (this.failure || ch.failed) return;
+      try {
+        const t = await ch.topup(this.timeouts.proof);
+        if (t?.granted) this.event({ ev: "topup", before: t.before, after: t.after, bytes: t.bytes, ms: t.ms });
+      } catch (e) {
+        this.fail(e instanceof ConfidentialError ? e : new SessionProtocolError(`proof channel top-up: ${e instanceof Error ? e.message : String(e)}`));
+      }
+    };
+    const p = this.proofChain.then(run, run);
+    this.proofChain = p.catch(() => {});
   }
 
   // --- frames -------------------------------------------------------------------
@@ -1586,7 +1625,8 @@ export class ConfidentialConnection {
    * node refused the request: the connection is then as it was, and the next
    * request carries the same number.
    */
-  request(opts: ConnectionRequestOptions): ConnectionRequestHandle {
+  request(requestOpts: ConnectionRequestOptions): ConnectionRequestHandle {
+    let opts = requestOpts;
     if (!this.idle) {
       throw this.failure ?? new SessionRejectedError("the connection cannot take a request now");
     }
@@ -1600,10 +1640,11 @@ export class ConfidentialConnection {
         ? renderImageSuffix(opts.model, image.count, imageCountKey(offer.images!), offer.images!.fixed_pins, image.variant.pins)
         : canonicalSuffix(this.offer.chat, opts.model, opts.maxTokens),
     );
-    const body = opts.body;
-    if (body.length <= suffix.length || !suffix.every((b, i) => body[body.length - suffix.length + i] === b)) {
+    const given = opts.body;
+    if (given.length <= suffix.length || !suffix.every((b, i) => given[given.length - suffix.length + i] === b)) {
       throw new SessionProtocolError("request body does not end with the pinned suffix");
     }
+    if (opts.padBucket !== undefined) opts = { ...opts, body: padBody(given, suffix.length, opts.padBucket) };
     const n = this.requests + 1;
     const cur: Cur = {
       n,
@@ -1840,6 +1881,7 @@ export class ConfidentialConnection {
     this.tLastSettled = tEnd;
     this.settled++;
     this.kick();
+    if (status < 300) this.topUp();
 
     // An accepted image response is handed on in the pieces it arrived in (held once).
     const accepted = cur.image !== undefined && status < 300;
@@ -2311,11 +2353,15 @@ export class ConfidentialConnection {
       "our records to be proven",
       this.timeouts.proof,
     );
-    const head = cur.head!;
-    const rec = this.reader.recordAt(head.off);
-    if (rec.start !== head.off) {
-      throw new ResponseVerificationError("the error head does not start a server record: it cannot be disclosed");
-    }
+    // R runs from byte 0 of the record that holds the response HEADERS frame
+    // to that frame's end (§5.4); the frames before it in the record are
+    // disclosed too, so they may only be ones that carry nothing of ours.
+    const frameHead = cur.head!;
+    const rec = this.reader.recordAt(frameHead.off);
+    const prefix = this.reader.slice(rec.start, frameHead.off);
+    const problem = errorHeadPrefixProblem(prefix, cur.stream);
+    if (problem) throw new ResponseVerificationError(`the error head cannot be disclosed: ${problem}`);
+    const head = { off: rec.start, raw: concat(prefix, frameHead.raw) };
     const postIdx = rec.abs - this.hsCipher;
     let keyUpdates = 0;
     let epochStart = 0;

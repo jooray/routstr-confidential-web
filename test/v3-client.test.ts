@@ -407,6 +407,42 @@ describe("a refused request (§12.4)", () => {
   });
 });
 
+describe("offer_changed with unchanged terms, padding, evicted", () => {
+  it("offer_changed closes the connection even when the refetched offer has the same terms", async () => {
+    mockNodeOffer();
+    let refused = 0;
+    const { connect, request } = fakeConnections((conn, n) =>
+      conn.sid.startsWith("00000001") && n === 2 && refused++ === 0 ? { refuse: { status: 409, reason: "offer_changed" } } : {},
+    );
+    const c = client();
+    await chat(c);
+    const { r } = await chat(c);
+    expect([r.n, r.connection]).toEqual([1, "new"]);
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("padBucket reaches the connection's request", async () => {
+    mockNodeOffer();
+    const { request } = fakeConnections();
+    await chat(client({ padBucket: "pow2" }));
+    expect((request.mock.calls[0]![0] as ConnectionRequestOptions).padBucket).toBe("pow2");
+  });
+
+  it("an idle connection the node evicted is never reused: the next request opens its own", async () => {
+    mockNodeOffer();
+    const { connect } = fakeConnections();
+    const c = client();
+    await chat(c);
+    const conn = (connect.mock.contexts[0] as any);
+    conn.closedReason = "evicted";
+    conn.goaway = true;
+    const { r } = await chat(c);
+    expect([r.n, r.connection]).toEqual([1, "new"]);
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("a pooled connection is a cache, never a promise", () => {
   it("runs the request on a fresh connection when the pooled one fails before the release", async () => {
     mockNodeOffer();

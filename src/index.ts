@@ -101,11 +101,11 @@ export type {
   ImagePin,
   VerifiedOffer,
 } from "./offer.js";
-export { checkH2Offer, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, FrameReader, requestBlock, splitBody } from "./h2.js";
+export { checkH2Offer, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, errorHeadPrefixProblem, FrameReader, requestBlock, splitBody } from "./h2.js";
 export { checkPiC3SParams, checkPiNKParams, headRouteProblem, headTemplateProblem } from "./params.js";
 export { checkUpstreamErrorReceipt, maxChargeMsats, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt.js";
 export { canonicalJson, npubToHex, verifySchnorrSignature } from "./canonical.js";
-export { canonicalSuffix } from "./suffix.js";
+export { canonicalSuffix, MAX_BODY_LEN, padBody, paddedBodyLength, type PadBucket } from "./suffix.js";
 export { buildPinnedBody, requestedMaxTokens, SseParser, aggregateChatCompletion } from "./request.js";
 export { mintInputFees, NodeApi, NodeApiError } from "./node-api.js";
 export type { BalanceInfo, LightningInvoice, LightningInvoiceStatus, MintFee, NodeModel } from "./node-api.js";
@@ -114,6 +114,6 @@ export type { ModelPricing } from "./pricing.js";
 export { InlineWasmHost, WorkerWasmHost, getDefaultWasmHost, setDefaultWasmHost } from "./wasm/host.js";
 export type { WasmHost } from "./wasm/host.js";
 export { TwoPcSession } from "./twopc.js";
-export { ProofChannel } from "./zkchan.js";
+export { ProofChannel, type ProofChannelTopup } from "./zkchan.js";
 export { probeProviderTls } from "./diagnostics.js";
 export type { TlsProbeResult } from "./diagnostics.js";

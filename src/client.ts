@@ -67,6 +67,7 @@ import {
 import { ConnectionPool, poolKey, type Http2Options, type PoolLease } from "./pool.js";
 import { requestResult, type ConfidentialRequestResult } from "./result.js";
 import { checkImageResponse } from "./wire.js";
+import type { PadBucket } from "./suffix.js";
 import { getDefaultWasmHost, type WasmHost } from "./wasm/host.js";
 
 export interface PrewarmOptions {
@@ -143,6 +144,15 @@ export interface ConfidentialClientOptions {
    * cannot link them by it (§9.1). Default: one scope for the credential.
    */
   reuseScope?: string;
+  /**
+   * Optional body-size bucket (off by default): pad each request body with
+   * JSON whitespace before the pinned suffix to the next multiple of this many
+   * bytes, or to the next power of two (`"pow2"`), so observers of the
+   * client–node and node–provider connections (and the provider) see the
+   * bucket, not the exact size. Costs upload bytes; the node still learns the
+   * prompt's token count at settlement (PROTOCOL-V3.md §9.3).
+   */
+  padBucket?: PadBucket;
   /** Keep one connection armed while the page is visible and the key is funded. */
   prewarm?: boolean | PrewarmOptions;
   /** Called once per client when the node's offer names an older protocol (`node_protocol_outdated`). */
@@ -250,6 +260,12 @@ export function isOfferExpired(e: unknown): boolean {
   const reason = e instanceof RequestRefusedError ? e.reason : "";
   const named = (t: string | undefined) => t === "offer_expired" || t === "offer_changed" || t === "session_fee_not_accepted";
   return e.status === 409 && (named(d?.error?.type) || named(reason));
+}
+
+/** A request the node refused because the connection's terms are no longer served (`offer_changed`). */
+function offerChangedRefusal(e: RequestRefusedError): boolean {
+  const d = e.nodeDetail as { error?: { type?: string } } | undefined;
+  return e.reason === "offer_changed" || d?.error?.type === "offer_changed";
 }
 
 /**
@@ -736,6 +752,7 @@ export class ConfidentialClient {
           maxTokens: spec.maxTokens,
           image: spec.image,
           body: spec.body,
+          padBucket: this.opts.padBucket,
           onResponseHead: (h) => {
             state.headSeen = true;
             spec.onResponseHead?.(h);
@@ -763,8 +780,12 @@ export class ConfidentialClient {
         return r;
       } catch (error) {
         const refused = error instanceof RequestRefusedError;
-        // A refused request leaves its connection usable: it goes back to the pool.
+        // A refused request leaves its connection usable: it goes back to the
+        // pool. Except `offer_changed`: the node takes no further request on a
+        // connection whose terms it no longer serves (§3.3), so the retry with
+        // the refetched offer opens a new one.
         if (oneOff) conn.close("one-off bearer");
+        else if (refused && offerChangedRefusal(error)) conn.close("offer_changed");
         lease.release();
         traffic.done();
         if (refused || handle.bodyReleased || state.headSeen || signal?.aborted || attempt >= 3) throw error;
