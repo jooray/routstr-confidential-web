@@ -3,13 +3,13 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at ccef4ba (branch `v3-h2`, protocol v3; the base is
+`jooray/routstr-confidential` at 55f381e (branch `v3-h2`, protocol v3; the base is
 recorded in `crates/vendor/UPSTREAM`), and `git apply` of it there
 reproduces `crates/vendor/` byte for byte (`cu-crypto` needs no change and
 is a plain copy):
 
 ```bash
-cd routstr-confidential && git checkout ccef4ba && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
+cd routstr-confidential && git checkout 55f381e && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
 cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```

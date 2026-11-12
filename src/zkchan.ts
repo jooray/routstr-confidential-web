@@ -4,8 +4,9 @@
  * `zkchan` socket (`/v1/confidential/zk?proof=zkchan`). The OT/VOLE setup of
  * π_NK and of the client's proofs (π_WIN, π_C3S: any number, per request and
  * per control record) runs while the connection is armed; each proof then
- * only runs QuickSilver over existing correlations (the channel extends them
- * online when they run out). If the channel fails before any proof started on
+ * only runs QuickSilver over existing correlations. On a kept framing-"2"
+ * connection the correlations are topped up between requests (`topup`,
+ * PROTOCOL-V3.md §9.2); a proof that still runs short extends them online. If the channel fails before any proof started on
  * it, the connection falls back to the per-proof path; after that a failure
  * ends the connection.
  */
@@ -28,6 +29,18 @@ export interface ProofChannelResult {
 /** Most bytes a proof channel may receive over its connection's life (1 GiB). */
 export const ZKCHAN_MAX_INBOUND = 1 << 30;
 
+/** What one top-up did (PROTOCOL-V3.md §9.2). */
+export interface ProofChannelTopup {
+  /** The node granted a step and the chain was extended. */
+  granted: boolean;
+  /** Correlations on the proof chain before and after. */
+  before: number;
+  after: number;
+  /** Bytes the top-up moved (both ways). */
+  bytes: number;
+  ms: number;
+}
+
 type Pending = { res: (m: ProofChannelResult) => void; rej: (e: Error) => void };
 
 export class ProofChannel {
@@ -35,6 +48,8 @@ export class ProofChannel {
   readonly tStart = Date.now();
   tReady = 0;
   used = false;
+  /** Top-ups the node granted, in order. */
+  readonly topups: ProofChannelTopup[] = [];
   private relay?: DriverRelay;
   private pending = new Map<number, Pending>();
   private nextId = 1;
@@ -172,6 +187,53 @@ export class ProofChannel {
       throw new ProverError(`proof channel: ${proof} checks failed`);
     }
     return m;
+  }
+
+  /**
+   * Between requests on a kept connection: ask the node to top the proof
+   * chain up to one more request's worth (§9.2). The driver runs its commands
+   * in order, so a proof sent meanwhile waits for it. Resolves undefined when
+   * there is nothing to do (no proof ran on the channel yet, or it is closed);
+   * throws, and fails the channel, when the top-up fails.
+   */
+  async topup(ms = 60_000): Promise<ProofChannelTopup | undefined> {
+    if (this.failureErr || this.closed || !this.used) return undefined;
+    const id = this.nextId++;
+    const m = await new Promise<ProofChannelResult & Partial<ProofChannelTopup>>((res, rej) => {
+      const t = setTimeout(() => {
+        this.pending.delete(id);
+        rej(new ProverError(`proof channel: top-up timed out (${ms}ms)`));
+      }, ms);
+      this.pending.set(id, {
+        res: (r) => {
+          clearTimeout(t);
+          res(r);
+        },
+        rej: (e) => {
+          clearTimeout(t);
+          rej(e);
+        },
+      });
+      this.relay?.command({ cmd: "topup", id, timeout_ms: ms });
+    }).catch((e: unknown) => {
+      const err = e instanceof Error ? e : new ProverError(String(e));
+      this.fail(err);
+      throw err;
+    });
+    if (!m.ok) {
+      const err = new ProverError(`proof channel: top-up failed: ${m.err ?? "unknown"}`);
+      this.fail(err);
+      throw err;
+    }
+    const done: ProofChannelTopup = {
+      granted: m.granted === true,
+      before: Number(m.before ?? 0),
+      after: Number(m.after ?? 0),
+      bytes: Number(m.bytes ?? 0),
+      ms: Number(m.ms ?? 0),
+    };
+    if (done.granted) this.topups.push(done);
+    return done;
   }
 
   close(): void {

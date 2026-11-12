@@ -120,6 +120,10 @@ async fn zkchan_driver_against_node_channel() {
         let fx = zkbench::fixtures::all();
         let mut served = Vec::new();
         while let Ok(Some(req)) = ch.next_request().await {
+            if req.proof == "topup" {
+                ch.serve_topup(true).await.unwrap();
+                continue;
+            }
             let (_, params, witness) = fx.iter().find(|(n, _, _)| *n == req.proof).unwrap();
             let w = if req.proof == "pi_nk" { Some(witness) } else { None };
             let r = ch.serve(&req.proof, params, w).await.unwrap();
@@ -140,6 +144,21 @@ async fn zkchan_driver_against_node_channel() {
         assert_eq!(d["ok"], true, "{name}: {d}");
         eprintln!("zkchan: {name} ok");
     }
+    // Between requests: a top-up refills the proof chain (one step), a second
+    // finds it full; the next proof only consumes.
+    cmd(&input, json!({"cmd":"topup","id":20,"timeout_ms":60000}));
+    let d = next_ev(&mut ev, "done").await;
+    assert_eq!((d["ok"].as_bool(), d["granted"].as_bool()), (Some(true), Some(true)), "{d}");
+    assert!(d["bytes"].as_u64().unwrap() > 100_000, "{d}");
+    cmd(&input, json!({"cmd":"topup","id":21}));
+    let d = next_ev(&mut ev, "done").await;
+    assert_eq!((d["ok"].as_bool(), d["granted"].as_bool(), d["bytes"].as_u64()), (Some(true), Some(false), Some(0)), "{d}");
+    let (_, wp, ww) = zkbench::fixtures::all().remove(1);
+    cmd(&input, json!({"cmd":"prove","id":22,"proof":"pi_win","params":wp,"witness":ww}));
+    let d = next_ev(&mut ev, "done").await;
+    assert_eq!(d["ok"], true, "{d}");
+    assert!(d["bytes_recv"].as_u64().unwrap() < 100_000, "the proof after a top-up extended online: {d}");
+    eprintln!("zkchan: top-up ok");
     // Params for another statement than the command names are refused
     // before anything reaches the channel (the channel stays usable).
     let (_, win_params, win_w) = zkbench::fixtures::all().remove(1);
@@ -159,7 +178,7 @@ async fn zkchan_driver_against_node_channel() {
     let end = tokio::time::timeout(std::time::Duration::from_secs(10), ev.next()).await;
     eprintln!("zkchan: output closed {:?}", end.as_ref().map(|v| v.is_none()));
     let served = node.await.unwrap();
-    assert_eq!(served.len(), 3);
+    assert_eq!(served.len(), 4);
     assert!(served.iter().all(|(_, ok)| *ok), "{served:?}");
 }
 

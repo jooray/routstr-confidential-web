@@ -266,6 +266,29 @@ async fn run_channel(
         if name == "close" {
             break;
         }
+        if name == "topup" {
+            // Between requests (PROTOCOL-V3.md §9.2): the node grants one step
+            // of correlations or none; both ends extend in lockstep.
+            let limit = cmd.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(60_000).clamp(1_000, 600_000);
+            let r = match rt::timeout(Duration::from_millis(limit), ch.topup()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    ch.poison();
+                    Err(anyhow::anyhow!("top-up timed out on the proof channel"))
+                }
+            };
+            let ms = ch.take_timings().last().map(|x| (x.ms * 1000.0).round() / 1000.0).unwrap_or(0.0);
+            let (nk, cp) = ch.available();
+            match r {
+                Ok(o) => emit(
+                    &out,
+                    json!({"ev":"done","id":id,"proof":"topup","ok":true,"granted":o.after > o.before,
+                           "before":o.before,"after":o.after,"bytes":o.bytes,"ms":ms,"avail":[nk,cp]}),
+                ),
+                Err(e) => emit(&out, json!({"ev":"done","id":id,"proof":"topup","ok":false,"err":format!("{e:#}"),"ms":ms})),
+            }
+            continue;
+        }
         if name != "prove" && name != "verify" {
             emit(&out, json!({"ev":"done","id":id,"ok":false,"err":format!("unknown command {name:?}")}));
             continue;
@@ -307,13 +330,14 @@ async fn run_channel(
         .await;
         let t = ch.take_timings();
         let (ms, sent, recv) = t.last().map(|x| (x.ms, x.bytes_sent, x.bytes_recv)).unwrap_or((0.0, 0, 0));
+        let (nk, cp) = ch.available();
         match res {
             Ok(checks) => {
                 let cs: Vec<_> = checks.iter().map(|c| json!({"label":c.label,"ok":c.ok})).collect();
                 emit(
                     &out,
                     json!({"ev":"done","id":id,"proof":proof,"ok":true,"checks":cs,
-                           "ms":(ms * 1000.0).round() / 1000.0,"bytes_sent":sent,"bytes_recv":recv}),
+                           "ms":(ms * 1000.0).round() / 1000.0,"bytes_sent":sent,"bytes_recv":recv,"avail":[nk,cp]}),
                 );
             }
             Err(e) => emit(&out, json!({"ev":"done","id":id,"proof":proof,"ok":false,"err":format!("{e:#}"),"ms":ms})),

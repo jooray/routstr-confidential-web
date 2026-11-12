@@ -403,11 +403,11 @@ index f948594..7db6f8e 100644
  rayon = ["mpz-zk/rayon"]
  
 diff --git a/crypto/zkbench/src/channel.rs b/crypto/zkbench/src/channel.rs
-index a731090..62f7aed 100644
+index 46f3b5e..8e2a00b 100644
 --- a/crypto/zkbench/src/channel.rs
 +++ b/crypto/zkbench/src/channel.rs
-@@ -35,7 +35,7 @@
- //!   it, so a cheating prover can never probe a Δ more than once.
+@@ -50,7 +50,7 @@
+ //! client asks for during a top-up waits for it.
  
  use std::sync::Arc;
 -use std::time::Instant;
@@ -415,9 +415,9 @@ index a731090..62f7aed 100644
  
  use anyhow::{Context as _, Result, anyhow, bail};
  use futures::{AsyncRead, AsyncWrite};
-@@ -502,7 +502,7 @@ impl ZkChannel {
+@@ -581,7 +581,7 @@ impl ZkChannel {
  
-         let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64 };
+         let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64, topup: prealloc.topup as u64 };
          ctl.io_mut().send(mine).await.context("proof channel hello")?;
 -        let peer: Hello = tokio::time::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
 +        let peer: Hello = crate::rt::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
