@@ -1,6 +1,6 @@
 /**
- * The client side of the protocol v2 two-party handshake
- * (docs/TWOPC-DESIGN.md in routstr-confidential), run by the wasm build of
+ * The client side of the protocol v3 two-party key schedule (`split-public-1`,
+ * PROTOCOL-V3.md §4 in routstr-confidential), run by the wasm build of
  * `cu-2pc` and bridged to the node's `twopc` WebSocket
  * (`/v1/confidential/zk?proof=twopc`). Same events and commands as the SDK's
  * `twopc.ts`: `key_share`, `hs`, `ap`, `timing`, `error`; `handshake`, `app`.
@@ -9,7 +9,7 @@
  */
 
 import { fromHex, hex } from "./bytes.js";
-import { ProverError } from "./errors.js";
+import { ProverError, TwoPcVersionMismatchError } from "./errors.js";
 import { DriverRelay } from "./relay.js";
 import type { WasmHost } from "./wasm/host.js";
 
@@ -35,6 +35,11 @@ export interface TwoPcTiming {
   bytes_sent?: number;
   bytes_recv?: number;
 }
+
+/** What a 2PC version mismatch means for the user of this page. */
+const TWOPC_MISMATCH_TEXT =
+  "twopc_version_mismatch: this page and the node's sidecar run different versions of the two-party key schedule " +
+  "(this page speaks split-public-1); update the app or use another node";
 
 type Waiter = { res: (m: Record<string, unknown>) => void; rej: (e: Error) => void };
 
@@ -80,6 +85,15 @@ export class TwoPcSession {
     return { sent: this.relay?.bytesSent ?? 0, recv: this.relay?.bytesRecv ?? 0 };
   }
 
+  /** Bytes on the 2PC socket, each way. */
+  get bytesSent(): number {
+    return this.relay?.bytesSent ?? 0;
+  }
+
+  get bytesRecv(): number {
+    return this.relay?.bytesRecv ?? 0;
+  }
+
   private onControl(m: Record<string, unknown>): void {
     const ev = typeof m.ev === "string" ? m.ev : "";
     if (ev === "timing") {
@@ -92,7 +106,12 @@ export class TwoPcSession {
       return;
     }
     if (ev === "error") {
-      this.fail(new ProverError(`2pc: ${String(m.msg ?? "unknown error")}`));
+      const msg = String(m.msg ?? "unknown error");
+      this.fail(
+        m.code === "twopc_version_mismatch" || msg.includes("twopc_version_mismatch")
+          ? new TwoPcVersionMismatchError(`${TWOPC_MISMATCH_TEXT} (${msg.slice(0, 200)})`)
+          : new ProverError(`2pc: ${msg}`),
+      );
       return;
     }
     if (ev === "exit") return;
@@ -147,14 +166,14 @@ export class TwoPcSession {
     return hexField(m, "p", 65);
   }
 
-  /** ECtF + phase A: the handshake traffic secrets. */
+  /** ECtF + stages A1–A3: the handshake traffic secrets. */
   async handshake(serverShare: Uint8Array, thSH: Uint8Array, ms = 15_000): Promise<TwoPcHandshakeSecrets> {
     this.command({ cmd: "handshake", s: hex(serverShare), th_sh: hex(thSH) });
     const m = await this.wait("hs", ms);
     return { clientHs: hexField(m, "c_hs", 32), serverHs: hexField(m, "s_hs", 32) };
   }
 
-  /** Phase B: s_ap_0 and c_ap_1 for us; h1, h2, hk public. */
+  /** Stages B1, B2: s_ap_0 and c_ap_1 for us; h1, h2, hk public. */
   async application(thSF: Uint8Array, ms = 30_000): Promise<TwoPcApplicationSecrets> {
     this.command({ cmd: "app", th_sf: hex(thSF) });
     const m = await this.wait("ap", ms);

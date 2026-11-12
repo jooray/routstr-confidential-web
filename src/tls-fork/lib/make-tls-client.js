@@ -146,6 +146,18 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             }, 'decrypted wrapped record');
             recordRecvCount += 1;
         }
+        // FORK PATCH (TLS-16): once TLS 1.3 record protection is on (the
+        // handshake keys are installed after the ServerHello), a plaintext
+        // handshake or alert record is not the server's (RFC 8446 §5: only
+        // the compatibility ChangeCipherSpec stays in plaintext). A plaintext
+        // KeyUpdate would otherwise rotate the read key, and a plaintext
+        // close_notify end the connection as if the server had closed it.
+        if (ctx.type === 'plaintext'
+            && connTlsVersion === 'TLS1_3'
+            && keys
+            && (type === PACKET_TYPE.HELLO || type === PACKET_TYPE.ALERT)) {
+            throw new Error(`plaintext record of type ${type} after the TLS 1.3 handshake keys were installed`);
+        }
         onRead?.({ content, header }, ctx);
         if (type === PACKET_TYPE.WRAPPED_RECORD
             || type === PACKET_TYPE.HELLO) {
@@ -429,6 +441,17 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             }
         }
         else if (contentType === CONTENT_TYPE_MAP.APPLICATION_DATA) {
+            // FORK PATCH (TLS-15): application data only under the
+            // application traffic keys, i.e. after the server Finished
+            // verified. Before that a record is under the handshake traffic
+            // secret, which in protocol v2 the node holds (c_hs and s_hs are
+            // public outputs of the two-party key schedule): it would be the
+            // node's bytes handed to the caller as the server's. Application
+            // data is not in the transcript, so CertificateVerify and
+            // Finished do not notice such a record.
+            if (!handshakeDone) {
+                throw new Error('application data before the handshake completed');
+            }
             logger.trace({ len: record.length }, 'received application data');
             onApplicationData?.(record);
         }
@@ -921,6 +944,25 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             };
             recordSendCount = 0;
             logger.info('updated client traffic keys');
+        },
+        // FORK PATCH (v3): write one record whose whole inner plaintext the
+        // caller supplies: content, the inner content type byte and any zero
+        // padding (RFC 8446 §5.4). Protocol v3 (`http: 2`) sends exactly one
+        // HTTP/2 frame per record, up to the full 2^14 bytes of content.
+        async writeInner(inner) {
+            if (!handshakeDone) {
+                throw new Error('Handshake not done');
+            }
+            if (keyUpdateReplyOwed) {
+                throw new Error('Server KeyUpdate with update_requested before the client finished writing is not supported');
+            }
+            if (connTlsVersion !== 'TLS1_3' || inner.length < 1 || inner.length > 16385) {
+                throw new Error('writeInner: one TLS 1.3 inner plaintext of 1..16385 bytes');
+            }
+            await writeEncryptedPacket({
+                data: inner,
+                type: 'WRAPPED_RECORD'
+            });
         },
         async write(data) {
             if (!handshakeDone) {

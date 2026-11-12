@@ -10,7 +10,7 @@
 import { hex, sha256 } from "./bytes.js";
 import { verifySchnorrSignature } from "./canonical.js";
 import { ReceiptVerificationError } from "./errors.js";
-import type { ConfidentialReceipt } from "./session.js";
+import type { ConfidentialReceipt } from "./wire.js";
 import type { UpstreamUsageEvent } from "./suffix.js";
 
 export interface ReceiptVerificationInput {
@@ -24,7 +24,7 @@ export interface ReceiptVerificationInput {
   /** Our own usage event parsed from the π_C3 disclosure. */
   ownUsage: UpstreamUsageEvent;
   /**
-   * The model the request pinned (π_C2S proves it). The node settles at this
+   * The model the request pinned (π_WIN over the suffix proves it). The node settles at this
    * model's rates and names it in the receipt even when the provider's usage
    * event spells the model differently (an alias, a canonical id, a case
    * change); a receipt naming either is accepted.
@@ -50,21 +50,25 @@ export interface ReceiptVerificationResult {
 }
 
 /**
- * The most a node may charge for a usage at the signed offer's terms:
- * ceil((in·prompt + out·completion)/1000) + the session fee. The rates already
- * include any surcharge (the node signs the surcharged price list).
+ * The most a node may charge for a usage at the signed offer's terms: the
+ * usage priced at the signed rates (below) + the session fee. The rates
+ * already include any surcharge (the node signs the surcharged price list).
  *
- * Cached prompt tokens may be billed at `cached_in` (never above `in`), and
- * prompt-cache writes at `cache_write` (`in` when the offer has none). The
- * node computes its charge as
+ * The node computes its charge from the same disclosed usage as
  * ceil((in·(prompt−cached−written) + min(cached_in, in)·cached
  *       + cache_write·written + out·completion)/1000)
- * in floating point, `written` being the first positive count of
+ * in floating point (routstr-core `frozen_cost_msats`): cached prompt tokens
+ * at `cached_in` (never above `in`), prompt-cache writes at `cache_write`
+ * (`in` when the offer has none), `written` being the first positive count of
  * `prompt_tokens_details.{cache_creation_input_tokens, cache_write_tokens,
  * cache_creation_tokens}` or the top-level `cache_creation_input_tokens`
- * (at most prompt−cached). The bound is the largest of that formula, the one
- * without writes and the uncached one, so an honest receipt is never refused
- * for rounding or for a count the node did not read.
+ * (at most prompt−cached).
+ *
+ * The bound is that formula, computed in the same order, or the same formula
+ * with the writes billed at `in` when that is larger (a node that did not
+ * read a write count bills them so). It is never the uncached price for a
+ * usage that reports cached reads: the node reads the same usage, so a
+ * charge that ignores the cache discount is an overcharge.
  */
 export function maxChargeMsats(
   priceEntry: { in: number; out: number; cached_in?: number; cache_write?: number },
@@ -100,7 +104,8 @@ export function maxChargeMsats(
             1000,
         )
       : withCached;
-  return Math.max(uncached, withCached, withWrites) + Math.max(0, sessionFeeMsat);
+  // `withCached` is the uncached price when no cached reads are reported.
+  return Math.max(withCached, withWrites) + Math.max(0, sessionFeeMsat);
 }
 
 /** Prompt-cache writes as the node reads them: nested names first, then
@@ -133,57 +138,47 @@ function tokenCount(v: unknown): number {
 
 /**
  * A charge without usage: at most the given signed fee (the session fee for a
- * 429/503/401/402/403; the abandon fee for a rejected request or for a session that ended
- * without a request reaching the provider).
+ * provider refusal, 429/503/401/402/403; the abandon fee for a session that ended without
+ * a request reaching the provider).
  */
 export function feeOnlyChargeOk(costMsats: number | undefined, sessionFeeMsat = 0): boolean {
   return (costMsats ?? 0) <= Math.max(0, sessionFeeMsat);
 }
 
 /**
- * What a provider error costs. A client-caused 4xx is charged the abandon
- * fee: the node did the 2PC for a request the provider rejected. A 429 or 503
- * (the provider's own limit or capacity) or a 401, 402 or 403 (the node's own
- * provider key or account) costs the session fee. Any other error is charged
- * up to the session's reservation, which is what the node charges when it
- * cannot attribute the provider's work (`undefined`).
+ * What a provider error costs, by status: a refusal for capacity (429, 503) or
+ * for the node's own key or account (401, 402, 403) costs the session fee; any
+ * other 4xx is a request the provider refused for its own content, so the
+ * client pays the abandon fee (the node ran the 2PC for it); any other error
+ * the session's reservation.
  */
-export function errorStatusChargeMsat(status: number, sessionFeeMsat = 0, abandonFeeMsat = 0): number | undefined {
-  const fs = Math.max(0, sessionFeeMsat);
-  if ([401, 402, 403, 429, 503].includes(status)) return fs;
-  if (status >= 400 && status < 500) return Math.max(fs, abandonFeeMsat);
-  return undefined;
-}
-
-/** The terms of an image session, which its error receipt must name too. */
-export interface ImageSessionTerms {
-  model: string;
-  variant: string;
-  count: number;
-  msatPerImage: number;
+export function errorStatusCharge(status: number): "abandon_fee" | "session_fee" | "reservation" {
+  if ([401, 402, 403, 429, 503].includes(status)) return "session_fee";
+  if (status >= 400 && status < 500) return "abandon_fee";
+  return "reservation";
 }
 
 /**
  * A receipt for an upstream HTTP error (no usage event to price). It must name
- * the status we saw ourselves (returned as the usage match). A 4xx/429/503
- * costs at most the signed fee `errorStatusChargeMsat` names (less only favours
- * us); any other error
- * at most the session's reservation, and for an image session at most
- * `msat_per_image × count + max(session fee, abandon fee)`. An image session's
- * error receipt must also carry its kind, model, variant and count. A charge or
- * terms outside these bounds throw.
+ * the status we saw ourselves (returned as the usage match), and cost at most
+ * what that status is billed (`errorStatusCharge`, at the signed fees). For an
+ * image session the receipt must also carry the session's image terms, and
+ * even the reservation is bounded by them: price × count plus the larger fee.
+ * A charge outside these bounds throws.
  */
 export function checkUpstreamErrorReceipt(
   receipt: ConfidentialReceipt,
   status: number,
   sessionFeeMsat = 0,
-  abandonFeeMsat = 0,
-  image?: ImageSessionTerms,
+  options: {
+    abandonFeeMsat?: number;
+    image?: { model: string; variant: string; count: number; msatPerImage: number };
+  } = {},
 ): boolean {
   const ru = receipt.usage as unknown as { error_status?: unknown } | undefined;
   const usageMatch = ru?.error_status === status;
   const fee = Math.max(0, sessionFeeMsat);
-  const abandon = Math.max(fee, abandonFeeMsat);
+  const abandon = Math.max(fee, options.abandonFeeMsat ?? 0);
   if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
     throw new ReceiptVerificationError(
       `receipt names a session fee of ${receipt.session_fee_msat} msats, the signed offer ${fee} msats`,
@@ -198,22 +193,27 @@ export function checkUpstreamErrorReceipt(
   if (!isMsatAmount(cost)) {
     throw new ReceiptVerificationError(`receipt cost ${String(receipt.cost_msats)} is not a valid amount`);
   }
+  const image = options.image;
   if (image) {
-    const r = receipt as unknown as Record<string, unknown>;
-    if (r.kind !== "images" || receipt.model !== image.model || r.variant !== image.variant || r.count !== image.count) {
-      throw new ReceiptVerificationError("error receipt does not name this image session's kind, model, variant and count");
-    }
+    const fail = (what: string): never => {
+      throw new ReceiptVerificationError(`image error receipt: ${what}`);
+    };
+    if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+    if (receipt.model !== image.model) fail(`model ${String(receipt.model)} is not ${image.model}`);
+    if (receipt.variant !== image.variant) fail(`variant ${String(receipt.variant)} is not ${image.variant}`);
+    if (receipt.count !== image.count) fail(`count ${String(receipt.count)} is not ${image.count}`);
+    const ceiling = Math.ceil(image.msatPerImage * image.count + abandon);
+    if (cost > ceiling) fail(`cost ${cost} msats exceeds price × count plus the abandon fee (${ceiling} msats)`);
   }
-  const expected = errorStatusChargeMsat(status, fee, abandon);
-  if (expected !== undefined) {
-    if (cost > expected) {
+  const charge = errorStatusCharge(status);
+  if (charge !== "reservation") {
+    const bound = charge === "abandon_fee" ? abandon : fee;
+    if (cost > bound) {
       throw new ReceiptVerificationError(
-        `node charged ${cost} msats for upstream error ${status}; the signed fees allow ${expected} msats`,
+        `node charged ${cost} msats for upstream error ${status}, more than the ${charge.replace("_", " ")} (${bound} msats)`,
       );
     }
-    return usageMatch;
-  }
-  if (cost > fee) {
+  } else if (cost > fee) {
     const reserved = receipt.reserved_msats;
     if (typeof reserved !== "number" || !Number.isFinite(reserved)) {
       throw new ReceiptVerificationError(
@@ -225,13 +225,54 @@ export function checkUpstreamErrorReceipt(
         `node charged ${cost} msats for upstream error ${status}, more than its reservation (${reserved} msats)`,
       );
     }
-    if (image && cost > image.msatPerImage * image.count + abandon) {
-      throw new ReceiptVerificationError(
-        `node charged ${cost} msats for upstream error ${status}, more than the image session's reservation`,
-      );
-    }
   }
   return usageMatch;
+}
+
+/**
+ * A flat-priced (image) receipt: the charge is fixed at setup by the signed
+ * offer, so everything is checked for equality: the model, variant and count
+ * we pinned, the signed price per image, and the cost
+ * `msat_per_image × count + session fee`. Throws on any mismatch.
+ */
+export function verifyFlatReceipt(
+  receipt: ConfidentialReceipt,
+  own: {
+    model: string;
+    variant: string;
+    count: number;
+    /** From the signed offer we verified. */
+    msatPerImage: number;
+    sessionFeeMsat?: number;
+    abandonFeeMsat?: number;
+  },
+): void {
+  const fee = Math.max(0, own.sessionFeeMsat ?? 0);
+  const fail = (what: string): never => {
+    throw new ReceiptVerificationError(`flat receipt: ${what}`);
+  };
+  if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+  if ((receipt.usage as unknown as { flat?: unknown } | undefined)?.flat !== true) fail("usage is not flat");
+  if (receipt.model !== own.model) fail(`model ${String(receipt.model)} is not ${own.model}`);
+  if (receipt.variant !== own.variant) fail(`variant ${String(receipt.variant)} is not ${own.variant}`);
+  if (receipt.count !== own.count) fail(`count ${String(receipt.count)} is not ${own.count}`);
+  if (receipt.msat_per_image !== own.msatPerImage) {
+    fail(`price ${String(receipt.msat_per_image)} msats per image is not the signed ${own.msatPerImage}`);
+  }
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    fail(`session fee ${receipt.session_fee_msat} msats exceeds the signed ${fee}`);
+  }
+  if (
+    typeof receipt.abandon_fee_msat === "number" &&
+    receipt.abandon_fee_msat > Math.max(fee, own.abandonFeeMsat ?? 0)
+  ) {
+    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
+  }
+  // The node charges the price × count plus the fee, rounded up to whole msats.
+  const want = Math.ceil(own.msatPerImage * own.count + fee);
+  if (!isMsatAmount(receipt.cost_msats) || receipt.cost_msats !== want) {
+    fail(`cost ${String(receipt.cost_msats)} msats is not ${want} (price × count + session fee)`);
+  }
 }
 
 export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificationResult {
@@ -276,53 +317,6 @@ export function verifyReceipt(input: ReceiptVerificationInput): ReceiptVerificat
  * over the exact signed bytes, those bytes (not any unsigned envelope) are the
  * receipt, and it must name this session and this session's attestation.
  */
-/**
- * A flat-priced (image) receipt: the charge is fixed at setup, so it must be
- * exactly ceil(`msat_per_image × count + session fee`) at the signed offer's price,
- * for the model, variant and count we asked for.
- */
-export function verifyFlatReceipt(
-  receipt: ConfidentialReceipt,
-  own: {
-    model: string;
-    variant: string;
-    count: number;
-    /** From the signed offer we verified. */
-    msatPerImage: number;
-    sessionFeeMsat?: number;
-    abandonFeeMsat?: number;
-  },
-): void {
-  const fee = Math.max(0, own.sessionFeeMsat ?? 0);
-  const fail = (what: string): never => {
-    throw new ReceiptVerificationError(`flat receipt: ${what}`);
-  };
-  // Every image field is required: a receipt without them would not show
-  // what was billed, even when its cost happens to match.
-  if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
-  if ((receipt.usage as unknown as { flat?: unknown } | undefined)?.flat !== true) fail("usage is not flat");
-  if (receipt.model !== own.model) fail(`model ${String(receipt.model)} is not ${own.model}`);
-  if (receipt.variant !== own.variant) fail(`variant ${String(receipt.variant)} is not ${own.variant}`);
-  if (receipt.count !== own.count) fail(`count ${String(receipt.count)} is not ${own.count}`);
-  if (receipt.msat_per_image !== own.msatPerImage) {
-    fail(`price ${String(receipt.msat_per_image)} msats per image is not the signed ${own.msatPerImage}`);
-  }
-  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
-    fail(`session fee ${receipt.session_fee_msat} msats exceeds the signed ${fee}`);
-  }
-  if (
-    typeof receipt.abandon_fee_msat === "number" &&
-    receipt.abandon_fee_msat > Math.max(fee, own.abandonFeeMsat ?? 0)
-  ) {
-    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
-  }
-  // The node charges the price × count plus the fee, rounded up to whole msats.
-  const want = Math.ceil(own.msatPerImage * own.count + fee);
-  if (!isMsatAmount(receipt.cost_msats) || receipt.cost_msats !== want) {
-    fail(`cost ${String(receipt.cost_msats)} msats is not ${want} (price × count + session fee)`);
-  }
-}
-
 export function parseSignedReceipt(input: {
   receiptJson: string;
   sig?: string;

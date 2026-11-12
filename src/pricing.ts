@@ -7,6 +7,7 @@
 
 import {
   offerAbandonFeeMsat,
+  offerConnectionDepositMsat,
   offerReserveMarginTokens,
   offerSessionFeeMsat,
   type ConfidentialPriceEntry, type VerifiedOffer } from "./offer.js";
@@ -34,21 +35,33 @@ export interface ModelPricing {
    * unused part is released at settlement.
    */
   reservationMsat?: number;
+  /**
+   * The connection deposit of the signed offer (msat): held from a
+   * connection's setup until its first request settles (PROTOCOL-V3 §8).
+   */
+  connectionDepositMsat: number;
+  /**
+   * The available balance a request needs before a new connection is opened
+   * (msat): the deposit plus `reservationMsat`. On a kept connection whose
+   * first request settled, `reservationMsat` is enough.
+   */
+  requiredMsat?: number;
   maxTokens: number;
 }
 
 /**
  * The prompt size the node reserves for: the model's full context length,
- * taken as the node does, the first positive integer of
- * `top_provider.context_length` and `context_length`, in that order.
- * Undefined when neither is one (the node then reserves the model's maximum
- * cost instead).
+ * taken as the node does, the larger of the positive integer
+ * `top_provider.context_length` and `context_length` (the catalogue's
+ * `top_provider` may describe another provider). Undefined when neither is
+ * one (the node then reserves the model's maximum cost instead).
  */
 export function promptLimit(m: NodeModel | undefined): number | undefined {
   if (!m) return undefined;
-  return [m.top_provider?.context_length, m.context_length].find(
+  const known = [m.top_provider?.context_length, m.context_length].filter(
     (cl): cl is number => typeof cl === "number" && Number.isSafeInteger(cl) && cl > 0,
   );
+  return known.length ? Math.max(...known) : undefined;
 }
 
 /** The model's undiscounted maximum cost in sats, from the node's model list. */
@@ -72,7 +85,10 @@ export function reservationMsat(
   const margin = offerReserveMarginTokens(offer);
   const limit = promptLimit(m);
   if (limit !== undefined) {
-    return Math.ceil((limit * rates.in + (maxTokens + margin) * rates.out) / 1000) + fee;
+    // The prompt is opaque and may be all prompt-cache writes: the node prices
+    // it at the dearer of the input and cache-write rates.
+    const inRate = Math.max(rates.in, rates.cache_write ?? 0);
+    return Math.ceil((limit * inRate + (maxTokens + margin) * rates.out) / 1000) + fee;
   }
   const maxCost = maxCostSats(m);
   if (maxCost === undefined) return undefined;
@@ -113,6 +129,8 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
       const m = byId.get(id);
       const limit = promptLimit(m);
       const mt = Math.min(maxTokens, offer.max_tokens_cap);
+      const reservation = reservationMsat(offer, rates, m, mt);
+      const deposit = offerConnectionDepositMsat(offer);
       return {
         id,
         name: m?.name,
@@ -123,7 +141,9 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
         abandonFeeMsat: offerAbandonFeeMsat(offer),
         rateSurchargePct: pct,
         maxTokens: mt,
-        reservationMsat: reservationMsat(offer, rates, m, mt),
+        reservationMsat: reservation,
+        connectionDepositMsat: deposit,
+        requiredMsat: reservation === undefined ? undefined : reservation + deposit,
       };
     })
     .sort((a, b) => a.id.localeCompare(b.id));

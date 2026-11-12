@@ -59,7 +59,7 @@ export function sourceDigest(root = ROOT) {
 
 /** The buildInfo string embedded in a wasm binary, if any. */
 export function embeddedBuildInfo(wasm) {
-  const m = /client-wasm [0-9.]+ \(protocol v2; routstr-confidential@[^,]*, mpz2@[^,]*, src:[0-9a-f]{16}\)/.exec(
+  const m = /client-wasm [0-9.]+ \(protocol v3, twopc split-public-1; routstr-confidential@[^,]*, mpz2@[^,]*, src:[0-9a-f]{16}\)/.exec(
     Buffer.from(wasm).toString("latin1"),
   );
   return m?.[0];

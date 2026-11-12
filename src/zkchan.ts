@@ -1,11 +1,13 @@
 /**
- * Protocol v2 proof channel: one long-lived wasm `cu-prover --channel` driver
- * per session, bridged to the node's `zkchan` socket
- * (`/v1/confidential/zk?proof=zkchan`). The OT/VOLE setup of π_NK, π_C2S and
- * π_C3S runs while the session is armed; each proof at claim time then only
- * runs QuickSilver over existing correlations. If the channel fails before
- * any proof started on it, the session falls back to the per-proof path;
- * after that a failure ends the session.
+ * A connection's proof channel (protocol v3): one long-lived wasm
+ * `cu-prover --channel` driver per connection, bridged to the node's
+ * `zkchan` socket (`/v1/confidential/zk?proof=zkchan`). The OT/VOLE setup of
+ * π_NK and of the client's proofs (π_WIN, π_C3S: any number, per request and
+ * per control record) runs while the connection is armed; each proof then
+ * only runs QuickSilver over existing correlations (the channel extends them
+ * online when they run out). If the channel fails before any proof started on
+ * it, the connection falls back to the per-proof path; after that a failure
+ * ends the connection.
  */
 
 import { ProverError } from "./errors.js";
@@ -22,6 +24,9 @@ export interface ProofChannelResult {
   bytes_recv?: number;
   err?: string;
 }
+
+/** Most bytes a proof channel may receive over its connection's life (1 GiB). */
+export const ZKCHAN_MAX_INBOUND = 1 << 30;
 
 type Pending = { res: (m: ProofChannelResult) => void; rej: (e: Error) => void };
 
@@ -50,6 +55,15 @@ export class ProofChannel {
     this.readyP.catch(() => {});
   }
 
+  /** Bytes on the proof-channel socket, each way. */
+  get bytesSent(): number {
+    return this.relay?.bytesSent ?? 0;
+  }
+
+  get bytesRecv(): number {
+    return this.relay?.bytesRecv ?? 0;
+  }
+
   start(url: string): void {
     this.relay = new DriverRelay({
       host: this.host,
@@ -58,6 +72,11 @@ export class ProofChannel {
       url,
       webSocketImpl: this.opts.webSocketImpl,
       label: "proof channel",
+      // A kept framing-"2" connection runs a π_WIN and a π_C3S per request
+      // (up to the offer's h2.max_requests, 100 on the shipped node) and
+      // extends its correlations online: the per-socket budget is the
+      // connection's, not one session's.
+      maxInbound: ZKCHAN_MAX_INBOUND,
       onEvent: (m) => this.onControl(m),
       onFailure: (e) => this.fail(e),
       closeIsNormal: () => this.closed,

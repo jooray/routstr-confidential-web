@@ -5,7 +5,6 @@
  * routstr-sdk `transport.ts` / `prewarm.ts`.
  */
 
-import { endsWith } from "./bytes.js";
 import { ConfidentialError, SessionProtocolError } from "./errors.js";
 import { CHAT_PROTOCOL_KEYS, type ChatSuffixSpec, canonicalSuffix, samePinValue } from "./suffix.js";
 
@@ -24,6 +23,17 @@ export function buildPinnedBody(
   const pinned = new Map(chat.fixed_pins);
   const priv: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(request)) {
+    if (k === "n" && v !== undefined && v !== null) {
+      // One completion per request (the offer's pin, else the provider's
+      // default): another count would be answered with one choice and no error.
+      const one = pinned.has("n") ? pinned.get("n") : 1;
+      if (!samePinValue(v, one)) {
+        throw new ConfidentialError(
+          "pinned_parameter",
+          `a confidential request returns n = ${JSON.stringify(one)} completion; this request sets n to ${JSON.stringify(v)}`,
+        );
+      }
+    }
     if (CHAT_PROTOCOL_KEYS.has(k)) continue;
     if (pinned.has(k)) {
       if (samePinValue(v, pinned.get(k))) continue;
@@ -34,7 +44,7 @@ export function buildPinnedBody(
     }
     priv[k] = v;
   }
-  // The body must end with the exact suffix π_C2S proves, leading comma
+  // The body must end with the exact suffix π_WIN proves, leading comma
   // included, so it needs at least one private field before it.
   if (Object.keys(priv).length === 0) throw new SessionProtocolError("a confidential request needs its messages");
   const json = JSON.stringify(priv);
@@ -52,37 +62,6 @@ export function requestedMaxTokens(request: Record<string, unknown>, cap: number
     }
   }
   return asked === undefined ? cap : Math.max(1, Math.min(asked, cap));
-}
-
-/**
- * Pad a pinned body to exactly `length` bytes with spaces between the private
- * part and the suffix (JSON allows whitespace before the suffix's comma), so a
- * session armed for length L serves any body ≤ L.
- */
-export function padPinnedBody(body: Uint8Array, length: number, suffix: string): Uint8Array {
-  const s = new TextEncoder().encode(suffix);
-  if (!endsWith(body, s)) throw new RangeError("body does not end with the pinned suffix");
-  if (body.length > length) throw new RangeError(`body ${body.length} exceeds armed length ${length}`);
-  if (body.length === length) return body;
-  const out = new Uint8Array(length);
-  const cut = body.length - s.length;
-  out.set(body.subarray(0, cut), 0);
-  out.fill(0x20, cut, length - s.length);
-  out.set(s, length - s.length);
-  return out;
-}
-
-/** Power-of-two body-length bucket for the largest recent body, with headroom. */
-export function chooseBucket(
-  maxLen: number,
-  opts: { minBucket?: number; maxBucket?: number; headroom?: number } = {},
-): number {
-  const min = opts.minBucket ?? 4096;
-  const max = opts.maxBucket ?? 8 << 20;
-  const want = Math.ceil(Math.max(0, maxLen) * (opts.headroom ?? 1.25));
-  let b = min;
-  while (b < want && b < max) b *= 2;
-  return Math.min(b, max);
 }
 
 /** Incremental SSE `data:` line parser (OpenAI chat-completions stream). */

@@ -1,13 +1,12 @@
 /**
- * Client-side checks of the proof parameters the node sends for π_NK, π_C2S
- * and π_C3S (protocol v2; protocol v1 and its π_C1/π_C2/π_C3 are retired).
+ * Client-side checks of the proof parameters the node sends for π_NK
+ * (framing "1.1"; `h2.ts` has the framing-"2" head and π_WIN) and π_C3S.
  *
  * The client is the prover and the node chooses the public parameters, so the
- * client only proves statements about data it already agreed to disclose: its
- * own final body record carrying the pinned suffix (π_C2S), and the final
- * server records covering its own disclosure (π_C3S). The circuits reveal
- * only an equality bit; these checks make sure the node cannot point even
- * that bit at other plaintext.
+ * client only proves statements about data it already agreed to disclose: the
+ * final server records covering its own disclosure (π_C3S). The circuits
+ * reveal only an equality bit; these checks make sure the node cannot point
+ * even that bit at other plaintext.
  */
 
 import { SessionProtocolError } from "./errors.js";
@@ -22,29 +21,6 @@ function eq(a: Bytes | undefined, b: Bytes): boolean {
 
 function fail(proof: string, what: string): never {
   throw new SessionProtocolError(`${proof}: node-supplied parameters rejected (${what})`);
-}
-
-function checkSuffixWindow(
-  proof: string,
-  p: Record<string, any>,
-  own: { seq: number; record: Uint8Array; suffix: Uint8Array },
-): void {
-  const payload = own.record.subarray(5);
-  const ctLen = payload.length - 16; // inner plaintext length (content + type byte)
-  const selLen = own.suffix.length;
-  const w = Math.min(selLen + 1 + 13, ctLen);
-  const off = ctLen - w;
-  const selStart = w - 1 - selLen;
-  if (selStart < 0) fail(proof, "suffix does not fit in our final record");
-  if (p.seq !== own.seq) fail(proof, `seq ${p.seq} is not our final record ${own.seq}`);
-  // v2 compares our suffix followed by the record's inner content type
-  // (0x17, public too); v1's π_C2 compares the suffix alone.
-  const want = proof === "π_C2S" ? Uint8Array.from([...own.suffix, 0x17]) : own.suffix;
-  if (p.off !== off || p.w !== w || p.sel_start !== selStart || p.sel_len !== want.length) {
-    fail(proof, "window is not the end of our final record");
-  }
-  if (!eq(p.ct_window, payload.subarray(off, off + w))) fail(proof, "ciphertext is not ours");
-  if (!eq(p.expected, want)) fail(proof, "expected bytes are not our suffix");
 }
 
 function checkTailRecords(
@@ -141,21 +117,10 @@ export function firstTailOffset(firstContent: number, rest: number, need: number
 }
 
 // ---------------------------------------------------------------------------
-// Protocol v2 (two-party handshake, docs/TWOPC-DESIGN.md). The proofs anchor
+// The two-party handshake (docs/TWOPC-DESIGN.md). The proofs anchor
 // on public hashes of the secrets our 2PC output gave us (h1 = SHA256(c_ap_1),
 // h2 = SHA256(s_ap_0), hk = SHA256(K_0 ‖ IV_0)).
 // ---------------------------------------------------------------------------
-
-/** π_C2S: the end of our own final epoch-1 body record, anchored on our h1. */
-export function checkPiC2SParams(
-  params: unknown,
-  own: { h1: Uint8Array; seq: number; record: Uint8Array; suffix: Uint8Array },
-): void {
-  const p = (params as { PiC2S?: Record<string, any> } | null)?.PiC2S;
-  if (!p) fail("π_C2S", "missing");
-  if (!eq(p.h1, own.h1)) fail("π_C2S", "anchor h1 is not the one from our 2PC");
-  checkSuffixWindow("π_C2S", p, own);
-}
 
 /** π_C3S: the final server records as we received them, anchored on our h2. */
 export function checkPiC3SParams(
@@ -229,8 +194,8 @@ export function checkPiNKParams(
     offer: { head_template?: string; key_length?: number; key_alphabet?: string; upstream_host?: string };
     hk: Uint8Array;
     bodyLen: number;
-    /** The session's kind: the template must name its route (default chat). */
-    kind?: "chat" | "images";
+    /** Which request the head is for (default chat). */
+    kind?: HeadTemplateKind;
   },
 ): void {
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
@@ -264,8 +229,11 @@ export function checkPiNKParams(
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) fail("π_NK", "c_commit missing");
 }
 
-/** The endpoints a route ends in, per session kind (after the trusted API base). */
-const ROUTE_ENDPOINTS: Record<"chat" | "images", readonly string[]> = {
+/** Which request a head template is for: it decides the path it may name. */
+export type HeadTemplateKind = "chat" | "images";
+
+/** The request paths a head template may name, per kind (no query, no fragment). */
+const TEMPLATE_PATHS: Record<HeadTemplateKind, readonly string[]> = {
   chat: ["/chat/completions"],
   images: ["/image/generate", "/images/generations"],
 };
@@ -276,78 +244,80 @@ const ROUTE_ENDPOINTS: Record<"chat" | "images", readonly string[]> = {
  * `undefined` when it is. The bases come from the caller's trusted-host
  * entry (`TrustedHostMatcher.apiBases`), not from the node.
  */
-export function headRouteProblem(tpl: string, bases: readonly string[], kind: "chat" | "images"): string | undefined {
+export function headRouteProblem(tpl: string, bases: readonly string[], kind: HeadTemplateKind): string | undefined {
   const m = /^POST (\S+) HTTP\/1\.1\r\n/.exec(tpl);
   if (!m) return "template is not an HTTP/1.1 POST";
-  const allowed = bases.flatMap((b) => ROUTE_ENDPOINTS[kind].map((end) => b + end));
+  const allowed = bases.flatMap((b) => TEMPLATE_PATHS[kind].map((end) => b + end));
   return allowed.includes(m[1]!)
     ? undefined
     : `template route ${m[1]} is not one the trusted host allows (${allowed.join(", ")})`;
 }
 
-/** The route a head template may name, per session kind. */
-const TEMPLATE_PATHS: Record<"chat" | "images", RegExp> = {
-  chat: /\/chat\/completions$/,
-  images: /\/(image\/generate|images\/generations)$/,
-};
+/** The headers a head template carries: exactly these, each once, nothing else. */
+const TEMPLATE_HEADERS = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
 
 /** One header line of a head template. */
 const TEMPLATE_HEADER_LINE = /^([A-Za-z0-9-]+): ([\x21-\x7e]+(?: [\x21-\x7e]+)*)$/;
 
 /**
- * The published head template must be one HTTP/1.1 POST request head for the
- * offer's upstream host, on the route of the session's kind (no query), with
- * exactly these headers: `Host` (the upstream host), `Authorization` (the key
- * token), `Content-Type: application/json`, `Accept-Encoding: identity`,
- * `Connection: close` and `Content-Length` (the body length). Any other header
- * could switch on a provider feature, an interim response or a compressed or
- * kept-alive answer the session cannot settle. Each line is in the plain
- * `Name: value` form ending in CR LF, with no other control byte. (The node
- * writes the head, so this is what π_NK lets us hold it to.)
+ * Why a published head template is not acceptable, or `undefined` when it is.
+ * It must be one HTTP/1.1 POST head to the offer's upstream host, for the
+ * kind's endpoint path (no query string: a node must not steer the request to
+ * another provider feature), with exactly the headers a plain JSON request
+ * needs and nothing that changes how the provider answers (`Expect`, `TE`,
+ * `Upgrade`, compression, keep-alive), each line in the plain `Name: value`
+ * form ending in CR LF and no other control byte: the node writes this head,
+ * so this is what π_NK lets the client hold it to.
  */
-export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat" | "images" = "chat"): void {
+export function headTemplateProblem(tpl: string, upstreamHost: string, kind: HeadTemplateKind): string | undefined {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
-  if (count(/\{KEY:\d+\}/g) !== 1) fail("π_NK", "template must carry exactly one {KEY:n} token");
-  if (count(/\{LEN\}/g) !== 1) fail("π_NK", "template must carry exactly one {LEN} token");
-  if (count(/[{}]/g) !== 4) fail("π_NK", "template carries other placeholders");
-  const line = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1\r\n/.exec(tpl);
-  if (!line) fail("π_NK", "template is not an HTTP/1.1 POST");
-  const path = line![1]!;
-  if (/[?#]/.test(path)) fail("π_NK", "template path carries a query or fragment");
-  // A canonical path: no dot segments, empty segments, escapes or parameters
-  // a provider might normalise onto another route.
-  if (!/^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/.test(path)) fail("π_NK", `template path ${path} is not canonical`);
-  if (!TEMPLATE_PATHS[kind].test(path)) fail("π_NK", `template path ${path} is not a ${kind} route`);
+  if (count(/\{KEY:\d+\}/g) !== 1) return "template must carry exactly one {KEY:n} token";
+  if (count(/\{LEN\}/g) !== 1) return "template must carry exactly one {LEN} token";
+  if (count(/[{}]/g) !== 4) return "template carries other placeholders";
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
-    fail("π_NK", "template is not exactly one request head");
+    return "template is not exactly one request head";
   }
   // No control byte but the CR LF that ends each line (no bare CR or LF, no
   // tab, no NUL): a provider and a proxy may split such a head differently.
-  if (/[\x00-\x1f\x7f]/.test(tpl.replace(/\r\n/g, ""))) fail("π_NK", "template carries a control byte");
-  const want: Record<string, (v: string) => boolean> = {
-    host: (v) => !!upstreamHost && v.toLowerCase() === upstreamHost.toLowerCase(),
-    authorization: (v) => /^Bearer \{KEY:\d+\}$/.test(v),
-    "content-type": (v) => v.toLowerCase() === "application/json",
-    "accept-encoding": (v) => v.toLowerCase() === "identity",
-    connection: (v) => v.toLowerCase() === "close",
-    "content-length": (v) => v === "{LEN}",
-  };
-  const seen = new Set<string>();
-  for (const h of tpl.slice(0, -4).split("\r\n").slice(1)) {
+  if (/[\x00-\x1f\x7f]/.test(tpl.replace(/\r\n/g, ""))) return "template carries a control byte";
+  const lines = tpl.slice(0, -4).split("\r\n");
+  const m = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1$/.exec(lines[0] ?? "");
+  if (!m) return "template is not an HTTP/1.1 POST";
+  const path = m[1]!;
+  if (/[?#]/.test(path)) return "template path carries a query or fragment";
+  // A canonical path: no dot segments, empty segments, escapes or parameters
+  // a provider might normalise onto another route.
+  if (!/^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/.test(path)) return `template path ${path} is not canonical`;
+  if (!TEMPLATE_PATHS[kind].some((end) => path.endsWith(end))) {
+    return `template path ${path} is not a ${kind} endpoint`;
+  }
+  const seen = new Map<string, string>();
+  for (const h of lines.slice(1)) {
     // `Name: value`: no space before the colon, one after it, no leading or
     // trailing whitespace, no folded continuation line.
     const hm = TEMPLATE_HEADER_LINE.exec(h);
-    if (!hm) fail("π_NK", "template carries a malformed header line");
-    const name = hm![1]!;
-    const key = name.toLowerCase();
-    // An own key only: `want.constructor` must not admit a `Constructor` header.
-    const check = Object.hasOwn(want, key) ? want[key] : undefined;
-    if (!check) fail("π_NK", `template sets a header outside the allowed set (${name})`);
-    if (seen.has(key)) fail("π_NK", `template sets ${name} twice`);
-    seen.add(key);
-    if (!check!(hm![2]!)) fail("π_NK", `template ${name} has an unexpected value`);
+    if (!hm) return "template carries a malformed header line";
+    const name = hm[1]!.toLowerCase();
+    if (!TEMPLATE_HEADERS.includes(name)) return `template sets the header ${name}`;
+    if (seen.has(name)) return `template repeats the header ${name}`;
+    seen.set(name, hm[2]!);
   }
-  for (const key of Object.keys(want)) {
-    if (!seen.has(key)) fail("π_NK", `template lacks the ${key} header`);
+  for (const name of TEMPLATE_HEADERS) {
+    if (!seen.has(name)) return `template lacks the header ${name}`;
   }
+  if (!upstreamHost || seen.get("host")!.toLowerCase() !== upstreamHost.toLowerCase()) {
+    return "template Host is not the offer's upstream host";
+  }
+  if (!/^Bearer \{KEY:\d+\}$/.test(seen.get("authorization")!)) return "template Authorization is not Bearer {KEY:n}";
+  if (seen.get("content-type")!.toLowerCase() !== "application/json") return "template Content-Type is not application/json";
+  if (seen.get("accept-encoding")!.toLowerCase() !== "identity") return "template Accept-Encoding is not identity";
+  if (seen.get("connection")!.toLowerCase() !== "close") return "template Connection is not close";
+  if (seen.get("content-length") !== "{LEN}") return "template Content-Length is not the body length";
+  return undefined;
+}
+
+/** `headTemplateProblem` as a refusal of the node's π_NK parameters. */
+export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: HeadTemplateKind = "chat"): void {
+  const problem = headTemplateProblem(tpl, upstreamHost, kind);
+  if (problem) fail("π_NK", problem);
 }

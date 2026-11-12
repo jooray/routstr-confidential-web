@@ -12,7 +12,7 @@
  */
 
 import { OfferMalformedError, SessionProtocolError } from "./errors.js";
-import type { ConfidentialImagesOffer, ConfidentialImageVariant, ImagePin } from "./offer.js";
+import { imageCountKey, type ConfidentialImagesOffer, type ConfidentialImageVariant, type ImagePin } from "./offer.js";
 
 /**
  * The suffix for (model, count, variant), byte-exact with the sidecar and the
@@ -46,12 +46,12 @@ export function renderImageSuffix(
 
 /** The suffix for a request from the signed offer's image block. */
 export function imageSuffix(images: ConfidentialImagesOffer, model: string, variant: ConfidentialImageVariant, count: number): string {
-  return renderImageSuffix(model, images.count_key, count, images.fixed_pins, variant.pins);
+  return renderImageSuffix(model, imageCountKey(images), count, images.fixed_pins, variant.pins);
 }
 
 /** Keys the suffix pins (a private option may not use them). */
 export function pinnedImageKeys(images: ConfidentialImagesOffer, variant: ConfidentialImageVariant): Set<string> {
-  return new Set(["model", images.count_key, ...images.fixed_pins.map((p) => p[0]), ...variant.pins.map((p) => p[0])]);
+  return new Set(["model", imageCountKey(images), ...images.fixed_pins.map((p) => p[0]), ...variant.pins.map((p) => p[0])]);
 }
 
 /**
@@ -144,7 +144,7 @@ export function planImageRequest(
   }
   if (typeof body.prompt !== "string" || !body.prompt.trim()) throw new ImageRequestError("an image request needs a prompt");
   // The count may come under any of its names, but they must agree.
-  const counts = [...new Set([images.count_key, "n", "variants", "count"])]
+  const counts = [...new Set([imageCountKey(images), "n", "variants", "count"])]
     .map((k) => body[k])
     .filter((v) => v !== undefined);
   if (counts.some((c) => JSON.stringify(c) !== JSON.stringify(counts[0]))) {
@@ -193,7 +193,7 @@ export function planImageRequest(
   if (hasAxis("resolution") && (body.width !== undefined || body.height !== undefined)) {
     throw new ImageRequestError(`${model} is priced by resolution tier: width/height cannot be private options`);
   }
-  const selectors = new Set<string>([...IMAGE_SELECTOR_KEYS, images.count_key]);
+  const selectors = new Set<string>([...IMAGE_SELECTOR_KEYS, imageCountKey(images)]);
   const pinned = pinnedImageKeys(images, variant);
   const privateOptions: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(body)) {

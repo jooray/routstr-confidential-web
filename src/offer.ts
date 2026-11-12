@@ -16,8 +16,10 @@ import {
   verifySchnorrSignature,
 } from "./canonical.js";
 import { TrustedHostMatcher } from "./hosts.js";
-import { checkHeadTemplate, headRouteProblem } from "./params.js";
+import { checkH2Offer } from "./h2.js";
+import { headRouteProblem, headTemplateProblem } from "./params.js";
 import {
+  NodeProtocolOutdatedError,
   OfferBadSignatureError,
   OfferMalformedError,
   OfferPinMismatchError,
@@ -28,10 +30,15 @@ import {
 } from "./errors.js";
 import { type ChatSuffixSpec, pinKeyProblem, validateChatSuffix } from "./suffix.js";
 
-/** Protocol versions this client speaks. */
-/** The browser client implements only protocol v2 (two-party handshake). */
-export const CONFIDENTIAL_VERSION_MIN = 2;
-export const CONFIDENTIAL_VERSION_MAX = 2;
+/** The one protocol version this client speaks (PROTOCOL-V3.md). */
+export const CONFIDENTIAL_VERSION = 3;
+export const CONFIDENTIAL_VERSION_MIN = CONFIDENTIAL_VERSION;
+export const CONFIDENTIAL_VERSION_MAX = CONFIDENTIAL_VERSION;
+/** The two-party key schedule this client implements (§4). */
+export const CONFIDENTIAL_TWOPC = "split-public-1";
+/** A connection's framing towards the provider. */
+export type ConfidentialFraming = "2" | "1.1";
+export const CONFIDENTIAL_FRAMINGS: readonly ConfidentialFraming[] = ["2", "1.1"];
 
 export interface ConfidentialPriceEntry {
   /** msats per 1k input tokens. */
@@ -44,36 +51,37 @@ export interface ConfidentialPriceEntry {
   out: number;
 }
 
-/** A JSON key/value pinned in the image suffix, as `[key, value]`. */
-export type ImagePin = [string, unknown];
-
-/** One priced variant of an image model (its pins choose the price tier). */
+/** One priced way to generate an image with a model (its pinned request keys). */
 export interface ConfidentialImageVariant {
   id: string;
-  pins: ImagePin[];
-  /** Flat price per image, msats, from the signed offer. */
+  /** Request keys and values the suffix pins for this variant, in order. */
+  pins: [string, unknown][];
+  /** Flat price per generated image (whole msats), surcharge included. */
   msat_per_image: number;
-  /** Most images per request for this variant (below the block's `max_count`). */
+  /** Most images per request for this variant, when lower than the offer's `max_count`. */
   max_count?: number;
 }
 
-/** The signed offer's image block (capability `images`). */
+/**
+ * The image-generation capability of a signed offer: a flat price per image,
+ * fixed at setup from pinned request parameters (no usage disclosure).
+ */
 export interface ConfidentialImagesOffer {
-  /** Request head of the image route, `{KEY:n}` and `{LEN}` tokens as for chat. */
+  /** The request head the node writes for an image request ({KEY:n}, {LEN}). */
   head_template: string;
-  /** Response JSON shape: `venice` (`{images:[base64]}`) or `openai` (`{data:[{b64_json}]}`). */
+  /** `venice` (`{images: [b64]}`) or `openai` (`{data: [{b64_json}]}`). */
   response_shape: "venice" | "openai";
-  /** Seconds the provider may stay silent before the response (default 300). */
+  /** Seconds the response may stay silent (image generation sends nothing until done). */
   response_idle_s?: number;
   /** Most images per request. */
   max_count: number;
-  /** The request key that carries the count (default `variants`, Venice's). */
-  count_key: string;
-  /** Pins every request carries, after the model and the count. */
-  fixed_pins: ImagePin[];
-  price_list: Record<string, ConfidentialImageVariant[]>;
-  /** The relay's parameter space and response cap (informational for the client). */
+  /** The request key that carries the image count (default `variants`). */
+  count_key?: string;
+  /** Key/value pairs pinned on every image request (paid extras off, …). */
+  fixed_pins: [string, unknown][];
+  /** The values each tier key may take (informational). */
   param_space?: Record<string, unknown[]>;
+  price_list: Record<string, ConfidentialImageVariant[]>;
   max_response_bytes?: number;
 }
 
@@ -94,9 +102,6 @@ export interface ConfidentialOffer {
   /** How the pinned chat suffix is built (`validateChatSuffix`). */
   chat: ChatSuffixSpec;
   price_list: Record<string, ConfidentialPriceEntry>;
-  /** What the node serves confidentially (absent: chat only). */
-  capabilities?: string[];
-  images?: ConfidentialImagesOffer;
   mints?: string[];
   prewarm?: boolean;
   /**
@@ -118,16 +123,97 @@ export interface ConfidentialOffer {
    */
   rate_surcharge_pct?: number;
   /**
-   * Completion tokens the node reserves beyond `max_tokens` (a provider may
-   * bill a few past the cap). Only the reservation grows; the charge is still
-   * the usage.
+   * Completion tokens the node reserves beyond the pinned cap (a provider may
+   * bill slightly past it); absent when none.
    */
   reserve_margin_tokens?: number;
+  /** What the node serves confidentially (`chat`, `images`); absent: chat only. */
+  capabilities?: string[];
+  /** Image generation terms, present with the `images` capability. */
+  images?: ConfidentialImagesOffer;
+  /**
+   * The framings the node serves towards the provider, in the operator's
+   * order of preference (`"2"`: HTTP/2, many sequential requests per
+   * connection; `"1.1"`: one request per connection). Absent: `["1.1"]`.
+   */
+  http?: string[];
+  /** Terms of framing `"2"`, present when `http` lists it. */
+  h2?: ConfidentialH2Offer;
+  /** The two-party key schedule (`split-public-1`). */
+  twopc?: string;
+  /**
+   * The deposit (msat) the node reserves at a connection's `setup`. It is
+   * released when the connection's first request reaches a settlement and
+   * charged when the connection ends without one (unless the node, its
+   * sidecar or the provider failed first). 0: none.
+   */
+  connection_deposit_msat?: number;
+  /** The node closes a connection that had no request in flight for this long (seconds). */
+  idle_timeout_s?: number;
   /** BIP-340 Schnorr signature (hex) over `sig_payload`. */
   sig?: string;
   /** Exact bytes that were signed. */
   sig_payload?: string;
   [key: string]: unknown;
+}
+
+/** The `h2` block of an offer that lists `"2"` in `http` (§12.1). */
+export interface ConfidentialH2Offer {
+  /** Path of the node's one probe request in the connection head (API base + `/models`). */
+  probe_path: string;
+  /** The sidecar's own idle limit (seconds); the ceiling of the offer's `idle_timeout_s`. */
+  idle_secs: number;
+  /** Requests per connection. */
+  max_requests: number;
+  /** A connection is closed at the first settlement after this long since `head_written` (seconds). */
+  max_lifetime_s: number;
+  /**
+   * The request kinds a connection serves: `["chat"]`, or `["chat", "images"]`
+   * when image requests (the offer's `images` block) may run on it too.
+   */
+  kinds: string[];
+}
+
+/** The framings a verified offer serves, in the operator's order. */
+export function offerFramings(offer: ConfidentialOffer): ConfidentialFraming[] {
+  const list = Array.isArray(offer.http) ? offer.http : ["1.1"];
+  return list.filter((f): f is ConfidentialFraming => f === "2" || f === "1.1");
+}
+
+/** The offer's connection deposit (msat; 0 when it names none). */
+export function offerConnectionDepositMsat(offer: Pick<ConfidentialOffer, "connection_deposit_msat">): number {
+  const d = offer.connection_deposit_msat;
+  return typeof d === "number" && Number.isSafeInteger(d) && d > 0 ? d : 0;
+}
+
+/** How long the node keeps a connection with no request in flight (seconds). */
+export function offerIdleTimeoutS(offer: Pick<ConfidentialOffer, "idle_timeout_s" | "h2">): number {
+  const t = offer.idle_timeout_s;
+  if (typeof t === "number" && Number.isSafeInteger(t) && t >= 10) return t;
+  return Math.min(120, offer.h2?.idle_secs ?? 120);
+}
+
+/**
+ * The framings of `offer` that serve a request of `kind`: `"1.1"` serves chat
+ * always and images when the offer has an images block; `"2"` serves the
+ * kinds its `h2` block lists.
+ */
+export function offerFramingsFor(offer: ConfidentialOffer, kind: "chat" | "images"): ConfidentialFraming[] {
+  return offerFramings(offer).filter((f) => {
+    if (kind === "chat") return f === "1.1" || offer.h2 !== undefined;
+    if (!offerSupportsImages(offer)) return false;
+    return f === "1.1" || offerSupportsHttp2Images(offer);
+  });
+}
+
+/** True when the verified offer serves image requests on `http: 2` connections. */
+export function offerSupportsHttp2Images(offer: ConfidentialOffer): boolean {
+  return (
+    offerSupportsHttp2(offer) &&
+    offerSupportsImages(offer) &&
+    Array.isArray(offer.h2?.kinds) &&
+    offer.h2!.kinds.includes("images")
+  );
 }
 
 export interface VerifyOfferOptions {
@@ -153,6 +239,21 @@ export interface VerifyOfferOptions {
 export interface VerifiedOffer extends ConfidentialOffer {
   /** The exact payload whose signature verified. */
   signedPayload: string;
+  /**
+   * Why the offer's `images` block was refused (it is then dropped, chat is
+   * unaffected); an image request names this reason.
+   */
+  imagesRefused?: string;
+  /**
+   * Why the offer's framing-`"2"` terms were refused (`http` then no longer
+   * lists `"2"` and `h2` is dropped; framing `"1.1"` is unaffected).
+   */
+  http2Refused?: string;
+}
+
+/** True when the verified offer serves framing `"2"`. */
+export function offerSupportsHttp2(offer: ConfidentialOffer): boolean {
+  return Array.isArray(offer.http) && offer.http.includes("2") && offer.h2 !== undefined;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -240,13 +341,6 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.abandon_fee_msat is not a non-negative integer");
   }
-  if (offer.capabilities !== undefined) {
-    if (!Array.isArray(offer.capabilities) || !offer.capabilities.every((c) => typeof c === "string")) {
-      throw new OfferMalformedError("offer.capabilities is not a list of strings");
-    }
-  }
-  // The image block is checked when an image request uses it (`offerImages`):
-  // a malformed one refuses images, never the chat the offer also serves.
   if (
     offer.rate_surcharge_pct !== undefined &&
     (typeof offer.rate_surcharge_pct !== "number" ||
@@ -255,130 +349,184 @@ export function validateOfferShape(offer: unknown): asserts offer is Confidentia
   ) {
     throw new OfferMalformedError("offer.rate_surcharge_pct is not a non-negative number");
   }
+  if (
+    offer.capabilities !== undefined &&
+    (!Array.isArray(offer.capabilities) || !offer.capabilities.every((c) => typeof c === "string"))
+  ) {
+    throw new OfferMalformedError("offer.capabilities is not a list of strings");
+  }
+  // The images block is checked in verifyConfidentialOffer: a malformed one
+  // disables images only, never chat.
 }
 
-function isPin(p: unknown): p is ImagePin {
-  return Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && p[0].length > 0;
+function isPinList(v: unknown): v is [string, unknown][] {
+  return (
+    Array.isArray(v) &&
+    v.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && p[0] !== "")
+  );
 }
 
-/** Most images per request any offer may ask for. */
+/** The variant keys an image offer may pin: price axes and the output format. */
+export const IMAGE_VARIANT_PIN_KEYS: ReadonlySet<string> = new Set(["resolution", "quality", "format"]);
+
+/** Most images one confidential request may ask for. */
 export const IMAGE_MAX_COUNT = 4;
-/** The variant pins a client lets the node choose: price tiers and the format. */
-export const IMAGE_VARIANT_PIN_KEYS = ["resolution", "quality", "format"] as const;
 
-/** A fixed pin switches a provider extra off: `false` or an empty list. */
+/** A fixed pin may only switch a provider extra off: `false` or an empty list. */
 function isOffValue(v: unknown): boolean {
   return v === false || (Array.isArray(v) && v.length === 0);
 }
 
 /**
- * The signed image block, checked before any image request uses it. The node
- * chooses what the suffix pins, and the provider obeys the suffix, so only
- * pins that switch extras off (under no key that negates a feature or names
- * a protection) and pins that select a priced tier are taken: anything else
- * could switch on a feature that sends the prompt elsewhere.
+ * Check a signed offer's `images` block. The node chooses every pinned value,
+ * so the client holds it to a narrow shape: fixed pins only switch extras off
+ * (under no key that negates a feature or names a protection), variant pins
+ * only choose a price tier or the format among the published values, the
+ * head is a plain request to the image endpoint, and the numbers are
+ * bounded. Throws `OfferMalformedError`.
  */
-export function validateImagesBlock(images: unknown, upstreamHost?: string): void {
+export function validateImagesOffer(images: unknown, upstreamHost: string): asserts images is ConfidentialImagesOffer {
   const bad = (what: string): never => {
-    throw new OfferMalformedError(`offer.images: ${what}`);
+    throw new OfferMalformedError(`offer.images.${what}`);
   };
-  if (!isObject(images)) bad("not an object");
+  if (!isObject(images)) bad("is not an object");
   const im = images as Record<string, unknown>;
   if (typeof im.head_template !== "string" || !im.head_template) bad("head_template is not a non-empty string");
-  if (upstreamHost !== undefined) {
-    try {
-      checkHeadTemplate(im.head_template as string, upstreamHost, "images");
-    } catch (e) {
-      bad(`head_template: ${(e as Error).message}`);
-    }
-  }
-  if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("unknown response_shape");
+  const tplProblem = headTemplateProblem(im.head_template as string, upstreamHost, "images");
+  if (tplProblem) bad(`head_template: ${tplProblem}`);
+  if (im.response_shape !== "venice" && im.response_shape !== "openai") bad("response_shape is not venice or openai");
   if (
     im.response_idle_s !== undefined &&
-    (typeof im.response_idle_s !== "number" ||
-      !Number.isSafeInteger(im.response_idle_s) ||
-      im.response_idle_s < 30 ||
-      im.response_idle_s > 600)
+    !(Number.isSafeInteger(im.response_idle_s) && (im.response_idle_s as number) >= 30 && (im.response_idle_s as number) <= 600)
   ) {
-    bad("response_idle_s is not an integer of 30 to 600");
+    bad("response_idle_s is not an integer from 30 to 600");
+  }
+  if (!(Number.isSafeInteger(im.max_count) && (im.max_count as number) >= 1 && (im.max_count as number) <= IMAGE_MAX_COUNT)) {
+    bad(`max_count is not an integer from 1 to ${IMAGE_MAX_COUNT}`);
+  }
+  if (im.count_key !== undefined && (typeof im.count_key !== "string" || !im.count_key)) {
+    bad("count_key is not a non-empty string");
+  }
+  // The count is pinned under this key and the charge is the price × count:
+  // under a key the endpoint does not read, the provider would make its
+  // default number of images while the client paid for `count`.
+  const routeKey = imageCountKeyForRoute(im.head_template as string);
+  if (routeKey === undefined) bad("head_template does not name an image endpoint with a known count key");
+  if (imageCountKey(im) !== routeKey) {
+    bad(`count_key ${JSON.stringify(imageCountKey(im))} is not the one the endpoint reads (${JSON.stringify(routeKey)})`);
   }
   if (
-    typeof im.max_count !== "number" ||
-    !Number.isSafeInteger(im.max_count) ||
-    im.max_count < 1 ||
-    im.max_count > IMAGE_MAX_COUNT
+    !isObject(im.param_space) ||
+    !Object.values(im.param_space).every((vals) => Array.isArray(vals) && vals.every((x) => typeof x === "string"))
   ) {
-    bad(`max_count is not an integer of 1 to ${IMAGE_MAX_COUNT}`);
+    bad("param_space is not an object of string lists");
   }
-  const countKey = im.count_key ?? "variants";
-  if (typeof countKey !== "string" || !countKey || countKey === "model") bad("count_key is invalid");
-  if (!Array.isArray(im.fixed_pins) || !im.fixed_pins.every(isPin)) bad("fixed_pins is not a list of [key, value]");
-  const fixed = im.fixed_pins as ImagePin[];
-  for (const [k, v] of fixed) {
-    if (!isOffValue(v)) bad(`fixed pin ${JSON.stringify(k)} does not switch an extra off`);
+  const space = im.param_space as Record<string, string[]>;
+  if (!isPinList(im.fixed_pins)) bad("fixed_pins is not a list of [key, value] pairs");
+  for (const [k, v] of im.fixed_pins as [string, unknown][]) {
+    if (!isOffValue(v)) bad(`fixed_pins ${JSON.stringify(k)} is not switched off (only false or [] may be pinned)`);
     const keyProblem = pinKeyProblem(k, v);
-    if (keyProblem) bad(`fixed pin ${JSON.stringify(k)}: ${keyProblem}`);
-  }
-  const fixedKeys = fixed.map(([k]) => k);
-  const reserved = ["model", countKey as string, ...fixedKeys];
-  if (new Set(reserved).size !== reserved.length) bad("a fixed pin repeats the model, the count or another pin");
-  if (!isObject(im.param_space)) bad("param_space is not an object");
-  const space = im.param_space as Record<string, unknown>;
-  for (const [k, vals] of Object.entries(space)) {
-    if (!Array.isArray(vals) || !vals.every((x) => typeof x === "string")) bad(`param_space[${JSON.stringify(k)}] is not a list of strings`);
+    if (keyProblem) bad(`fixed_pins ${JSON.stringify(k)}: ${keyProblem}`);
   }
   if (!isObject(im.price_list)) bad("price_list is not an object");
+  const fixed = new Set([...(im.fixed_pins as [string, unknown][]).map((p) => p[0]), "model", imageCountKey(im)]);
+  if (fixed.size !== (im.fixed_pins as unknown[]).length + 2) bad("fixed_pins repeat a key or pin model/count");
   for (const [model, variants] of Object.entries(im.price_list as Record<string, unknown>)) {
-    const at = `price_list[${JSON.stringify(model)}]`;
-    if (!Array.isArray(variants) || variants.length === 0) bad(`${at} has no variants`);
+    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list[${JSON.stringify(model)}] has no variants`);
     const ids = new Set<string>();
     for (const v of variants as unknown[]) {
-      if (!isObject(v) || typeof v.id !== "string" || !v.id || !Array.isArray(v.pins) || !v.pins.every(isPin)) {
-        bad(`${at} has a malformed variant`);
+      const where = `price_list[${JSON.stringify(model)}]`;
+      if (!isObject(v) || typeof v.id !== "string" || !v.id || ids.has(v.id)) bad(`${where} has a variant without a unique id`);
+      ids.add((v as { id: string }).id);
+      const vv = v as Record<string, unknown>;
+      if (!isPinList(vv.pins) || vv.pins.some((p) => fixed.has(p[0]))) bad(`${where} pins a fixed key`);
+      if (new Set((vv.pins as [string, unknown][]).map((p) => p[0])).size !== (vv.pins as unknown[]).length) {
+        bad(`${where} repeats a pinned key`);
       }
-      const vr = v as Record<string, unknown>;
-      if (ids.has(vr.id as string)) bad(`${at} repeats the variant id ${JSON.stringify(vr.id)}`);
-      ids.add(vr.id as string);
-      const price = vr.msat_per_image;
-      if (typeof price !== "number" || !Number.isSafeInteger(price) || price <= 0) {
-        bad(`${at} variant ${JSON.stringify(vr.id)} has no positive integer price`);
+      for (const [k, val] of vv.pins as [string, unknown][]) {
+        if (!IMAGE_VARIANT_PIN_KEYS.has(k)) bad(`${where} pins ${JSON.stringify(k)}, which is not a price tier or the format`);
+        if (typeof val !== "string" || !(space[k] ?? []).includes(val)) {
+          bad(`${where} pins ${k}=${JSON.stringify(val)}, which is not in param_space`);
+        }
+      }
+      const price = vv.msat_per_image;
+      if (!(Number.isSafeInteger(price) && (price as number) > 0)) {
+        bad(`${where} msat_per_image is not a positive whole number of msats`);
       }
       if (
-        vr.max_count !== undefined &&
-        (typeof vr.max_count !== "number" ||
-          !Number.isSafeInteger(vr.max_count) ||
-          vr.max_count < 1 ||
-          vr.max_count > (im.max_count as number))
+        vv.max_count !== undefined &&
+        !(Number.isSafeInteger(vv.max_count) && (vv.max_count as number) >= 1 && (vv.max_count as number) <= (im.max_count as number))
       ) {
-        bad(`${at} variant ${JSON.stringify(vr.id)} has an invalid max_count`);
-      }
-      const keys = new Set<string>();
-      for (const [k, val] of vr.pins as ImagePin[]) {
-        if (!(IMAGE_VARIANT_PIN_KEYS as readonly string[]).includes(k)) bad(`${at} pins ${JSON.stringify(k)}, not a price tier`);
-        if (keys.has(k) || reserved.includes(k)) bad(`${at} pins ${JSON.stringify(k)} twice`);
-        keys.add(k);
-        const allowed = space[k];
-        if (typeof val !== "string" || !Array.isArray(allowed) || !allowed.includes(val)) {
-          bad(`${at} pins ${JSON.stringify(k)}=${JSON.stringify(val)} outside param_space`);
-        }
+        bad(`${where} max_count is not an integer from 1 to the offer's max_count`);
       }
     }
   }
 }
 
+/** Why a signed offer's `images` block is refused, or `undefined` when it is acceptable. */
+export function imagesOfferProblem(images: unknown, upstreamHost: string): string | undefined {
+  try {
+    validateImagesOffer(images, upstreamHost);
+    return undefined;
+  } catch (error) {
+    if (error instanceof OfferMalformedError) return error.message;
+    throw error;
+  }
+}
+
 /**
- * The offer's image block when the node serves images confidentially: only
- * with `capabilities` naming `images` (an offer without the field is chat
- * only). Defaults filled in: `count_key` "variants", `response_idle_s` 300.
- * A malformed block throws `OfferMalformedError`: images are refused, the
- * offer's chat is not affected.
+ * The request key an image endpoint reads the image count from, by the route
+ * its head template names: `n` for the OpenAI-style `/images/generations`,
+ * `variants` for `/image/generate`. Undefined for any other route (the head
+ * template check allows only these two).
  */
-export function offerImages(
-  offer: Pick<ConfidentialOffer, "capabilities" | "images"> & { upstream_host?: string },
-): ConfidentialImagesOffer | undefined {
-  if (!offer.images || !offer.capabilities?.includes("images")) return undefined;
-  validateImagesBlock(offer.images, offer.upstream_host);
-  return { ...offer.images, count_key: offer.images.count_key ?? "variants", response_idle_s: offer.images.response_idle_s ?? 300 };
+export function imageCountKeyForRoute(headTemplate: string): string | undefined {
+  const path = /^POST (\S+) HTTP\/1\.1\r\n/.exec(headTemplate)?.[1]?.split("?")[0] ?? "";
+  if (path.endsWith("/images/generations")) return "n";
+  if (path.endsWith("/image/generate")) return "variants";
+  return undefined;
+}
+
+/** The request key that carries the image count. */
+export function imageCountKey(images: { count_key?: unknown }): string {
+  return typeof images.count_key === "string" && images.count_key ? images.count_key : "variants";
+}
+
+/** One pinned `[key, value]` pair of an image request's suffix. */
+export type ImagePin = [string, unknown];
+
+/**
+ * The verified offer's image block, or `undefined` when the node offers no
+ * confidential image generation. A block the client refused (the offer is
+ * then usable for chat only) throws `OfferMalformedError` with the reason.
+ */
+export function offerImages(offer: Pick<VerifiedOffer, "capabilities" | "images" | "imagesRefused">): ConfidentialImagesOffer | undefined {
+  if (offer.imagesRefused !== undefined && Array.isArray(offer.capabilities) && offer.capabilities.includes("images")) {
+    throw new OfferMalformedError(`the node's image offer is refused: ${offer.imagesRefused}`);
+  }
+  return Array.isArray(offer.capabilities) && offer.capabilities.includes("images") ? offer.images : undefined;
+}
+
+/** True when the signed offer serves confidential image generation. */
+export function offerSupportsImages(offer: ConfidentialOffer): boolean {
+  return Array.isArray(offer.capabilities) && offer.capabilities.includes("images") && offer.images !== undefined;
+}
+
+/**
+ * The pinned JSON suffix of an image request, byte for byte as the relay
+ * renders it: model, count, the fixed pins, then the variant's pins, in
+ * compact JSON, closing the request object.
+ */
+export function renderImageSuffix(
+  model: string,
+  count: number,
+  countKey: string,
+  fixedPins: readonly [string, unknown][],
+  pins: readonly [string, unknown][],
+): string {
+  const parts = [`"model":${JSON.stringify(model)}`, `${JSON.stringify(countKey)}:${JSON.stringify(count)}`];
+  for (const [k, v] of [...fixedPins, ...pins]) parts.push(`${JSON.stringify(k)}:${JSON.stringify(v)}`);
+  return `,${parts.join(",")}}`;
 }
 
 function feeValue(fee: unknown): number {
@@ -421,6 +569,21 @@ export function verifyOfferSignature(offer: ConfidentialOffer): boolean {
   return verifySchnorrSignature(payload, offer.sig, offer.notary_pubkey);
 }
 
+/** The version an offer names (in its signed bytes when it has them), when it is below this client's. */
+function offeredVersionBelow(raw: unknown): number | undefined {
+  if (!isObject(raw)) return undefined;
+  let v: unknown = raw.v;
+  if (typeof raw.sig_payload === "string" && raw.sig_payload.length > 0) {
+    try {
+      const signed: unknown = JSON.parse(raw.sig_payload);
+      if (isObject(signed)) v = signed.v;
+    } catch {
+      return undefined;
+    }
+  }
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v < CONFIDENTIAL_VERSION ? v : undefined;
+}
+
 /** Supported-version check against the offer's `min_v`/`max_v` and `v`. */
 export function supportedVersion(offer: ConfidentialOffer): boolean {
   const min = offer.min_v ?? offer.v;
@@ -443,6 +606,16 @@ export function verifyConfidentialOffer(
   raw: unknown,
   options: VerifyOfferOptions = {},
 ): VerifiedOffer {
+  // §11, before anything else: an older node's offer need not have the shape
+  // of ours, and the answer is the same whoever signed it (the node is not used).
+  const olderVersion = offeredVersionBelow(raw);
+  if (olderVersion !== undefined) {
+    throw new NodeProtocolOutdatedError(
+      `node_protocol_outdated: the node offers routstr-confidential v${olderVersion}, this client speaks v${CONFIDENTIAL_VERSION}; ` +
+        "the node must be updated before it can serve confidential requests",
+      olderVersion,
+    );
+  }
   validateOfferShape(raw);
   // The signed bytes are authoritative: when the node ships `sig_payload`, the
   // fields the client uses MUST come from it, not from the outer (mutable)
@@ -465,16 +638,43 @@ export function verifyConfidentialOffer(
 
   if (!supportedVersion(offer)) {
     throw new OfferUnsupportedVersionError(
-      `offer version v=${offer.v} min_v=${offer.min_v ?? offer.v} max_v=${offer.max_v ?? offer.v} ` +
-        `outside supported range ${CONFIDENTIAL_VERSION_MIN}-${CONFIDENTIAL_VERSION_MAX}`,
+      `offer version v=${offer.v} is not supported: this client speaks only protocol v${CONFIDENTIAL_VERSION} (update the client)`,
     );
   }
+  if (offer.twopc !== CONFIDENTIAL_TWOPC) {
+    throw new OfferUnsupportedVersionError(
+      `offer names the two-party key schedule ${JSON.stringify(offer.twopc ?? null).slice(0, 64)}, this client implements ${CONFIDENTIAL_TWOPC}`,
+    );
+  }
+  const framings = offer.http === undefined ? ["1.1"] : offer.http;
+  if (
+    !Array.isArray(framings) ||
+    framings.length === 0 ||
+    framings.some((f) => f !== "2" && f !== "1.1") ||
+    new Set(framings).size !== framings.length
+  ) {
+    throw new OfferMalformedError('offer.http is not a non-empty list of distinct framings ("2", "1.1")');
+  }
+  const deposit = offer.connection_deposit_msat === undefined ? 0 : offer.connection_deposit_msat;
+  if (typeof deposit !== "number" || !Number.isSafeInteger(deposit) || deposit < 0) {
+    throw new OfferMalformedError("offer.connection_deposit_msat is not a non-negative integer");
+  }
+  const idleS = offer.idle_timeout_s;
+  if (idleS !== undefined && (typeof idleS !== "number" || !Number.isSafeInteger(idleS) || idleS < 10)) {
+    throw new OfferMalformedError("offer.idle_timeout_s is not an integer of at least 10");
+  }
 
+  const pinsConfigured = Boolean(options.pinnedPubkey) || (options.pinnedPubkeys?.length ?? 0) > 0;
   if (!offer.sig) {
     if (!options.allowUnpinned) {
       throw new OfferUnpinnedError(
         "offer is unsigned and allowUnpinned is not set (self-consistency is not authenticity)",
       );
+    }
+    // A pin is a claim about who signed: an unsigned offer naming the pinned
+    // key proves nothing, whatever allowUnpinned says.
+    if (pinsConfigured) {
+      throw new OfferUnpinnedError("offer is unsigned but node keys are pinned; a pinned offer must be signed");
     }
   } else if (!verifySchnorrSignature(payload, offer.sig, offer.notary_pubkey)) {
     throw new OfferBadSignatureError();
@@ -514,17 +714,15 @@ export function verifyConfidentialOffer(
 
   // The node writes the chat request head too: the same syntax as the image
   // head, checked before any setup (π_NK checks it again per session).
-  try {
-    checkHeadTemplate(offer.head_template, offer.upstream_host, "chat");
-  } catch (e) {
-    throw new OfferMalformedError(`offer.head_template: ${(e as Error).message}`);
-  }
+  const tplProblem = headTemplateProblem(offer.head_template, offer.upstream_host, "chat");
+  if (tplProblem) throw new OfferMalformedError(`offer.head_template: ${tplProblem}`);
 
   // Fail closed at runtime too (plain-JS callers bypass the TS type): an
   // offer is only usable for an upstream host the caller trusts.
   if (options.trustedHosts === undefined) {
     throw new TrustedHostError("no trusted upstream hosts configured; refusing the offer");
   }
+  let apiBases: string[] = [];
   {
     const matcher =
       options.trustedHosts instanceof TrustedHostMatcher
@@ -538,17 +736,45 @@ export function verifyConfidentialOffer(
     // The node writes the request head: hold its route to the API base the
     // caller trusts for that host, so it cannot pick another route of the
     // same provider that merely ends in the endpoint.
-    const bases = matcher.apiBases(offer.upstream_host);
-    const route = headRouteProblem(offer.head_template, bases, "chat");
+    apiBases = matcher.apiBases(offer.upstream_host);
+    const route = headRouteProblem(offer.head_template, apiBases, "chat");
     if (route) throw new TrustedHostError(`offer head_template: ${route}`);
-    if (offer.images && headRouteProblem(String(offer.images.head_template), bases, "images")) {
-      // Images off for this offer; chat on the same signed terms still works.
-      const { images: _refused, ...rest } = offer;
-      return { ...rest, signedPayload: payload };
-    }
   }
 
-  return { ...offer, signedPayload: payload };
+  // Framing "2": held to what the node's sidecar enforces. A refused block
+  // switches it off for this offer when "1.1" is offered too; an offer of
+  // nothing else is refused.
+  let http2Refused: string | undefined;
+  {
+    const { h2: _block, ...rest } = offer;
+    if (framings.includes("2")) {
+      try {
+        const h2 = checkH2Offer(offer, apiBases);
+        if (idleS !== undefined && idleS > h2.idle_secs) {
+          throw new OfferMalformedError("offer.idle_timeout_s exceeds h2.idle_secs");
+        }
+        offer = { ...rest, http: [...framings], h2 };
+      } catch (error) {
+        http2Refused = error instanceof Error ? error.message : String(error);
+        if (!framings.includes("1.1")) throw new OfferMalformedError(`offer serves only framing "2" and its terms are refused: ${http2Refused}`);
+        offer = { ...rest, http: ["1.1"] };
+      }
+    } else offer = { ...rest, http: [...framings] };
+    offer.connection_deposit_msat = deposit;
+  }
+
+  if (offer.images !== undefined) {
+    const images = offer.images as { head_template?: unknown };
+    const problem =
+      imagesOfferProblem(offer.images, offer.upstream_host) ??
+      headRouteProblem(String(images.head_template), apiBases, "images");
+    if (problem) {
+      // Images off for this offer; chat on the same signed terms still works.
+      const { images: _refused, ...rest } = offer;
+      return { ...rest, signedPayload: payload, imagesRefused: problem, ...(http2Refused ? { http2Refused } : {}) };
+    }
+  }
+  return { ...offer, signedPayload: payload, ...(http2Refused ? { http2Refused } : {}) };
 }
 
 /**
@@ -560,8 +786,10 @@ export async function fetchConfidentialOffer(
   options: VerifyOfferOptions & { fetchImpl?: typeof fetch } = {},
 ): Promise<VerifiedOffer> {
   const base = baseUrl.replace(/\/$/, "");
-  const url = `${base}/v1/confidential/offer`;
-  const doFetch = options.fetchImpl ?? fetch;
+  // The query tells an older node's access log that v3 clients are asking (§11).
+  const url = `${base}/v1/confidential/offer?v=${CONFIDENTIAL_VERSION}`;
+  // Called unbound: a bare reference to `fetch` called as a method of another object is an illegal invocation.
+  const doFetch = options.fetchImpl ?? ((input: string) => fetch(input));
   let resp: Response;
   try {
     resp = await doFetch(url);
