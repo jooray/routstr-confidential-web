@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "client-wasm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -1949,6 +1949,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gloo-timers",
  "hex",
+ "libc",
  "mpz-circuits",
  "mpz-common",
  "mpz-core",

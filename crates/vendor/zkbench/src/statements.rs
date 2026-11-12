@@ -1,4 +1,5 @@
-//! The three ZK statements of a session (`docs/TWOPC-DESIGN.md`).
+//! The ZK statements of a session (protocol v3, `PROTOCOL-V3.md` §7; the
+//! two-party key schedule that outputs the anchors is `docs/TWOPC-DESIGN.md`).
 //!
 //! Nobody knows `HS`. The two-party key schedule hands the client `c_ap_1`
 //! and `s_ap_0`, the node `K_0`/`IV_0`, and both sides the public anchors
@@ -9,8 +10,10 @@
 //!
 //! so each statement is anchored by a hash of its own secret:
 //!
-//! * **π_C2S** (client proves): the final body record (epoch 1, under
-//!   `c_ap_1`) decrypts, at the public window, to the pinned suffix.
+//! * **π_WIN** (client proves): plaintext windows of records under `c_ap_1`
+//!   (or `s_ap_0`) equal public bytes. Framing `"1.1"` uses one window, the
+//!   whole final body record, which must equal the pinned suffix and the
+//!   inner content type; framing `"2"` uses several per request.
 //! * **π_C3S** (client proves): the tail server records (under `s_ap_0`)
 //!   end with the disclosed `R` (plus `skip` undisclosed bytes).
 //! * **π_NK** (node proves): the credential record (epoch 0, seq 0, under
@@ -27,16 +30,16 @@
 //!
 //! # What the circuits do not check
 //!
-//! The record statements (π_C2S/π_C3S) prove AES-CTR decryption of public
+//! The record statements (π_WIN/π_C3S) prove AES-CTR decryption of public
 //! ciphertext only; none of them recomputes the GCM tag (π_NK likewise binds
 //! only the CTR ciphertext it commits to). They are sound because the
 //! verifier never takes record ciphertext from the prover: the sidecar builds
-//! these parameters from its own relay transcript (the client's final body
-//! record it holds and then forwards; the server records it read from its own
+//! these parameters from its own relay transcript (the client's records it
+//! holds and then forwards; the server records it read from its own
 //! connection to the provider), and the client checks the node's parameters
 //! against the records it sent or received. A tag would add nothing on top:
 //! for the server records the client holds the traffic secret and could
-//! compute a valid tag itself, and the body record's tag is checked by the
+//! compute a valid tag itself, and a client record's tag is checked by the
 //! provider, which rejects the record otherwise. Whoever calls these
 //! statements with ciphertext it did not observe itself gets no assurance
 //! that the record was ever sent.
@@ -51,8 +54,7 @@ use mpz_vm_core::{
 
 use crate::Role;
 use crate::gadgets::{
-    aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_tail, decrypt_window,
-    eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
+    aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_tail, eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
     splice_circuit, xor_bytes,
 };
 
@@ -77,25 +79,27 @@ pub const MAX_INNER_CIPHERTEXT_PAYLOAD: usize = (1 << 14) + 256;
 pub enum Proof {
     /// Head template under K_0 (N proves; anchored by `hk`).
     PiNK,
-    /// Body suffix under c_ap_1 (anchored by `h1`).
-    PiC2S,
     /// Usage disclosure under s_ap_0 (anchored by `h2`).
     PiC3S,
+    /// Record windows under one traffic secret (anchored by `h1` for client
+    /// records, `h2` for server ones): the pinned suffix record of framing
+    /// `"1.1"`, the frames of a framing `"2"` request.
+    PiWin,
 }
 
 impl Proof {
     pub fn name(&self) -> &'static str {
         match self {
             Proof::PiNK => "pi_nk",
-            Proof::PiC2S => "pi_c2s",
             Proof::PiC3S => "pi_c3s",
+            Proof::PiWin => "pi_win",
         }
     }
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
             "pi_nk" => Some(Proof::PiNK),
-            "pi_c2s" => Some(Proof::PiC2S),
             "pi_c3s" => Some(Proof::PiC3S),
+            "pi_win" => Some(Proof::PiWin),
             _ => None,
         }
     }
@@ -125,26 +129,6 @@ pub struct TailRecord {
 
 fn is_zero_usize(n: &usize) -> bool {
     *n == 0
-}
-
-/// π_C2S public parameters: a window of the final body record, anchored by
-/// `h1`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PiC2S {
-    /// `SHA256(c_ap_1)`, output publicly by the 2PC.
-    pub h1: [u8; 32],
-    /// Record sequence number within epoch 1 (the body starts at 0).
-    pub seq: u64,
-    /// Public ciphertext window `ct[off .. off+w]`.
-    pub ct_window: Vec<u8>,
-    /// Inner-plaintext offset of the window start.
-    pub off: usize,
-    pub w: usize,
-    /// Sub-range inside the window that must match `expected`.
-    pub sel_start: usize,
-    pub sel_len: usize,
-    /// The pinned suffix (compared inside the circuit; one bit is revealed).
-    pub expected: Vec<u8>,
 }
 
 /// π_C3S public parameters: the tail server records, anchored by `h2`.
@@ -198,6 +182,77 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// One window of π_WIN: a block-aligned ciphertext slice of one record and
+/// the bytes part of its plaintext must equal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WinWindow {
+    /// The record's sequence number within its key epoch.
+    pub seq: u64,
+    /// Block-aligned inner-plaintext offset of `ct` in the record. Omitted on
+    /// the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub off: usize,
+    /// The record's ciphertext `[off, off + |ct|)` (never the tag).
+    pub ct: Vec<u8>,
+    /// Offset inside `ct` at which the plaintext must equal `expected`.
+    /// Omitted on the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub sel_start: usize,
+    /// The bytes the plaintext must equal at `[sel_start, sel_start + |expected|)`.
+    pub expected: Vec<u8>,
+}
+
+impl WinWindow {
+    /// The one window of framing `"1.1"`: the whole inner plaintext of record
+    /// `seq` (`ct` is its whole ciphertext, tag excluded) must equal
+    /// `expected` (the pinned suffix and the inner content type 0x17). The
+    /// lengths are public and must agree: π_WIN compares only
+    /// `|expected|` bytes, so a longer record would otherwise pass with
+    /// anything after them.
+    pub fn whole_record(seq: u64, ct: Vec<u8>, expected: Vec<u8>) -> anyhow::Result<Self> {
+        if ct.is_empty() || ct.len() != expected.len() {
+            anyhow::bail!("π_WIN: a record of {} bytes cannot equal {} expected bytes", ct.len(), expected.len());
+        }
+        Ok(Self { seq, off: 0, ct, sel_start: 0, expected })
+    }
+
+    /// True when the window compares a whole record from its first byte to
+    /// the last byte of `ct` (what [`WinWindow::whole_record`] builds). The
+    /// caller still checks that `ct` is the whole record it relayed or sent.
+    pub fn is_whole_record(&self) -> bool {
+        self.off == 0 && self.sel_start == 0 && !self.ct.is_empty() && self.ct.len() == self.expected.len()
+    }
+}
+
+/// π_WIN public parameters. The witness is one traffic secret; every window is decrypted with
+/// AES-CTR under the key `key_updates` "traffic upd" steps after it, and all
+/// windows are compared in one equality, so the verifier decodes the anchor
+/// digest and one bit.
+///
+/// The statement says nothing about which records the windows belong to or
+/// what the rest of a record holds: the verifier takes every `ct` from its
+/// own relay buffer and chooses the windows (frame header, last byte, pinned
+/// block or suffix), and the prover checks every window against its own
+/// records before proving (the bit must not become an oracle on private
+/// bytes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiWin {
+    /// `SHA256(secret)`: `h1` for client records (under `c_ap_1`), `h2` for
+    /// server records (under `s_ap_0`), as output publicly by the 2PC.
+    pub anchor: [u8; 32],
+    /// KeyUpdates between the anchored secret and the windows' key epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_updates: u32,
+    pub windows: Vec<WinWindow>,
+}
+
+/// Most windows a π_WIN may compare (two per DATA record: its frame header
+/// and its last byte).
+pub const MAX_WIN_WINDOWS: usize = 2200;
+
+/// Most ciphertext bytes, summed over the windows, a π_WIN may decrypt.
+pub const MAX_WIN_BYTES: usize = 64 << 10;
+
 /// π_NK public parameters: the head template, anchored by `hk` (the keystream
 /// is computed in-circuit from `K_0`/`IV_0`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -227,16 +282,16 @@ pub struct PiNK {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Params {
     PiNK(PiNK),
-    PiC2S(PiC2S),
     PiC3S(PiC3S),
+    PiWin(PiWin),
 }
 
 impl Params {
     pub fn proof(&self) -> Proof {
         match self {
             Params::PiNK(_) => Proof::PiNK,
-            Params::PiC2S(_) => Proof::PiC2S,
             Params::PiC3S(_) => Proof::PiC3S,
+            Params::PiWin(_) => Proof::PiWin,
         }
     }
 }
@@ -245,7 +300,7 @@ impl Params {
 /// and `Debug` prints only the variant.
 #[derive(Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub enum Witness {
-    /// π_C2S/π_C3S: a 32-byte traffic secret (c_ap_1 or s_ap_0).
+    /// π_WIN/π_C3S: a 32-byte traffic secret (c_ap_1 or s_ap_0).
     Secret([u8; 32]),
     /// π_NK: the epoch-0 AES key and IV and the API key bytes.
     NodeKey {
@@ -294,8 +349,8 @@ pub fn build<VM: Vm<Binary>>(
 ) -> anyhow::Result<Vec<Check>> {
     match params {
         Params::PiNK(p) => build_pi_nk(vm, role, p, witness),
-        Params::PiC2S(p) => build_pi_c2s(vm, role, p, witness),
         Params::PiC3S(p) => build_pi_c3s(vm, role, p, witness),
+        Params::PiWin(p) => build_pi_win(vm, role, p, witness),
     }
 }
 
@@ -307,19 +362,8 @@ fn secret_of(w: Option<&Witness>) -> Option<&[u8; 32]> {
 }
 
 /// Allocate the 32-byte traffic secret, check its hash against the anchor and
-/// derive `(K, IV)`.
-fn anchored_keys<VM: Vm<Binary>>(
-    vm: &mut VM,
-    role: Role,
-    label: &str,
-    anchor: &[u8; 32],
-    witness: Option<&Witness>,
-) -> anyhow::Result<(Check, Array<U8, 16>, Array<U8, 12>)> {
-    anchored_keys_after_updates(vm, role, label, anchor, witness, 0)
-}
-
-/// [`anchored_keys`] for the traffic secret `updates` KeyUpdates after the
-/// anchored one (RFC 8446 §7.2: `HKDF-Expand-Label(s, "traffic upd", "", 32)`).
+/// derive `(K, IV)` of the traffic secret `updates` KeyUpdates after it
+/// (RFC 8446 §7.2: `HKDF-Expand-Label(s, "traffic upd", "", 32)`).
 fn anchored_keys_after_updates<VM: Vm<Binary>>(
     vm: &mut VM,
     role: Role,
@@ -340,32 +384,6 @@ fn anchored_keys_after_updates<VM: Vm<Binary>>(
     }
     let (k, iv) = record_keys_keyed(vm, &cur)?;
     Ok((Check::full(label, digest, anchor.to_vec()), k, iv))
-}
-
-pub fn build_pi_c2s<VM: Vm<Binary>>(
-    vm: &mut VM,
-    role: Role,
-    p: &PiC2S,
-    witness: Option<&Witness>,
-) -> anyhow::Result<Vec<Check>> {
-    if p.sel_len != p.expected.len() {
-        anyhow::bail!("π_C2S: sel_len {} != |expected| {}", p.sel_len, p.expected.len());
-    }
-    // The compared range is the window's end and its last byte is the inner
-    // content type (application data): the statement itself says the record
-    // ends with the suffix, not only the parameters the verifier chose.
-    if p.sel_start.checked_add(p.sel_len) != Some(p.w) || p.ct_window.len() != p.w {
-        anyhow::bail!("π_C2S: the compared range must end the window");
-    }
-    if p.expected.last() != Some(&0x17) {
-        anyhow::bail!("π_C2S: the compared range must end with the inner content type 0x17");
-    }
-    let (anchor, k, iv) = anchored_keys(vm, role, "h1", &p.h1, witness)?;
-    let ct = public_bytes(vm, &p.ct_window)?;
-    let out = decrypt_window(vm, &k, &iv, p.seq, &ct, p.off, p.w, p.sel_start, p.sel_len)?;
-    let expected = public_bytes(vm, &p.expected)?;
-    let eq = eq_bytes(vm, &out, &expected)?;
-    Ok(vec![anchor, Check::full("suffix", eq, vec![1u8])])
 }
 
 pub fn build_pi_c3s<VM: Vm<Binary>>(
@@ -416,6 +434,95 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     let expected = public_bytes(vm, &want)?;
     let eq = eq_bytes(vm, &out, &expected)?;
     Ok(vec![anchor, Check::full("disclosure", eq, vec![1u8])])
+}
+
+/// The AES-CTR keystream blocks a π_WIN needs, each as `(seq, block index)`,
+/// in the order the circuit computes them (a block shared by two windows of
+/// one record is computed once).
+pub fn pi_win_blocks(p: &PiWin) -> Vec<(u64, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for w in &p.windows {
+        let first = w.off / 16;
+        for b in first..first + w.ct.len().div_ceil(16) {
+            if seen.insert((w.seq, b)) {
+                out.push((w.seq, b));
+            }
+        }
+    }
+    out
+}
+
+/// Shape checks of π_WIN parameters, shared by the builder and by whoever
+/// assembles parameters (so nothing unprovable is ever sent).
+pub fn check_pi_win(p: &PiWin) -> anyhow::Result<()> {
+    if p.windows.is_empty() {
+        anyhow::bail!("π_WIN: no windows");
+    }
+    if p.windows.len() > MAX_WIN_WINDOWS {
+        anyhow::bail!("π_WIN: {} windows (limit {MAX_WIN_WINDOWS})", p.windows.len());
+    }
+    if p.key_updates > MAX_SERVER_KEY_UPDATES {
+        anyhow::bail!("π_WIN: {} KeyUpdates (limit {MAX_SERVER_KEY_UPDATES})", p.key_updates);
+    }
+    let total = p.windows.iter().try_fold(0usize, |acc, w| acc.checked_add(w.ct.len()));
+    if total.is_none_or(|t| t > MAX_WIN_BYTES) {
+        anyhow::bail!("π_WIN: the windows exceed {MAX_WIN_BYTES} ciphertext bytes in all");
+    }
+    for (i, w) in p.windows.iter().enumerate() {
+        if w.off % 16 != 0 {
+            anyhow::bail!("π_WIN: window {i} offset {} is not block-aligned", w.off);
+        }
+        if w.ct.is_empty() || w.off.checked_add(w.ct.len()).is_none_or(|end| end > MAX_INNER_CIPHERTEXT_PAYLOAD) {
+            anyhow::bail!("π_WIN: window {i} is empty or exceeds a record");
+        }
+        if w.expected.is_empty() || w.sel_start.checked_add(w.expected.len()).is_none_or(|end| end > w.ct.len()) {
+            anyhow::bail!("π_WIN: window {i} compares nothing or bytes outside its ciphertext");
+        }
+    }
+    Ok(())
+}
+
+pub fn build_pi_win<VM: Vm<Binary>>(
+    vm: &mut VM,
+    role: Role,
+    p: &PiWin,
+    witness: Option<&Witness>,
+) -> anyhow::Result<Vec<Check>> {
+    check_pi_win(p)?;
+    let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "anchor", &p.anchor, witness, p.key_updates)?;
+    // Keystream blocks by (seq, block): windows of one record may share one.
+    let mut keystream: std::collections::HashMap<(u64, usize), Vector<U8>> = std::collections::HashMap::new();
+    let mut outs = Vec::with_capacity(p.windows.len());
+    let mut want = Vec::new();
+    for w in &p.windows {
+        let first = w.off / 16;
+        let nblocks = w.ct.len().div_ceil(16);
+        let mut blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
+        for b in first..first + nblocks {
+            let ks = match keystream.get(&(w.seq, b)) {
+                Some(ks) => *ks,
+                None => {
+                    // J0 has counter 1; keystream block `b` has counter `b + 2`.
+                    let ctr = ctr_block(vm, &iv, w.seq, (b + 2) as u32)?;
+                    let ks: Vector<U8> = aes_block(vm, &k, &ctr)?.into();
+                    keystream.insert((w.seq, b), ks);
+                    ks
+                }
+            };
+            blocks.push(ks);
+        }
+        let ks_all = concat(vm, &blocks)?;
+        let ks_used = select(vm, &ks_all, 0, w.ct.len())?;
+        let ct = public_bytes(vm, &w.ct)?;
+        let pt = xor_bytes(vm, &ct, &ks_used)?;
+        outs.push(select(vm, &pt, w.sel_start, w.expected.len())?);
+        want.extend_from_slice(&w.expected);
+    }
+    let all = concat(vm, &outs)?;
+    let expected = public_bytes(vm, &want)?;
+    let eq = eq_bytes(vm, &all, &expected)?;
+    Ok(vec![anchor, Check::full("windows", eq, vec![1u8])])
 }
 
 pub fn build_pi_nk<VM: Vm<Binary>>(

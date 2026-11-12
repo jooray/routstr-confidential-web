@@ -227,8 +227,14 @@ pub fn spawn_twopc(out: Out) -> Input {
     let (ctl_tx, ctl_rx) = unbounded::<Value>();
     let (in_tx, party_io, stop) = bridge(&out, Some(ctl_tx));
     rt::spawn(async move {
-        if let Err(msg) = run_twopc(out.clone(), ctl_rx, party_io).await {
-            emit(&out, json!({"ev":"error","msg":msg}));
+        match run_twopc(out.clone(), ctl_rx, party_io).await {
+            Ok(()) => {}
+            // `twopc::Error::VersionMismatch` prints with this code first
+            // (as `cu-2pc`, which exits with status 3).
+            Err(msg) if msg.starts_with(twopc::VERSION_MISMATCH) => {
+                emit(&out, json!({"ev":"error","code":twopc::VERSION_MISMATCH,"msg":msg}));
+            }
+            Err(msg) => emit(&out, json!({"ev":"error","msg":msg})),
         }
         emit(&out, json!({"ev":"exit"}));
         let _ = stop.send(());
@@ -387,7 +393,7 @@ pub fn spawn_prover_job(job: &[u8], out: Out) -> Input {
 /// and the digest of the source files (`node scripts/source-digest.mjs`).
 pub fn build_info() -> String {
     format!(
-        "client-wasm {} (protocol v2; routstr-confidential@{}, mpz2@{}, src:{})",
+        "client-wasm {} (protocol v3, twopc split-public-1; routstr-confidential@{}, mpz2@{}, src:{})",
         env!("CARGO_PKG_VERSION"),
         env!("CU_UPSTREAM"),
         env!("CU_MPZ2"),
@@ -395,7 +401,7 @@ pub fn build_info() -> String {
     )
 }
 
-/// The zkbench v2 fixtures (`pi_nk`, `pi_c2s`, `pi_c3s`: params + witness),
+/// The zkbench fixtures (`pi_nk`, `pi_win`, `pi_c3s`: params + witness),
 /// for benchmarks against the bench node. Test data only.
 pub fn fixtures_v2_json() -> String {
     let v: Vec<Value> = zkbench::fixtures::all()

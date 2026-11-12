@@ -1,8 +1,8 @@
 diff --git a/crypto/twopc/Cargo.toml b/crypto/twopc/Cargo.toml
-index a226bfc..69c4bb9 100644
+index 2c6db07..493dba1 100644
 --- a/crypto/twopc/Cargo.toml
 +++ b/crypto/twopc/Cargo.toml
-@@ -31,13 +31,25 @@ sha2 = { version = "0.10", features = ["compress"] }
+@@ -35,13 +35,25 @@ sha2 = { version = "0.10", features = ["compress"] }
  rand = "0.10"
  getrandom = "0.3"
  futures = "0.3"
@@ -30,21 +30,21 @@ index a226bfc..69c4bb9 100644
  cu-crypto = { path = "../cu-crypto" }
  # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
-index 3affaa2..e2f8b72 100644
+index 729632b..b2fd415 100644
 --- a/crypto/twopc/src/lib.rs
 +++ b/crypto/twopc/src/lib.rs
-@@ -25,8 +25,8 @@
+@@ -28,8 +28,8 @@
  //! p.close().await;
  //! ```
  //!
 -//! `Party::new` needs a running tokio runtime (it spawns the channel
--//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
+-//! multiplexer). It writes [`VERSION_TAG`] as the first bytes on the
 +//! `Party::new` needs a running executor (it spawns the channel
-+//! multiplexer: tokio natively, `wasm-bindgen-futures` on wasm32, see [`rt`]); `close` flushes the transport; `take_timings` returns per-step
- //! wall time and transport bytes.
- //!
- //! The library sets no deadlines: a receive waits until the peer's data or
-@@ -105,13 +105,15 @@ pub mod circuits;
++//! multiplexer: tokio natively, `wasm-bindgen-futures` on wasm32, see [`rt`]). It writes [`VERSION_TAG`] as the first bytes on the
+ //! transport and reads the peer's; anything else is
+ //! [`Error::VersionMismatch`] (`twopc_version_mismatch`). `close` flushes the
+ //! transport; `take_timings` returns per-step wall time and transport bytes.
+@@ -96,14 +96,16 @@ pub mod circuits;
  mod ectf;
  pub mod gc;
  mod mux;
@@ -56,18 +56,19 @@ index 3affaa2..e2f8b72 100644
  mod tests;
  
  use std::sync::Arc;
+ use std::sync::LazyLock;
 -use std::time::Instant;
 +use rt::Instant;
  
  use futures::{AsyncRead, AsyncWrite};
  use mpz_common::{Context, Flush};
-@@ -431,6 +433,30 @@ fn os_rng() -> StdRng {
+@@ -547,6 +549,29 @@ fn os_rng() -> StdRng {
      r
  }
  
-+/// `[f(0), f(1)]` on two scoped threads while `body` runs on this one
++/// `[f(0), …, f(n-1)]` on scoped threads while `body` runs on this one
 +/// (natively); sequentially on wasm32, which has no threads.
-+fn scope2<T, F, B>(f: &F, body: B) -> [T; 2]
++fn scope_n<T, F, B>(n: usize, f: &F, body: B) -> Vec<T>
 +where
 +    T: Send,
 +    F: Fn(usize) -> T + Sync,
@@ -76,33 +77,32 @@ index 3affaa2..e2f8b72 100644
 +    #[cfg(not(target_arch = "wasm32"))]
 +    {
 +        std::thread::scope(|sc| {
-+            let r0 = sc.spawn(|| f(0));
-+            let r1 = sc.spawn(|| f(1));
++            let hs: Vec<_> = (0..n).map(|s| sc.spawn(move || f(s))).collect();
 +            body();
-+            [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
++            hs.into_iter().map(|h| h.join().expect("rows thread")).collect()
 +        })
 +    }
 +    #[cfg(target_arch = "wasm32")]
 +    {
 +        body();
-+        [f(0), f(1)]
++        (0..n).map(f).collect()
 +    }
 +}
 +
  fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
      let mut out = Vec::with_capacity(16 * v.len());
      for b in v {
-@@ -700,7 +726,7 @@ impl Party {
+@@ -882,7 +907,7 @@ impl Party {
          if *TRACE {
              let c = self.counters.clone();
              let who = if self.role == Role::C { "C" } else { "N" };
 -            tokio::spawn(async move {
 +            rt::spawn(async move {
                  let t0 = Instant::now();
-                 let mut last = (0, 0);
+                 let mut last = (0, 0, 0);
                  for _ in 0..200 {
-@@ -709,7 +735,7 @@ impl Party {
-                         eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
+@@ -897,7 +922,7 @@ impl Party {
+                         );
                          last = v;
                      }
 -                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -110,16 +110,16 @@ index 3affaa2..e2f8b72 100644
                  }
              });
          }
-@@ -733,7 +759,7 @@ impl Party {
-         let c_bits = spec(0).c_bits + spec(1).c_bits;
-         let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
+@@ -921,7 +946,7 @@ impl Party {
+         let delta = self.delta;
+         let mut grng = StdRng::from_seed(self.rng.random());
  
 -        let garble = tokio::task::spawn_blocking(move || {
 +        let garble = rt::spawn_blocking(move || {
-             (0..2)
-                 .map(|p| {
-                     let s = spec(p);
-@@ -791,7 +817,7 @@ impl Party {
+             let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
+             let (k, tables) = gc::garble(&sp.circ, delta, &in_keys, 0, &mut grng);
+             (SecretBlocks(k), tables)
+@@ -974,7 +999,7 @@ impl Party {
                      && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
                      && t0.elapsed() < TABLES_MAX_WAIT
                  {
@@ -128,54 +128,53 @@ index 3affaa2..e2f8b72 100644
                  }
              }
          };
-@@ -897,7 +923,7 @@ impl Party {
-         let mask_bits = Zeroizing::new(mask_bits.to_vec());
-         let mask_macs = SecretBlocks(mask_macs.to_vec());
-         drop((r_bits, r_macs));
--        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
-+        let (st, keys, msgs) = rt::spawn_blocking(move || {
-             // Check rows and Y_N per phase.
-             let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
-                 let (lam, mac, t_mac) = &st[p];
-@@ -940,9 +966,7 @@ impl Party {
+@@ -1066,7 +1091,7 @@ impl Party {
+ 
+         // Product check, openings, consistency-check material, label-check
+         // pairs (CPU, blocking).
+-        let (st, msgs) = tokio::task::spawn_blocking(move || {
++        let (st, msgs) = rt::spawn_blocking(move || {
+             let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
+                 let sh = &lay.shapes[s];
+                 let pw = gc::powers(chi_ck[s], sh.ands.len());
+@@ -1108,8 +1133,7 @@ impl Party {
                  (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
              };
              let mut msgs: Vec<Vec<u8>> = Vec::new();
 -            let rows = std::thread::scope(|sc| {
--                let r0 = sc.spawn(|| rows_of(0));
--                let r1 = sc.spawn(|| rows_of(1));
-+            let rows = scope2(&rows_of, || {
+-                let hs: Vec<_> = (0..N_STAGES).map(|s| sc.spawn(move || rows_of(s))).collect();
++            let rows = scope_n(N_STAGES, &rows_of, || {
+                 let pw = gc::powers(chi_dv, lay.n_and);
                  let mut acc = (Block::ZERO, Block::ZERO);
-                 for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
-                     let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
-@@ -987,7 +1011,6 @@ impl Party {
+                 gc::dvzk_prover_acc(&lay.ands, &lam, &mac, &t_mac, &pw, &mut acc);
+@@ -1155,7 +1179,6 @@ impl Party {
                  let mut open = from_bits(&bits);
                  open.extend_from_slice(&hd);
                  msgs.push(open);
--                [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
+-                hs.into_iter().map(|h| h.join().expect("rows thread")).collect::<Vec<_>>()
              });
              for (r, y) in rows {
                  msgs.push(r);
-@@ -1103,7 +1126,7 @@ impl Party {
+@@ -1299,7 +1322,7 @@ impl Party {
          let chi_dv = chi(&seed, b"dvzk");
-         let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
+         let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
          let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
 -        let compute = tokio::task::spawn_blocking(move || {
 +        let compute = rt::spawn_blocking(move || {
-             let mut off = 0;
-             let mut per = Vec::new();
-             let mut acc = Block::ZERO;
-@@ -1519,7 +1542,7 @@ impl Party {
-             && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
- 
-         let circ = s.circ.clone();
--        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
-+        let (ok_check, out_labels) = rt::spawn_blocking(move || {
-             let l = SecretBlocks(gc::evaluate(&circ, &inl, &tables, phase));
-             drop(inl);
-             let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
+             let nb = lay.base.len();
+             let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
+             let t_key = &kfix[nb..nb + lay.n_and];
+@@ -1824,7 +1847,7 @@ impl Party {
+         let (y_n, salt) = (st.y_n[s], st.salt);
+         let tables = std::mem::take(&mut st.tables);
+         let mut l = std::mem::take(&mut st.l);
+-        let (ok_check, tables, l) = tokio::task::spawn_blocking(move || {
++        let (ok_check, tables, l) = rt::spawn_blocking(move || {
+             let sh = &lay.shapes[s];
+             gc::evaluate_range(&sp.circ, &mut l, &tables, sh.gates.clone(), sh.ands.start, 0);
+             let ok = gc::run_check(salt, s, &lay.ands[sh.ands.clone()], &sh.rows, &l, &ck, &rows, y_n, delta_b);
 diff --git a/crypto/twopc/src/mux.rs b/crypto/twopc/src/mux.rs
-index 21e6e06..d51662d 100644
+index e1a785e..26263ed 100644
 --- a/crypto/twopc/src/mux.rs
 +++ b/crypto/twopc/src/mux.rs
 @@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
@@ -404,10 +403,10 @@ index f948594..7db6f8e 100644
  rayon = ["mpz-zk/rayon"]
  
 diff --git a/crypto/zkbench/src/channel.rs b/crypto/zkbench/src/channel.rs
-index ec8852a..7acf798 100644
+index a731090..62f7aed 100644
 --- a/crypto/zkbench/src/channel.rs
 +++ b/crypto/zkbench/src/channel.rs
-@@ -34,7 +34,7 @@
+@@ -35,7 +35,7 @@
  //!   it, so a cheating prover can never probe a Δ more than once.
  
  use std::sync::Arc;
@@ -416,7 +415,7 @@ index ec8852a..7acf798 100644
  
  use anyhow::{Context as _, Result, anyhow, bail};
  use futures::{AsyncRead, AsyncWrite};
-@@ -494,7 +494,7 @@ impl ZkChannel {
+@@ -502,7 +502,7 @@ impl ZkChannel {
  
          let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64 };
          ctl.io_mut().send(mine).await.context("proof channel hello")?;
@@ -426,7 +425,7 @@ index ec8852a..7acf798 100644
              .map_err(|_| anyhow::anyhow!("proof channel hello: no reply in {}s", HELLO_TIMEOUT.as_secs()))?
              .context("proof channel hello")?;
 diff --git a/crypto/zkbench/src/lib.rs b/crypto/zkbench/src/lib.rs
-index efdedbc..9e69c29 100644
+index 67971c0..f7692f3 100644
 --- a/crypto/zkbench/src/lib.rs
 +++ b/crypto/zkbench/src/lib.rs
 @@ -11,7 +11,9 @@ pub mod mux;
@@ -493,7 +492,7 @@ index d7f9e87..eb6b4de 100644
          self.reader.abort();
      }
 diff --git a/crypto/zkbench/src/proofs.rs b/crypto/zkbench/src/proofs.rs
-index 385e07a..e154720 100644
+index 0b10485..e44ff1d 100644
 --- a/crypto/zkbench/src/proofs.rs
 +++ b/crypto/zkbench/src/proofs.rs
 @@ -12,11 +12,14 @@ use mpz_ot::{
@@ -511,7 +510,7 @@ index 385e07a..e154720 100644
  use crate::transport::Counters;
  
  pub(crate) fn ferret_config() -> ferret::FerretConfig {
-@@ -202,7 +205,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
+@@ -208,7 +211,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
      let witness_p = witness.clone();
      let params_v = params.clone();
  
@@ -520,7 +519,7 @@ index 385e07a..e154720 100644
          let checks = build(&mut prover, Role::Prover, &params_p, Some(&witness_p))?;
          let mut futs = Vec::with_capacity(checks.len());
          for c in &checks {
-@@ -218,7 +221,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
+@@ -224,7 +227,7 @@ pub async fn run_pair_ideal(params: &Params, witness: &Witness) -> Result<Vec<Ch
          Ok::<_, anyhow::Error>(())
      });
  
@@ -529,7 +528,7 @@ index 385e07a..e154720 100644
          let checks = build(&mut verifier, Role::Verifier, &params_v, None)?;
          let mut futs = Vec::with_capacity(checks.len());
          for c in &checks {
-@@ -283,6 +286,7 @@ fn sha256_blocks(len: usize) -> usize {
+@@ -290,6 +293,7 @@ fn sha256_blocks(len: usize) -> usize {
  }
  
  /// Outcome of a prover‖verifier run over an emulated transport.
@@ -537,7 +536,7 @@ index 385e07a..e154720 100644
  #[derive(Debug)]
  pub struct PairOutcome {
      pub checks: Vec<CheckResult>,
-@@ -292,6 +296,7 @@ pub struct PairOutcome {
+@@ -299,6 +303,7 @@ pub struct PairOutcome {
  }
  
  /// Run prover and verifier against each other over the emulated transport.

@@ -73,23 +73,44 @@ fn pi_nk_malformed_params_are_errors() {
 }
 
 #[test]
-fn pi_c2s_window_overflow_is_an_error() {
-    let (params, witness) = fixtures::pi_c2s();
-    let Params::PiC2S(mut p) = params else { unreachable!() };
-    p.sel_start = usize::MAX;
-    assert_rejected("sel_start + sel_len overflows", &Params::PiC2S(p), Some(&witness));
+fn pi_win_suffix_window_malformed_params_are_errors() {
+    // The framing "1.1" shape: one whole-record window.
+    let (params, witness) = fixtures::pi_win_suffix();
+    let Params::PiWin(p) = params else { unreachable!() };
+    let cases: Vec<(&str, Box<dyn Fn(&mut zkbench::statements::WinWindow)>)> = vec![
+        ("sel_start + |expected| overflows", Box::new(|w| w.sel_start = usize::MAX)),
+        ("compared range one past the ciphertext", Box::new(|w| w.sel_start = 1)),
+        ("expected longer than the ciphertext", Box::new(|w| w.expected.push(0))),
+        ("ciphertext shorter than expected", Box::new(|w| { w.ct.pop(); })),
+        ("empty ciphertext", Box::new(|w| w.ct.clear())),
+        ("nothing compared", Box::new(|w| w.expected.clear())),
+        ("unaligned offset", Box::new(|w| w.off = 1)),
+        ("offset overflows", Box::new(|w| w.off = usize::MAX - 15)),
+        ("window past a record", Box::new(|w| w.off = zkbench::statements::MAX_INNER_CIPHERTEXT_PAYLOAD)),
+    ];
+    for (case, mutate) in cases {
+        let mut q = p.clone();
+        mutate(&mut q.windows[0]);
+        assert_rejected(case, &Params::PiWin(q), Some(&witness));
+    }
+    // The constructor refuses lengths that do not agree, and an empty record.
+    use zkbench::statements::WinWindow;
+    assert!(WinWindow::whole_record(0, vec![1, 2], vec![1]).is_err());
+    assert!(WinWindow::whole_record(0, vec![1], vec![1, 2]).is_err());
+    assert!(WinWindow::whole_record(0, vec![], vec![]).is_err());
+    assert!(WinWindow::whole_record(0, vec![1, 2], vec![3, 4]).unwrap().is_whole_record());
 }
 
 #[test]
 fn wrong_witness_kind_is_an_error() {
-    let (params, _) = fixtures::pi_c2s();
+    let (params, _) = fixtures::pi_win_suffix();
     let (_, key) = fixtures::pi_nk();
     let r = catch_unwind(AssertUnwindSafe(|| {
         let (_, ot_recv) = ideal_rcot(Block::ZERO, Block::ONE);
         let mut prover = Prover::new(ProverConfig::default(), ot_recv);
         build(&mut prover, Role::Prover, &params, Some(&key)).map(|_| ())
     }));
-    assert!(matches!(r, Ok(Err(_))), "π_C2S with a node-key witness must be an error");
+    assert!(matches!(r, Ok(Err(_))), "π_WIN with a node-key witness must be an error");
     let (params, _) = fixtures::pi_nk();
     let r = catch_unwind(AssertUnwindSafe(|| {
         let (_, ot_recv) = ideal_rcot(Block::ZERO, Block::ONE);
@@ -97,14 +118,6 @@ fn wrong_witness_kind_is_an_error() {
         build(&mut prover, Role::Prover, &params, None).map(|_| ())
     }));
     assert!(matches!(r, Ok(Err(_))), "π_NK without a witness must be an error");
-}
-
-#[test]
-fn pi_c2s_sel_len_mismatch_is_an_error() {
-    let (params, witness) = fixtures::pi_c2s();
-    let Params::PiC2S(mut p) = params else { unreachable!() };
-    p.sel_len -= 1;
-    assert_rejected("sel_len != |expected|", &Params::PiC2S(p), Some(&witness));
 }
 
 #[test]
@@ -204,4 +217,31 @@ fn largest_honest_disclosures_fit_the_caps() {
     for k in 0..16 {
         build_ok("short head, many records", 200_000 + k, small, 600, MAX_C3S_NEED - 600);
     }
+}
+
+#[test]
+fn pi_win_malformed_params_are_errors() {
+    let (params, witness) = fixtures::pi_win();
+    for (side, r) in ["prover", "verifier"].iter().zip(build_both(&params, Some(&witness))) {
+        assert!(r.is_ok(), "pi_win ({side}): {r:?}");
+    }
+    let Params::PiWin(p) = params else { unreachable!() };
+    let cases: Vec<(&str, Box<dyn Fn(&mut zkbench::statements::PiWin)>)> = vec![
+        ("no windows", Box::new(|p| p.windows.clear())),
+        ("unaligned offset", Box::new(|p| p.windows[1].off = 3)),
+        ("empty window", Box::new(|p| p.windows[1].ct.clear())),
+        ("nothing compared", Box::new(|p| p.windows[1].expected.clear())),
+        ("compared range outside the window", Box::new(|p| p.windows[1].sel_start = usize::MAX - 2)),
+        ("window past a record", Box::new(|p| p.windows[1].off = 1 << 20)),
+        ("too many key updates", Box::new(|p| p.key_updates = 1000)),
+    ];
+    for (name, f) in cases {
+        let mut q = p.clone();
+        f(&mut q);
+        assert_rejected(name, &Params::PiWin(q), Some(&witness));
+    }
+    // The prover needs the secret witness; a node-key witness is an error.
+    let (_, nk) = fixtures::pi_nk();
+    let [prover, _] = build_both(&Params::PiWin(p), Some(&nk));
+    assert!(matches!(prover, Err(e) if e.starts_with("error:")));
 }

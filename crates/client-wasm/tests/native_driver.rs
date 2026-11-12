@@ -142,11 +142,11 @@ async fn zkchan_driver_against_node_channel() {
     }
     // Params for another statement than the command names are refused
     // before anything reaches the channel (the channel stays usable).
-    let (_, c2s_params, c2s_w) = zkbench::fixtures::all().remove(1);
-    cmd(&input, json!({"cmd":"prove","id":8,"proof":"pi_c3s","params":c2s_params,"witness":c2s_w}));
+    let (_, win_params, win_w) = zkbench::fixtures::all().remove(1);
+    cmd(&input, json!({"cmd":"prove","id":8,"proof":"pi_c3s","params":win_params,"witness":win_w}));
     let d = next_ev(&mut ev, "done").await;
     assert_eq!(d["ok"], false);
-    assert!(d["err"].as_str().unwrap().contains("the params are for pi_c2s"), "{d}");
+    assert!(d["err"].as_str().unwrap().contains("the params are for pi_win"), "{d}");
     // The client may not prove what the node proves.
     let (_, nk_params, nk_w) = zkbench::fixtures::all().remove(0);
     cmd(&input, json!({"cmd":"prove","id":9,"proof":"pi_nk","params":nk_params,"witness":nk_w}));
@@ -171,20 +171,26 @@ fn fixtures_are_valid_json() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prover_job_refuses_params_for_another_proof() {
-    let (_, c2s_params, c2s_w) = zkbench::fixtures::all().remove(1);
-    let job = serde_json::to_vec(&json!({"proof":"pi_c3s","role":"prover","params":c2s_params,"witness":c2s_w})).unwrap();
+    let (_, win_params, win_w) = zkbench::fixtures::all().remove(1);
+    let job = serde_json::to_vec(&json!({"proof":"pi_c3s","role":"prover","params":win_params,"witness":win_w})).unwrap();
     let (_node_io, mut ev, _input) = wire(|o| driver::spawn_prover_job(&job, o));
     let d = next_ev(&mut ev, "done").await;
     assert_eq!(d["ok"], false);
-    assert!(d["err"].as_str().unwrap().contains("its params are for pi_c2s"), "{d}");
+    assert!(d["err"].as_str().unwrap().contains("its params are for pi_win"), "{d}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn input_backlog_is_bounded() {
     // No node: the 2PC driver never reads past its first message, so input
     // queues up until the limit, then the input closes and the driver stops.
+    // The flood is no valid tag, so without one the driver would stop at its
+    // first byte (`twopc_version_mismatch`) and the input end with `Stopped`:
+    // the node's version tag goes first, then the driver waits in its
+    // preprocessing for a message the zeros never complete.
     let (out_tx, mut out_rx) = unbounded::<Frame>();
     let input = driver::spawn_twopc(out_tx);
+    input.unbounded_send((0, twopc::VERSION_TAG.to_vec())).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let chunk = vec![0u8; 8 << 20];
     let mut sent = 0usize;
     let err = loop {
@@ -208,4 +214,25 @@ async fn input_backlog_is_bounded() {
     })
     .await;
     assert_eq!(ended, Ok(true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn twopc_version_mismatch_is_reported() {
+    // A peer whose first bytes are another version tag (a v2 node sends no
+    // tag at all and starts with its own protocol bytes).
+    let (out_tx, mut out_rx) = unbounded::<Frame>();
+    let input = driver::spawn_twopc(out_tx);
+    input.unbounded_send((0, b"routstr-2pc/v2-other\n".to_vec())).unwrap();
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some((ch, data)) = out_rx.next().await {
+            let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+            if ch == 1 && v["ev"] == "error" {
+                return v;
+            }
+        }
+        Value::Null
+    })
+    .await
+    .unwrap();
+    assert_eq!(ev["code"], "twopc_version_mismatch", "{ev}");
 }
