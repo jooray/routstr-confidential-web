@@ -31,8 +31,8 @@ two-party key schedule `split-public-1` (node-only authenticated garbling,
 provider: `"2"` (HTTP/2, many requests on one connection and one 2PC) and
 `"1.1"` (one request per connection). It needs a v3 node: a v2 node's offer
 is refused as `node_protocol_outdated`, and a v3 node answers a v2 client with
-426 `upgrade_required`. Tested against a local v3 node and sidecar on the real
-provider (`api.venice.ai`; `scripts/live-v3.mjs`, `scripts/browser-live-v3.mjs`).
+426 `upgrade_required` (routstr.cypherpunk.today runs v3). Tested against a local
+v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`, `scripts/browser-live-v3.mjs`).
 
 ## How it works (one connection, its requests)
 
@@ -346,7 +346,7 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 ## Dependencies on routstr-confidential
 
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
-`jooray/routstr-confidential` (branch `v3-h2`, protocol v3) at the commit named in
+`jooray/routstr-confidential` (branch `main`, protocol v3) at the commit named in
 `crates/vendor/UPSTREAM`, with the wasm32 patch applied. The patch is
 `patches/routstr-confidential-wasm32.patch`, explained in
 `patches/README.md`; applying it to that commit reproduces `crates/vendor/`
@@ -355,7 +355,7 @@ on that repository. mpz2 is pinned at the same rev (`8f89783`) and needed no
 change. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `h2.ts`,
 `hpack-tables.ts`, `pool.ts`, `wire.ts`, `suffix.ts`, `hosts.ts`,
 `canonical.ts`, `errors.ts` and the TLS fork come from routstr-sdk
-(`confidential-v3`) with node-only imports replaced (`hash.ts` stands in for
+(branch `confidential-2pc` of jooray/routstr-sdk) with node-only imports replaced (`hash.ts` stands in for
 `node:crypto`); `connection.ts` is a port of the SDK's with the 2PC and the
 proofs on the wasm host and the provider's certificate path kept for display. The browser changes to the TLS fork are listed in
 `src/tls-fork/FORK-NOTES.md`.

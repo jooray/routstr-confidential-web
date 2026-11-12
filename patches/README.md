@@ -3,7 +3,7 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at 55f381e (branch `v3-h2`, protocol v3; the base is
+`jooray/routstr-confidential` at 55f381e (branch `main`, protocol v3; the base is
 recorded in `crates/vendor/UPSTREAM`), and `git apply` of it there
 reproduces `crates/vendor/` byte for byte (`cu-crypto` needs no change and
 is a plain copy):
