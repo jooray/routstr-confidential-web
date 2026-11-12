@@ -3,13 +3,13 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at 9046353 (branch `twopc-v2`; the base is
+`jooray/routstr-confidential` at ccef4ba (branch `v3-h2`, protocol v3; the base is
 recorded in `crates/vendor/UPSTREAM`), and `git apply` of it there
 reproduces `crates/vendor/` byte for byte (`cu-crypto` needs no change and
 is a plain copy):
 
 ```bash
-cd routstr-confidential && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
+cd routstr-confidential && git checkout ccef4ba && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
 cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
@@ -34,9 +34,9 @@ What it changes:
    executor-agnostic.
 3. **`twopc/src/lib.rs`**: `tokio::task::spawn_blocking` → `rt::spawn_blocking`
    (4×), `tokio::spawn`/`sleep` → `rt::`, `std::time::Instant` → `rt::Instant`,
-   and the node-side `std::thread::scope` for the two phases' check rows
-   becomes `scope2` (threads natively, sequential on wasm). `testutil` is
-   native-only.
+   and the node-side `std::thread::scope` for the per-stage check rows of
+   `split-public-1` (five stages) becomes `scope_n` (threads natively,
+   sequential on wasm). `testutil` is native-only.
 4. **`zkbench`**: `channel.rs` uses `rt::Instant` and `rt::timeout` (the
    hello timeout); `proofs.rs` spawns with
    `rt::spawn`; the emulated `transport` module and `run_pair_transport`

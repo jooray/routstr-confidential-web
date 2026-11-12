@@ -13,61 +13,83 @@ For more depth, there is a programmer's guide, [How routstr confidential mode wo
   `createConfidentialClient(...)` → `client.chat.completions.create({...,
   stream: true})`, OpenAI-style. It is "routstrd as a library" for confidential
   inference.
-- `crates/client-wasm`: the client side of protocol v2 compiled to
-  `wasm32-unknown-unknown`. It runs the 2PC handshake (`cu-2pc`) and the
-  proof channel (`cu-prover --channel`: verify π_NK, prove π_C2S/π_C3S), plus
-  the per-proof fallback.
+- `crates/client-wasm`: the client side of protocol v3 compiled to
+  `wasm32-unknown-unknown`. It runs the two-party key schedule
+  (`cu-2pc`, `split-public-1`) and the proof channel (`cu-prover --channel`:
+  verify π_NK, prove π_WIN and π_C3S), plus the per-proof fallback.
 - The demo app is a separate repository,
   [routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa)
   ([live](https://jooray.github.io/routstr-confidential-pwa/)): a streaming
   chat, a wallet (Lightning, Cashu, refund), signed prices, pre-warming, and a
   panel that shows what your browser verified.
 
-It speaks protocol v2 of
-[routstr-confidential](https://github.com/jooray/routstr-confidential), the
-two-party handshake with node-only authenticated garbling. It needs no change
-on the node. It is tested against the production node
-`https://routstr.cypherpunk.today` (provider `api.venice.ai`).
+It speaks protocol v3 of
+[routstr-confidential](https://github.com/jooray/routstr-confidential)
+(`PROTOCOL-V3.md` there): a **connection** that carries **requests**, the
+two-party key schedule `split-public-1` (node-only authenticated garbling,
+16.4 MB of tables down instead of v2's 22.1 MB), and two framings towards the
+provider: `"2"` (HTTP/2, many requests on one connection and one 2PC) and
+`"1.1"` (one request per connection). It needs a v3 node: a v2 node's offer
+is refused as `node_protocol_outdated`, and a v3 node answers a v2 client with
+426 `upgrade_required`. Tested against a local v3 node and sidecar on the real
+provider (`api.venice.ai`; `scripts/live-v3.mjs`, `scripts/browser-live-v3.mjs`).
 
-## How it works (one request)
+## How it works (one connection, its requests)
 
-1. **Offer.** The page fetches `GET /v1/confidential/offer`. It verifies the
+1. **Offer.** The page fetches `GET /v1/confidential/offer?v=3`. It verifies the
    BIP-340 signature over the signed payload, checks it against the **pinned
    node key**, and accepts only a **trusted provider host**
-   (`api.venice.ai`). Prices, fees and the HTTP head template come from the
-   signed bytes only.
-2. **Setup.** The page opens a WebSocket to `/v1/confidential/ws` and sends its
-   `sk-` key in-band (`setup.auth`, never in a URL or header). It also sends
-   the offer signature and any signed fees it accepts. The node reserves the
-   worst-case cost.
-3. **2PC.** A Web Worker runs the wasm 2PC with the node over
-   `/v1/confidential/zk?proof=twopc`. The work is OT preprocessing (about
-   1.2 MB up and 22 MB of garbled tables down) followed by a joint P-256 key
-   share. Neither side ever knows the ECDHE secret. The proof channel's
-   OT/VOLE setup runs alongside over `?proof=zkchan`. A session that is ready
-   up to here is **armed** (pre-warmed).
-4. **TLS 1.3 to the provider**, from the page, through the node's relay. The
+   (`api.venice.ai`), `v = 3`, the key schedule `split-public-1`, the framings
+   it knows (`http`, the operator's order) and an `h2` block in range. Prices,
+   fees, the connection deposit and the head templates come from the signed
+   bytes only.
+2. **Framing.** `http: "auto"` (default) takes the offer's first framing; a
+   framing-`"2"` connection that fails to open falls back to `"1.1"` on the
+   same node for 10 minutes. `http: "1.1"` turns HTTP/2 off.
+3. **Setup.** The page opens a WebSocket to `/v1/confidential/ws?…&v=3` and
+   sends its `sk-` key in-band (`setup.auth`, never in a URL or header) and the
+   offer signature. The node reserves the **connection deposit** (nothing about
+   a request yet). A deposit above `maxConnectionDepositMsat` (default
+   100 sats) is refused before anything is sent.
+4. **2PC.** A Web Worker runs the wasm 2PC with the node over
+   `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-1`
+   first; another tag is `twopc_version_mismatch`): OT preprocessing (about
+   1.1 MB up, 16.4 MB down) and the joint P-256 key share. The proof channel's
+   OT/VOLE setup runs alongside (`?proof=zkchan`). A connection ready up to
+   here is **armed**: it holds the deposit and no provider connection.
+5. **TLS 1.3 to the provider**, from the page, through the node's relay: the
+   canonical ClientHello with the joint share and ALPN `h2` or `http/1.1`. The
    vendored TLS client (WebCrypto) validates the provider's certificate chain
    to the bundled Mozilla roots and checks the hostname, CertificateVerify and
-   Finished. The key schedule comes from the 2PC (phase A, then phase B): the
-   page gets `s_ap_0` and `c_ap_1`, and the node gets only `K_0`, the key of
-   the record that carries its API key.
-5. **π_NK.** The page verifies that the node's credential record is the
-   published head template, using a statement it rebuilds from the signed
-   offer. Then the node writes that record.
-6. **Body.** The page sends the body under `c_ap_1`. The final record is the
-   pinned suffix (model, `max_tokens`, `stream`). The node holds that record
-   until **π_C2S** proves it is the canonical suffix.
-7. **Response.** The answer streams. Every record is AES-GCM-authenticated under
-   `s_ap_0`, which only the page holds, and the chunks are handed out as they
-   decrypt.
-8. **Settlement.** **π_C3S** discloses only the usage event. The page then
-   verifies the node-signed attestation and the **signed receipt**: the
-   signature, the binding to this session, usage equal to its own plaintext,
-   and cost ≤ usage × signed rates + signed fee. A stream ends cleanly only
-   after all of these pass. Any failure throws, from the stream's iterator
-   and from `stream.verification`. A consumer that leaves the loop early (on
-   `finish_reason`, say) must await `stream.verification` to see it.
+   Finished; it accepts application data only after the handshake and no
+   plaintext record once TLS 1.3 keys are installed. The key schedule runs in
+   five stages; the page gets `s_ap_0` and `c_ap_1`, the node only `K_0`.
+6. **π_NK.** The page verifies that the node's epoch-0 record is the head it
+   rebuilt from the signed offer: framing `"2"` the HTTP/2 connection head
+   (preface, SETTINGS, the probe request that puts the credential into the
+   provider's HPACK table), framing `"1.1"` the request head of request 1.
+7. **Requests.** `request` n (model, `max_tokens` or the image variant and
+   count, the body length, the credential, the offer signature): the node
+   reserves the request's worst case and answers `request_ok`, or
+   `request_refused` (402, 409 …), which leaves the connection as it was. The
+   page sends the body (framing `"2"`: one HTTP/2 frame per TLS record, DATA
+   frames under the provider's flow control; `"1.1"`: the suffix alone in the
+   final record) and proves with **π_WIN** that every record is what it must
+   be: the node checks each window against its own relay buffer, the page
+   checks every window against its own plaintext before proving.
+8. **Response and settlement.** The answer streams, authenticated under
+   `s_ap_0`. **π_C3S** discloses only the usage event (an image is settled by
+   `accept` at the flat price; an error head by π_WIN or π_C3S). The page
+   verifies the node-signed attestation (connection, request, stream, the
+   server records of the request's interval and our own records) and the
+   **signed receipt**: its binding (`sid`, `http`, `n`), usage equal to our
+   plaintext, cost ≤ usage × signed rates + the session fee still due on the
+   connection, and the deposit released with the connection's first
+   settlement. A stream ends cleanly only after all of these pass.
+9. **Next request.** Framing `"2"`: the connection goes back to the pool and
+   the next request runs on it (no 2PC, no π_NK) until the node's idle limit,
+   `h2.max_requests` or `h2.max_lifetime_s`. Framing `"1.1"`: the connection
+   ends after its request.
 
 The protocol and its security argument are in routstr-confidential:
 `docs/TWOPC-DESIGN.md` and `paper/`.
@@ -115,39 +137,50 @@ Other caveats:
   http only for loopback or an onion service), the pinned node
   key and the trusted provider host are shown in the "Node" panel. The
   provider certificate the page validated is shown for every answer.
-- **Pre-warming.** An armed session holds a reservation, and the node may keep
-  an abandon fee (2 sats on `routstr.cypherpunk.today`) when an armed session
-  is never used. The library arms only after a first chat request with the
-  current key (that one runs cold), and then only while the page is visible,
-  the key has enough available balance and the user is active, at most one
-  session at a time. It does not arm if the abandon fee is above `maxAbandonFeeMsat`
-  (default 5 sats). An armed session that dies before use backs arming off
-  (30 s, doubling to 10 min, reset by a request an armed session served).
-  Hiding the page closes the armed session, and showing it again arms nothing
-  until the next activity or request. It does not arm on a metered connection
-  (`navigator.connection.saveData`, or a cellular link where the browser
-  reports one) unless `allowMetered` is set. It can be turned off.
+- **Linkability.** Requests on one framing-`"2"` connection share a TLS
+  connection to the provider, which can tell they come from one client (as
+  requests under one API key already are). `reuseScope` separates what must
+  not be linked; `http2.reuse: "none"` opens a connection per request.
+- **Pre-warming.** An armed connection holds the connection deposit and is
+  bound to the credential only; the node keeps the deposit when an armed
+  connection is never used. The library arms only after a first settled chat
+  request with the current key, and then only while the page is visible, the
+  user is active and the key's available balance covers the deposit plus one
+  reservation, at most one armed connection at a time. Framing `"2"`: one is
+  armed when the key has no open connection (its last one was closed idle)
+  or every open one is busy. It does not arm if the deposit is above
+  `maxDepositMsat` (default 5 sats). A failed arm backs off (30 s, doubling to
+  10 min). Hiding the page closes the armed connection, and showing it again
+  arms nothing until the next activity or request. It does not arm on a
+  metered connection (`navigator.connection.saveData`, or a cellular link
+  where the browser reports one) unless `allowMetered` is set. It can be
+  turned off.
 - **Stopping an answer.** An abort before the request body is released closes
-  the session (the node keeps at most the abandon fee). After release the
-  provider already has the request, so an abort only ends the caller's stream:
-  the session drains in the background (capped by the pinned `max_tokens`)
-  and settles on the usage the provider reported, and `verification` still
-  resolves with its receipt. Closing it would cost the whole reservation.
-- The 2PC has **no external review** yet (see routstr-confidential). The
-  client's selective-failure leakage bound is ≤ log2 6 bits per session, about
-  fresh single-use values.
+  the connection (the node keeps the deposit if the connection settled nothing
+  yet, else at most the abandon fee). After release the provider already has
+  the request, so an abort only ends the caller's stream: the request drains
+  in the background (capped by the pinned `max_tokens`) and settles on the
+  usage the provider reported, and `verification` still resolves with its
+  receipt. Closing it would cost the whole reservation.
+- The 2PC and π_WIN have **no external review** yet (see routstr-confidential).
+  A cheating node learns at most log2 8 = 3 bits per connection about fresh,
+  single-use values.
 
 ## Costs (all read from the signed offer, never hard-coded)
 
 - **Per message**: the provider-reported usage at the offer's signed rates (msat
-  per 1k tokens), plus `session_fee_msat` if the node sets one. A typical
-  short chat on `deepseek-v4-flash` costs well under 1 sat. Each answer shows
-  its exact cost from the signed receipt.
+  per 1k tokens), plus `session_fee_msat` **once per connection** (at its
+  first settlement). Each answer shows its exact cost from the signed receipt.
+- **Connection deposit** (`connection_deposit_msat`): reserved at a
+  connection's setup, released by its first settled request (the receipt says
+  `deposit_released_msat`), kept when the connection ends without one (an
+  unused armed connection, a request abandoned before release). A failure of
+  the node, its sidecar or the provider releases it; the node signs the
+  outcome in the connection's last frame.
 - **Balance needed**: while a request runs, the node reserves its worst case: a
-  prompt filling the model's whole context, plus `max_tokens`, plus the fee. It
-  releases the unused part at settlement. The app shows this per model; for a
-  1M-context model it is about 160 sats.
-- **Unused prepared session**: `abandon_fee_msat` (2 sats on the production node).
+  prompt filling the model's whole context (the larger context length, at the
+  dearer of the input and cache-write rates), plus `max_tokens`, plus the fee.
+  A new connection needs that plus the deposit (`ModelPricing.requiredMsat`).
 - **Funding**: Lightning invoices from the node (`/lightning/invoice`; your
   wallet may add routing fees). Cashu tokens can create a key
   (`/v1/balance/create`) or top one up (`/v1/balance/topup`); the mint's
@@ -155,10 +188,12 @@ Other caveats:
   app reads each accepted mint's `/v1/keysets`. **Refund**
   (`/v1/balance/refund`) returns the whole balance as a Cashu token or to a
   Lightning address.
-- Node refusals the client maps to messages: **402** (insufficient balance for
-  the reservation), **409** (the offer or its fees changed: the library
-  refetches and retries once), **429** (3 unused sessions per address), **401**
-  (unknown key).
+- Node refusals the client maps to typed errors: `RequestRefusedError` (402
+  insufficient balance for a request's reservation, 409 `offer_expired` /
+  `offer_changed`: the library refetches the offer and retries once),
+  `ConnectionDepositError` (the deposit is not funded, or above the maximum),
+  `NodeProtocolOutdatedError` (a v2 node), `UpgradeRequiredError` (426),
+  `TwoPcVersionMismatchError`.
 
 ## Library usage
 
@@ -170,7 +205,8 @@ const client = createConfidentialClient({
   nodePubkeys: ["2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7"],
   trustedHosts: ["api.venice.ai"],
   credential: "sk-…",            // or client.setCredential(...) later
-  prewarm: true,                 // after a first request: one armed session while visible + funded
+  http: "auto",                  // or "2", or "1.1" (HTTP/2 off); client.setHttp(...) later
+  prewarm: true,                 // after a first request: one armed connection while visible + funded
   onEvent: (e) => console.debug(e), // progress events, never secrets
 });
 
@@ -182,7 +218,7 @@ const stream = await client.chat.completions.create({
 });
 for await (const chunk of stream) out.textContent += chunk.choices[0]?.delta?.content ?? "";
 const v = await stream.verification; // throws if any proof or receipt check failed
-console.log(v.provider?.chain[0]?.subject, v.receipt.cost_msats, v.timings);
+console.log(v.framing, v.n, v.connection, v.deposit, v.bytes, v.ttftMs, v.receipt.cost_msats, v.provider?.alpn);
 ```
 
 ### Images
@@ -223,14 +259,17 @@ console.log(r.msatPerImage, r.costMsats, r.confidential.receipt);
   (`resolution`, `quality`, `format`, values from the offer's `param_space`),
   and a head template on the image route with exactly the expected headers;
   anything else refuses the image block.
-- **No pre-arm**: every image request runs its own cold session (about 22 MB
-  down and 1.2 MB up of setup before the image) and never touches the chat
-  pre-warm pool.
+- **Framing**: on a framing-`"2"` connection when the offer's `h2.kinds` lists
+  images (it then reuses a connection a chat request left), else on a
+  connection of its own. Image requests never arm a connection in advance.
 
-Other entry points: `client.offer()`, `client.pricing(maxTokens)`,
-`client.prepare(model, maxTokens)` (pre-warm for the model the user picked),
-`client.activity()`, `client.setPrewarm(on)`, `client.api` (balance, Lightning,
-Cashu, refund), and `probeProviderTls` (diagnostics). The wasm runs in a module
+Other entry points: `client.offer()`, `client.pricing(maxTokens)` (rates,
+reservation, deposit, `requiredMsat`), `client.framing()`, `client.setHttp()`,
+`client.connections()` (the pool, no credentials), `client.prepare(model,
+maxTokens)`, `client.activity()`, `client.setPrewarm(on)`, `client.api`
+(balance, Lightning, Cashu, refund), `ConfidentialConnection` and
+`ConnectionPool` for callers that manage connections themselves, and
+`probeProviderTls` (diagnostics). The wasm runs in a module
 Worker (`WorkerWasmHost`) by default; pass `host: new InlineWasmHost()` to run
 it on the calling thread. The package is consumed as TypeScript source by a
 bundler (Vite, esbuild). It needs `new URL(..., import.meta.url)` worker and
@@ -255,7 +294,7 @@ Rebuilding the wasm needs rustup (the toolchain is pinned in
 (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`). `wasm-opt`
 comes from the `binaryen` devDependency. `.cargo/config.toml` selects the
 getrandom `wasm_js` backend and enables `simd128`, which every evergreen
-browser supports (Safari ≥ 16.4). The wasm is 5.93 MB, 1.8 MB gzipped. Commit
+browser supports (Safari ≥ 16.4). The wasm is 5.97 MB, 1.83 MB gzipped. Commit
 `wasm/pkg/` after rebuilding.
 
 **Checking the committed wasm.** The build is meant to be byte-reproducible:
@@ -285,16 +324,18 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 ## Dependencies on routstr-confidential
 
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
-`jooray/routstr-confidential` (branch `twopc-v2`) at the commit named in
+`jooray/routstr-confidential` (branch `v3-h2`, protocol v3) at the commit named in
 `crates/vendor/UPSTREAM`, with the wasm32 patch applied. The patch is
 `patches/routstr-confidential-wasm32.patch`, explained in
 `patches/README.md`; applying it to that commit reproduces `crates/vendor/`
 exactly. Once it is upstream, the vendored copies can become a git dependency
 on that repository. mpz2 is pinned at the same rev (`8f89783`) and needed no
-change. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `suffix.ts`,
-`hosts.ts`, `canonical.ts`, `errors.ts` and the TLS fork come from
-routstr-sdk (`confidential-2pc`) with node-only imports replaced; `session.ts`
-is a port of the SDK's with the same checks. The browser changes to the TLS fork are listed in
+change. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `h2.ts`,
+`hpack-tables.ts`, `pool.ts`, `wire.ts`, `suffix.ts`, `hosts.ts`,
+`canonical.ts`, `errors.ts` and the TLS fork come from routstr-sdk
+(`confidential-v3`) with node-only imports replaced (`hash.ts` stands in for
+`node:crypto`); `connection.ts` is a port of the SDK's with the 2PC and the
+proofs on the wasm host and the provider's certificate path kept for display. The browser changes to the TLS fork are listed in
 `src/tls-fork/FORK-NOTES.md`.
 
 ## Tests
@@ -315,12 +356,38 @@ npm run harness:build && node scripts/browser-bench.mjs chromium,firefox,webkit 
 # Browser TLS stack against the real provider via a test-only WS→TCP relay:
 node scripts/ws-tcp-relay.mjs 7451 & node scripts/tls-check.mjs
 
+# Protocol v3 live, against a local node + sidecar on the real provider (keys from the environment, never printed):
+npm run build && CONF_NODE=http://127.0.0.1:8451 CONF_KEY=sk-… node scripts/live-v3.mjs chat-2 chat-1.1 image refused   # in Node
+npm run harness:build && CONF_KEY=sk-… node scripts/browser-live-v3.mjs chat-2 chat-1.1 image refused                   # headless Chromium (ENGINE=firefox|webkit)
+
 ```
 
 `node scripts/browser-bench.mjs` and `scripts/tls-check.mjs` serve the test
 harness (`harness/`, `npm run harness:build`, built from `dist/`). End-to-end
 tests against the production node, including the live test with a funded key,
 live in the demo app's repository (`scripts/e2e-prod.mjs`).
+
+## Protocol v3, live (M2 Max laptop, headless Chromium 153, local node and sidecar, provider api.venice.ai)
+
+`scripts/browser-live-v3.mjs`, 2026-11-12, `mistral-small-3-2-24b-instruct` with
+`max_tokens` 24, the image `venice-sd35` (count 1). Time to first token from
+the call; bytes between page and node for the request, and for the
+connection's setup (2PC preprocessing, key share, proof channel, handshake,
+π_NK) when the request opened it.
+
+| case | framing | n | connection | first token | total | request up / down | setup up / down |
+|---|---|---|---|---|---|---|---|
+| chat | 2 | 1 | new | 4.98 s | 5.26 s | 0.08 / 0.02 MB | 2.55 / 17.96 MB |
+| chat | 2 | 2 | reused | 0.57 s | 0.87 s | 0.08 / 0.02 MB | — |
+| chat | 2 | 3 | reused | 1.08 s | 1.70 s | 0.09 / 1.46 MB¹ | — |
+| chat, HTTP/2 off | 1.1 | 1 | new | 4.10 s | 4.44 s | 0.08 / 0.10 MB | 2.55 / 17.88 MB |
+| refused (402), top-up, again | 2 | 1 | the same | 0.72 s | 1.06 s | 0.08 / 0.02 MB | — |
+| image | 2 | 1 | new | 10.76 s | 10.84 s | 0.04 / 0.05 MB | 2.55 / 17.96 MB |
+
+¹ the proof channel extending its correlations online on the third request.
+
+The v2 numbers below are kept for comparison (they name v2's π_C2S and the
+22.1 MB of v2 garbled tables).
 
 ## Measured timings (M2 Max laptop, loopback, against `bench-node`)
 
