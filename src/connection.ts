@@ -1994,6 +1994,7 @@ export class ConfidentialConnection {
     cur.releaseSent = true;
     const tw = await this.proof("pi_win", "prove", zp.params, { Secret: Array.from(this.ap!.clientAp1) });
     cur.proofs.push({ ...tw, purpose: "records", ...shape });
+    this.event({ ev: "pi_win_ok", first_seq: finalSeq, count: 1, windows: shape.windows });
     await this.until(() => cur.released, "body_released", this.timeouts.released);
 
     // The provider closes after its response; the node then attests on its
