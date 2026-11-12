@@ -15,5 +15,9 @@
     "types": []
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["src/tls-fork/**"]
+  "exclude": [
+    "src/tls-fork/**",
+    // Copies of routstr-sdk tests (node:fs, Buffer, node:stream): run by vitest, typechecked in the SDK.
+    "test/sdk-*.test.ts"
+  ]
 }

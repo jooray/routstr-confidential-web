@@ -3,8 +3,6 @@ import { VENICE_CHAT } from "./fixtures/chat.js";
 import {
   aggregateChatCompletion,
   buildPinnedBody,
-  chooseBucket,
-  padPinnedBody,
   requestedMaxTokens,
   SseParser,
 } from "../src/request.js";
@@ -20,7 +18,7 @@ import { costMsat, modelPricing, promptLimit } from "../src/pricing.js";
 import { offerReserveMarginTokens } from "../src/offer.js";
 import { verifyConfidentialOffer } from "../src/offer.js";
 import { fromHex, hex } from "../src/bytes.js";
-import prod from "./fixtures/cypherpunk-offer.json";
+import prod from "./fixtures/v3-node-offer.json";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -41,7 +39,7 @@ describe("canonical suffix", () => {
 describe("pinned body", () => {
   it("strips caller-supplied pinned keys and ends with the suffix", () => {
     const body = buildPinnedBody(
-      { model: "evil", max_tokens: 99999, n: 4, stream: false, messages: [{ role: "user", content: "hi" }] },
+      { model: "evil", max_tokens: 99999, n: 1, stream: false, messages: [{ role: "user", content: "hi" }] },
       "m",
       12,
       VENICE_CHAT,
@@ -52,6 +50,15 @@ describe("pinned body", () => {
     expect(text.slice(0, -suffix.length)).toBe('{"messages":[{"role":"user","content":"hi"}]');
     const j = JSON.parse(text);
     expect(j).toMatchObject({ model: "m", max_tokens: 12, n: 1, stream: true });
+  });
+
+  it("refuses n other than 1: one completion per request, never silently one of several", () => {
+    const msg = { messages: [{ role: "user", content: "hi" }] };
+    for (const n of [0, 2, 4, "1", true]) {
+      expect(() => buildPinnedBody({ ...msg, n }, "m", 12, VENICE_CHAT)).toThrow(/n = 1/);
+    }
+    expect(() => buildPinnedBody({ ...msg, n: 1 }, "m", 12, VENICE_CHAT)).not.toThrow();
+    expect(() => buildPinnedBody({ ...msg, n: null }, "m", 12, VENICE_CHAT)).not.toThrow();
   });
 
   it("needs a private field before the exact suffix", () => {
@@ -65,25 +72,6 @@ describe("pinned body", () => {
     expect(requestedMaxTokens({ max_tokens: 100000 }, 4096)).toBe(4096);
     expect(requestedMaxTokens({ max_completion_tokens: 7.9 }, 4096)).toBe(7);
     expect(requestedMaxTokens({}, 4096)).toBe(4096);
-  });
-
-  it("pads with spaces before the suffix: same JSON, suffix still last", () => {
-    const body = buildPinnedBody({ messages: [{ role: "user", content: "héllo" }] }, "m", 5, VENICE_CHAT);
-    const suffix = canonicalSuffix(VENICE_CHAT, "m", 5);
-    const padded = padPinnedBody(body, 4096, suffix);
-    expect(padded.length).toBe(4096);
-    expect(dec(padded).endsWith(suffix)).toBe(true);
-    expect(JSON.parse(dec(padded))).toEqual(JSON.parse(dec(body)));
-    expect(padPinnedBody(body, body.length, suffix)).toBe(body);
-    expect(() => padPinnedBody(body, body.length - 1, suffix)).toThrow(RangeError);
-    expect(() => padPinnedBody(enc('{"x":1}'), 4096, suffix)).toThrow(/suffix/);
-  });
-
-  it("chooses power-of-two buckets with headroom", () => {
-    expect(chooseBucket(0)).toBe(4096);
-    expect(chooseBucket(3200)).toBe(4096);
-    expect(chooseBucket(3400)).toBe(8192);
-    expect(chooseBucket(1e9)).toBe(8 << 20);
   });
 });
 
@@ -169,7 +157,7 @@ describe("streaming", () => {
 
 describe("pricing", () => {
   const offer = verifyConfidentialOffer(prod, {
-    pinnedPubkeys: ["2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7"],
+    pinnedPubkeys: [prod.notary_pubkey],
     trustedHosts: ["api.venice.ai"],
   });
   // The production offer without fees or a completion margin, so the expected
@@ -199,14 +187,30 @@ describe("pricing", () => {
     expect(q!.reservationMsat).toBe(Math.ceil((100_000 * r.in + 1016 * r.out) / 1000));
   });
 
-  it("takes the context length in the node's order: top_provider first, then the model's", () => {
-    // The first positive integer wins, not the larger one.
-    expect(promptLimit({ id: "a", top_provider: { context_length: 1000 }, context_length: 5000 })).toBe(1000);
+  it("takes the larger positive context length, as the node does", () => {
+    // The catalogue's top_provider may describe another provider: the larger one is reserved.
+    expect(promptLimit({ id: "a", top_provider: { context_length: 1000 }, context_length: 5000 })).toBe(5000);
+    expect(promptLimit({ id: "a", top_provider: { context_length: 9000 }, context_length: 5000 })).toBe(9000);
     expect(promptLimit({ id: "a", top_provider: { context_length: 0 }, context_length: 5000 })).toBe(5000);
     expect(promptLimit({ id: "a", top_provider: { context_length: null }, context_length: 5000 })).toBe(5000);
     expect(promptLimit({ id: "a", top_provider: { context_length: 1.5 }, context_length: 700 })).toBe(700);
     expect(promptLimit({ id: "a", top_provider: { context_length: -1 }, context_length: 0 })).toBeUndefined();
     expect(promptLimit({ id: "a" })).toBeUndefined();
+  });
+
+  it("prices the opaque prompt at the dearer of the input and cache-write rates", () => {
+    const rates = { in: 1000, cached_in: 100, cache_write: 1250, out: 2000 };
+    const o = { ...plain, price_list: { w: rates } };
+    const [p] = modelPricing(o, [{ id: "w", context_length: 1000 }], 10);
+    expect(p!.reservationMsat).toBe(Math.ceil((1000 * 1250 + (10 + offerReserveMarginTokens(o)) * 2000) / 1000));
+    const [q] = modelPricing({ ...o, price_list: { w: { ...rates, cache_write: 500 } } }, [{ id: "w", context_length: 1000 }], 10);
+    expect(q!.reservationMsat).toBe(Math.ceil((1000 * 1000 + (10 + offerReserveMarginTokens(o)) * 2000) / 1000));
+  });
+
+  it("adds the connection deposit to what a new connection needs", () => {
+    const [p] = modelPricing({ ...plain, connection_deposit_msat: 3000, price_list: { w: { in: 1000, out: 1000 } } }, [{ id: "w", context_length: 1000 }], 10);
+    expect(p!.connectionDepositMsat).toBe(3000);
+    expect(p!.requiredMsat).toBe(p!.reservationMsat! + 3000);
   });
 
   it("without a context length, reserves the model's maximum cost like the node", () => {

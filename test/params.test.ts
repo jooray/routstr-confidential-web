@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, checkPiNKParams, firstTailOffset } from "../src/params.js";
+import { checkPiC3SParams, checkPiNKParams, firstTailOffset, headTemplateProblem } from "../src/params.js";
 import { SessionProtocolError } from "../src/errors.js";
 
 describe("π_NK statement rebuilt from the signed offer", () => {
@@ -59,9 +59,9 @@ describe("head template", () => {
   ];
 
   it("takes exactly the expected headers on the kind's route", () => {
-    expect(() => checkHeadTemplate(head("/api/v1/chat/completions", STD), "api.example.com")).not.toThrow();
-    expect(() => checkHeadTemplate(head("/api/v1/image/generate", STD), "api.example.com", "images")).not.toThrow();
-    expect(() => checkHeadTemplate(head("/v1/images/generations", [...STD].reverse()), "API.example.com", "images")).not.toThrow();
+    expect(headTemplateProblem(head("/api/v1/chat/completions", STD), "api.example.com", "chat")).toBeUndefined();
+    expect(headTemplateProblem(head("/api/v1/image/generate", STD), "api.example.com", "images")).toBeUndefined();
+    expect(headTemplateProblem(head("/v1/images/generations", [...STD].reverse()), "API.example.com", "images")).toBeUndefined();
   });
 
   it("refuses another route, a query, another or a missing header", () => {
@@ -101,12 +101,12 @@ describe("head template", () => {
       ["/api/v1/chat/completions", STD.map((h) => (h.startsWith("Authorization") ? "Authorization: Bearer {KEY:4} x" : h)), "chat"],
     ];
     for (const [path, headers, kind] of bad) {
-      expect(() => checkHeadTemplate(head(path, headers), "api.example.com", kind)).toThrow(SessionProtocolError);
+      expect(headTemplateProblem(head(path, headers), "api.example.com", kind)).toBeTruthy();
     }
   });
 });
 
-describe("π_C2S / π_C3S windows are our own data", () => {
+describe("π_C3S windows are our own data", () => {
   const h1 = new Uint8Array(32).fill(1);
   const suffix = new TextEncoder().encode(',"model":"m","max_tokens":3}');
   const ctLen = 100;
@@ -125,23 +125,6 @@ describe("π_C2S / π_C3S windows are our own data", () => {
     },
   };
   const own = { h1, seq: 2, record, suffix };
-
-  it("accepts the window over our final record", () => {
-    expect(() => checkPiC2SParams(honest, own)).not.toThrow();
-  });
-
-  it("rejects a moved window, another record or another anchor", () => {
-    const moved = structuredClone(honest);
-    moved.PiC2S.off = 0;
-    expect(() => checkPiC2SParams(moved, own)).toThrow(SessionProtocolError);
-    const earlier = structuredClone(honest);
-    earlier.PiC2S.seq = 0;
-    expect(() => checkPiC2SParams(earlier, own)).toThrow(SessionProtocolError);
-    expect(() => checkPiC2SParams(honest, { ...own, h1: new Uint8Array(32) })).toThrow(/h1/);
-    // The bare suffix, without the record's content type byte, is not enough.
-    const bare = { PiC2S: { ...honest.PiC2S, sel_len: suffix.length, expected: [...suffix] } };
-    expect(() => checkPiC2SParams(bare, own)).toThrow(SessionProtocolError);
-  });
 
   it("π_C3S must cover exactly the final records we received", () => {
     const h2 = new Uint8Array(32).fill(2);

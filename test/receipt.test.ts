@@ -7,7 +7,7 @@ import {
   checkUpstreamErrorReceipt,
   feeOnlyChargeOk,
   maxChargeMsats,
-  errorStatusChargeMsat,
+  errorStatusCharge,
   parseSignedReceipt,
   verifyReceipt,
 } from "../src/receipt.js";
@@ -90,9 +90,9 @@ describe("receipt verification", () => {
     ).toThrow(/session fee/);
     // The abandon fee it names is bounded by the signed one, as in the SDK.
     expect(() =>
-      checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2001 }), 400, 100, 2000),
+      checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2001 }), 400, 100, { abandonFeeMsat: 2000 }),
     ).toThrow(/abandon fee/);
-    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2000 }), 400, 100, 2000)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 10, abandon_fee_msat: 2000 }), 400, 100, { abandonFeeMsat: 2000 })).toBe(true);
     // The status must be the one we saw, as a number.
     expect(checkUpstreamErrorReceipt(err("500", { cost_msats: 0 }), 500, 0)).toBe(false);
     expect(checkUpstreamErrorReceipt(err(502, { cost_msats: 0 }), 500, 0)).toBe(false);
@@ -101,33 +101,33 @@ describe("receipt verification", () => {
   it("bounds a rejected request by the abandon fee, a 429/503 by the session fee", () => {
     const err = (status: number, cost: number) => ({ sid: "s1", model: "m", usage: { error_status: status }, cost_msats: cost }) as never;
     // session fee 100, abandon fee 2000
-    expect(checkUpstreamErrorReceipt(err(400, 2000), 400, 100, 2000)).toBe(true);
-    expect(checkUpstreamErrorReceipt(err(404, 2000), 404, 100, 2000)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(400, 2000), 400, 100, { abandonFeeMsat: 2000 })).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(404, 2000), 404, 100, { abandonFeeMsat: 2000 })).toBe(true);
     // Less than the rule allows only favours the client (and a node not yet
     // charging the abandon fee stays usable).
-    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, 2000)).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(400, 2001), 400, 100, 2000)).toThrow(ReceiptVerificationError);
-    expect(checkUpstreamErrorReceipt(err(429, 100), 429, 100, 2000)).toBe(true);
-    expect(checkUpstreamErrorReceipt(err(503, 100), 503, 100, 2000)).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(429, 2000), 429, 100, 2000)).toThrow(ReceiptVerificationError);
-    expect(checkUpstreamErrorReceipt(err(503, 0), 503, 100, 2000)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, { abandonFeeMsat: 2000 })).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(400, 2001), 400, 100, { abandonFeeMsat: 2000 })).toThrow(ReceiptVerificationError);
+    expect(checkUpstreamErrorReceipt(err(429, 100), 429, 100, { abandonFeeMsat: 2000 })).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(503, 100), 503, 100, { abandonFeeMsat: 2000 })).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(429, 2000), 429, 100, { abandonFeeMsat: 2000 })).toThrow(ReceiptVerificationError);
+    expect(checkUpstreamErrorReceipt(err(503, 0), 503, 100, { abandonFeeMsat: 2000 })).toBe(true);
     // An abandon fee below the session fee counts as the session fee.
-    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, 0)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, { abandonFeeMsat: 0 })).toBe(true);
   });
 
   it("holds an image session's error receipt to its terms", () => {
     const image = { model: "z", variant: "webp", count: 2, msatPerImage: 12000 };
     const err = (status: number, extra: Record<string, unknown>) =>
       ({ sid: "s1", model: "z", kind: "images", variant: "webp", count: 2, usage: { error_status: status }, ...extra }) as never;
-    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 2000 }), 400, 0, 2000, image)).toBe(true);
+    expect(checkUpstreamErrorReceipt(err(400, { cost_msats: 2000 }), 400, 0, { abandonFeeMsat: 2000, image: image })).toBe(true);
     // Another kind, model, variant or count: refused.
     for (const other of [{ kind: undefined }, { model: "y" }, { variant: "1K-webp" }, { count: 1 }]) {
-      expect(() => checkUpstreamErrorReceipt(err(400, { cost_msats: 2000, ...other }), 400, 0, 2000, image)).toThrow(/image session/);
+      expect(() => checkUpstreamErrorReceipt(err(400, { cost_msats: 2000, ...other }), 400, 0, { abandonFeeMsat: 2000, image: image })).toThrow(/image error receipt/);
     }
     // Other 5xx: at most price × count + abandon fee, even under a larger named reservation.
-    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, 2000, image)).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26001, reserved_msats: 1e12 }), 500, 0, 2000, image)).toThrow(
-      /image session/,
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image: image })).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26001, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image: image })).toThrow(
+      /image error receipt/,
     );
   });
 
@@ -223,9 +223,9 @@ describe("receipt verification", () => {
   });
 
   it("charges the node's own provider-key errors the session fee", () => {
-    for (const s of [401, 402, 403, 429, 503]) expect(errorStatusChargeMsat(s, 2000, 5000)).toBe(2000);
-    expect(errorStatusChargeMsat(400, 2000, 5000)).toBe(5000);
-    expect(errorStatusChargeMsat(500, 2000, 5000)).toBeUndefined();
+    for (const s of [401, 402, 403, 429, 503]) expect(errorStatusCharge(s)).toBe("session_fee");
+    expect(errorStatusCharge(400)).toBe("abandon_fee");
+    expect(errorStatusCharge(500)).toBe("reservation");
   });
 });
 

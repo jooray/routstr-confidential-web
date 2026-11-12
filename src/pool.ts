@@ -441,9 +441,10 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         this.unusedDepositMsats += entry.conn.depositMsat;
         this.backoff(entry.key);
       }
+      const was = entry.state;
       this.remove(entry);
-      // A key that just lost its last open connection may want a spare (armWithoutOpen).
-      this.replenish();
+      // A key that just lost an idle open connection may want a spare (armWithoutOpen).
+      if (was === "idle") queueMicrotask(() => this.replenish());
     });
   }
 

@@ -6,8 +6,12 @@ import {
   OfferPinMismatchError,
   OfferUnpinnedError,
   OfferUnsupportedVersionError,
+  NodeProtocolOutdatedError,
   TrustedHostError,
 } from "../src/errors.js";
+import prodV2 from "./fixtures/cypherpunk-offer.json";
+
+const V2_PUBKEY = "2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7";
 import {
   fetchConfidentialOffer,
   offerAbandonFeeMsat,
@@ -16,9 +20,10 @@ import {
   verifyConfidentialOffer,
 } from "../src/offer.js";
 import { makeKey, sign, signedOffer } from "./helpers.js";
-import prod from "./fixtures/cypherpunk-offer.json";
+// A signed v3 offer from a scratch node on the real provider (its signing key was throwaway).
+import prod from "./fixtures/v3-node-offer.json";
 
-const PROD_PUBKEY = "2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7";
+const PROD_PUBKEY = prod.notary_pubkey;
 const HOSTS = ["api.venice.ai"];
 
 describe("canonical JSON + BIP-340", () => {
@@ -35,14 +40,20 @@ describe("canonical JSON + BIP-340", () => {
   });
   it("decodes npub and passes hex through", () => {
     expect(npubToHex(PROD_PUBKEY)).toBe(PROD_PUBKEY);
+    expect(npubToHex("2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7")).toBe("2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7");
     expect(npubToHex("not-a-key")).toBeNull();
   });
 });
 
 describe("offer verification", () => {
-  it("accepts the production node's signed offer under its pinned key", () => {
+  it("accepts a v3 node's signed offer under its pinned key", () => {
     const o = verifyConfidentialOffer(prod, { pinnedPubkeys: [PROD_PUBKEY], trustedHosts: HOSTS });
-    expect(o.v).toBe(2);
+    expect(o.v).toBe(3);
+    expect(o.twopc).toBe("split-public-1");
+    expect(o.http).toEqual(["2", "1.1"]);
+    expect(o.h2).toMatchObject({ probe_path: "/api/v1/models", kinds: ["chat", "images"] });
+    expect(o.connection_deposit_msat).toBeGreaterThan(0);
+    expect(o.images).toBeDefined();
     expect(o.upstream_host).toBe("api.venice.ai");
     expect(Object.keys(o.price_list).length).toBeGreaterThan(0);
   });
@@ -80,18 +91,26 @@ describe("offer verification", () => {
     expect(() => verifyConfidentialOffer(offer, { trustedHosts: HOSTS })).toThrow(OfferUnpinnedError);
   });
 
-  it("speaks v2 only (the browser has no v1 path)", () => {
-    const { offer, pubHex } = signedOffer({ v: 1, min_v: 1, max_v: 1 });
+  it("speaks v3 only: an older node is node_protocol_outdated, a newer one unsupported", () => {
+    for (const v of [1, 2]) {
+      const { offer, pubHex } = signedOffer({ v, min_v: v, max_v: v });
+      expect(() => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS })).toThrow(
+        NodeProtocolOutdatedError,
+      );
+    }
+    const { offer, pubHex } = signedOffer({ v: 4, min_v: 4, max_v: 4 });
     expect(() => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS })).toThrow(
       OfferUnsupportedVersionError,
     );
+    // The production node's last v2 offer (2026-10): refused as outdated.
+    expect(() => verifyConfidentialOffer(prodV2, { pinnedPubkeys: [V2_PUBKEY], trustedHosts: HOSTS })).toThrow(/node_protocol_outdated/);
   });
 
   it("rejects an offer whose version lies outside its own min_v..max_v", () => {
     for (const bad of [
-      { v: 2, min_v: 3, max_v: 3 },
-      { v: 2, min_v: 1, max_v: 1 },
-      { v: 2.5, min_v: 2, max_v: 3 },
+      { v: 3, min_v: 4, max_v: 4 },
+      { v: 3, min_v: 1, max_v: 2 },
+      { v: 3.5, min_v: 3, max_v: 4 },
     ]) {
       const { offer, pubHex } = signedOffer(bad);
       expect(() => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS })).toThrow(
@@ -128,7 +147,7 @@ describe("offer verification", () => {
       pinnedPubkeys: [PROD_PUBKEY],
       trustedHosts: HOSTS,
       fetchImpl: (async (url: string) => {
-        expect(url).toBe("https://node.example/v1/confidential/offer");
+        expect(url).toBe("https://node.example/v1/confidential/offer?v=3");
         return new Response(JSON.stringify(prod));
       }) as unknown as typeof fetch,
     });

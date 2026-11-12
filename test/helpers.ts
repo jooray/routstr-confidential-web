@@ -13,13 +13,12 @@ export function sign(payload: string, priv: Uint8Array): string {
   return bytesToHex(schnorr.sign(sha256(utf8ToBytes(payload)), priv));
 }
 
-/** An offer signed the way the node signs it: BIP-340 over sha256(canonical JSON). */
+/** A protocol-v3 offer signed the way the node signs it: BIP-340 over sha256(canonical JSON). */
 export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7) {
   const { priv, pubHex } = makeKey(keyFill);
   const offer: Record<string, unknown> = {
-    v: 2,
-    min_v: 2,
-    max_v: 2,
+    v: 3,
+    twopc: "split-public-1",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,

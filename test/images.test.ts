@@ -10,15 +10,22 @@ import {
   responseImages,
   toOpenAiImages,
 } from "../src/images.js";
-import { validateOfferShape, offerImages, type ConfidentialImagesOffer, type VerifiedOffer } from "../src/offer.js";
+import {
+  imagesOfferProblem,
+  offerImages,
+  validateOfferShape,
+  verifyConfidentialOffer,
+  type ConfidentialImagesOffer,
+  type VerifiedOffer,
+} from "../src/offer.js";
+import { NODE_PUB, signedV3Offer } from "./fixtures/v3.js";
 import { verifyFlatReceipt } from "../src/receipt.js";
 import { base64ToBytes, planImageRequest } from "../src/images.js";
-import { decodeImageResponse, imageOutcome } from "../src/session.js";
+import { checkImageResponse, imageOutcome } from "../src/wire.js";
 import { parseHttpResponse } from "../src/suffix.js";
 import { ProofChannel } from "../src/zkchan.js";
 import requestVectors from "./fixtures/image-request-vectors.json";
-import { ConfidentialSession } from "../src/session.js";
-import prod from "./fixtures/cypherpunk-offer.json";
+import prod from "./fixtures/v3-node-offer.json";
 
 const FIXED: [string, unknown][] = [
   ["return_binary", false],
@@ -97,6 +104,9 @@ describe("variant choice", () => {
   });
 });
 
+const policy = { pinnedPubkeys: [NODE_PUB], trustedHosts: ["api.venice.ai"] };
+const signed = (extra: Record<string, unknown>) => signedV3Offer(JSON.parse(JSON.stringify(extra)));
+
 describe("offer image block", () => {
   it("validates the block and honours the capability list", () => {
     const base = { ...(prod as object) } as Record<string, unknown>;
@@ -142,19 +152,26 @@ describe("offer image block", () => {
     ]) {
       // A malformed image block refuses images, not the offer's chat.
       expect(() => validateOfferShape({ ...base, capabilities: ["chat", "images"], images: bad })).not.toThrow();
-      expect(() => offerImages({ capabilities: ["chat", "images"], images: bad as never })).toThrow(/offer\.images/);
+      expect(imagesOfferProblem(bad, "api.venice.ai")).toMatch(/offer\.images/);
+      // A verified offer drops a refused block (chat still works) and says why.
+      const v = verifyConfidentialOffer(signed({ capabilities: ["chat", "images"], images: bad }), policy);
+      expect(v.images).toBeUndefined();
+      expect(v.imagesRefused).toMatch(/offer\.images/);
+      expect(() => offerImages(v)).toThrow(/image offer is refused/);
     }
-    expect(offerImages({ capabilities: ["chat", "images"], images: IMAGES })).toEqual(IMAGES);
+    expect(imagesOfferProblem(IMAGES, "api.venice.ai")).toBeUndefined();
+    expect(offerImages(verifyConfidentialOffer(signed({ capabilities: ["chat", "images"], images: IMAGES }), policy))).toEqual(IMAGES);
     // The head template is checked against the upstream host and the image route.
-    expect(offerImages({ capabilities: ["images"], images: IMAGES, upstream_host: "api.venice.ai" })).toEqual(IMAGES);
-    expect(() => offerImages({ capabilities: ["images"], images: IMAGES, upstream_host: "api.other.example" })).toThrow(/head_template/);
+    expect(imagesOfferProblem(IMAGES, "api.other.example")).toMatch(/head_template/);
     const chatRoute = { ...IMAGES, head_template: IMAGES.head_template.replace("/api/v1/image/generate", "/api/v1/chat/completions") };
-    expect(() => offerImages({ capabilities: ["images"], images: chatRoute, upstream_host: "api.venice.ai" })).toThrow(/head_template/);
+    expect(imagesOfferProblem(chatRoute, "api.venice.ai")).toMatch(/head_template/);
+    // The count key must be the one the route reads (variants for /image/generate, n for /images/generations).
+    expect(imagesOfferProblem({ ...IMAGES, count_key: "n" }, "api.venice.ai")).toMatch(/count_key/);
+    const openaiRoute = { ...IMAGES, count_key: "n", head_template: IMAGES.head_template.replace("/api/v1/image/generate", "/api/v1/images/generations") };
+    expect(imagesOfferProblem(openaiRoute, "api.venice.ai")).toBeUndefined();
     // No capability list: a chat-only offer, whatever else it carries.
     expect(offerImages({ images: IMAGES })).toBeUndefined();
     expect(offerImages({ capabilities: ["chat"], images: IMAGES })).toBeUndefined();
-    const { count_key: _k, response_idle_s: _r, ...bare } = IMAGES;
-    expect(offerImages({ capabilities: ["images"], images: bare as never })).toMatchObject({ count_key: "variants", response_idle_s: 300 });
     expect(offerImages({ capabilities: ["chat"] })).toBeUndefined();
   });
 });
@@ -202,110 +219,6 @@ describe("image response", () => {
   });
 });
 
-describe("image sessions", () => {
-  const base = {
-    baseUrl: "https://node.example",
-    auth: "sk-test",
-    model: "z-image-turbo",
-    maxTokens: 0,
-    bodyLength: 300,
-    host: {} as never,
-  };
-
-  it("need an offer that serves images, a valid variant and count", () => {
-    const variant = IMAGES.price_list["z-image-turbo"]![0]!;
-    expect(() => new ConfidentialSession({ ...base, offer: { ...offerWithImages(), images: undefined }, kind: "images", image: { variant, count: 1 } })).toThrow(/no confidential images/);
-    expect(() => new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant, count: 5 } })).toThrow(/outside/);
-    expect(() =>
-      new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant: { ...variant, id: "x" }, count: 1 } }),
-    ).toThrow(/no variant/);
-    const s = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant, count: 2 } });
-    expect(s.suffix).toBe(imageSuffix(IMAGES, "z-image-turbo", variant, 2));
-    // A caller's doctored copy of the variant does not reach the suffix.
-    const doctored = { ...variant, pins: [["resolution", "4K"]] as [string, string][], msat_per_image: 1 };
-    const d = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant: doctored, count: 2 } });
-    expect(d.suffix).toBe(imageSuffix(IMAGES, "z-image-turbo", variant, 2));
-    // A variant's own count cap is below the block's.
-    const capped = { ...variant, max_count: 1 };
-    const cappedOffer = offerWithImages({ images: { ...IMAGES, price_list: { ...IMAGES.price_list, "z-image-turbo": [capped] } } });
-    expect(() => new ConfidentialSession({ ...base, offer: cappedOffer, kind: "images", image: { variant: capped, count: 2 } })).toThrow(/outside 1\.\.1/);
-    // A node-chosen fixed pin that switches a feature on refuses the session.
-    const hostile = offerWithImages({ images: { ...IMAGES, fixed_pins: [["enable_web_search", true]] } });
-    expect(() => new ConfidentialSession({ ...base, offer: hostile, kind: "images", image: { variant, count: 1 } })).toThrow(/switch an extra off/);
-  });
-
-  it("are never armed ahead or claimed", async () => {
-    const variant = IMAGES.price_list["z-image-turbo"]![0]!;
-    const s = new ConfidentialSession({ ...base, offer: offerWithImages(), kind: "images", image: { variant, count: 1 } });
-    await expect(s.arm()).rejects.toThrow(/never armed/);
-    await expect(s.claim(new Uint8Array(300))).rejects.toThrow(/never claimed/);
-  });
-});
-
-describe("client.images.generate", () => {
-  afterEach(() => vi.restoreAllMocks());
-
-  function client() {
-    const c = new ConfidentialClient({
-      node: "https://node.example",
-      nodePubkeys: ["00".repeat(32)],
-      trustedHosts: ["api.venice.ai"],
-      credential: "sk-test",
-      host: {} as never,
-      prewarm: { onlyWhenVisible: false },
-    });
-    vi.spyOn(c, "offer").mockResolvedValue(offerWithImages());
-    return c;
-  }
-
-  it("runs one cold image session and never touches the pre-warm pool", async () => {
-    const c = client();
-    const pw = c.prewarmer!;
-    const spies = [vi.spyOn(pw, "setTarget"), vi.spyOn(pw, "take"), vi.spyOn(pw, "activity")];
-    const begin = vi.spyOn(pw, "beginPreparing");
-    const end = vi.spyOn(pw, "endPreparing");
-    let preparingDuringRun = -1;
-    let seen: ConfidentialSession | undefined;
-    let body = "";
-    vi.spyOn(ConfidentialSession.prototype, "run").mockImplementation(async function (this: ConfidentialSession, b: Uint8Array) {
-      seen = this;
-      body = new TextDecoder().decode(b);
-      preparingDuringRun = (pw as unknown as { preparing: number }).preparing;
-      return {
-        http: { status: 200, statusText: "OK" },
-        images: [new Blob([new Uint8Array([1, 2])], { type: "image/webp" })],
-        receipt: { cost_msats: 2 * 218000 },
-      } as never;
-    });
-    const out = await c.images.generate({ model: "nano-banana-pro", prompt: "a cat", count: 2, aspectRatio: "16:9", seed: 7 });
-    expect(seen?.kind).toBe("images");
-    expect(JSON.parse(body)).toMatchObject({ prompt: "a cat", aspect_ratio: "16:9", seed: 7, model: "nano-banana-pro", variants: 2, resolution: "1K" });
-    expect(out).toMatchObject({ variant: "1K-webp", count: 2, msatPerImage: 218000, costMsats: 436000 });
-    expect(out.images).toHaveLength(1);
-    for (const s of spies) expect(s).not.toHaveBeenCalled();
-    // The chat pool is held back while the image's own 2PC runs, and the
-    // image does not count as chat activity when it ends.
-    expect(begin).toHaveBeenCalledTimes(1);
-    expect(preparingDuringRun).toBe(1);
-    expect(end).toHaveBeenCalledWith(false);
-    pw.stop();
-  });
-
-  it("refuses a node without images and reports an upstream error with its result", async () => {
-    const c = client();
-    vi.spyOn(c, "offer").mockResolvedValue({ ...offerWithImages(), images: undefined });
-    await expect(c.images.generate({ model: "z-image-turbo", prompt: "x" })).rejects.toMatchObject({ code: "offer_no_images" });
-    vi.spyOn(c, "offer").mockResolvedValue(offerWithImages());
-    vi.spyOn(ConfidentialSession.prototype, "run").mockResolvedValue({
-      http: { status: 400, statusText: "Bad Request" },
-      images: [],
-      receipt: { cost_msats: 0 },
-    } as never);
-    await expect(c.images.generate({ model: "z-image-turbo", prompt: "x" })).rejects.toMatchObject({ code: "upstream_error", status: 400 });
-    c.prewarmer!.stop();
-  });
-});
-
 describe("image request planning (shared vectors with the SDK)", () => {
   const images = requestVectors.images as never as Parameters<typeof planImageRequest>[0];
   for (const v of requestVectors.cases) {
@@ -323,7 +236,7 @@ describe("image request planning (shared vectors with the SDK)", () => {
 });
 
 describe("an accepted image answer", () => {
-  const terms = { model: "z-image-turbo", count: 2, countKey: "variants", shape: "venice" as const, pins: [["format", "webp"]] as [string, unknown][] };
+  const want = { model: "z-image-turbo", count: 2, countKey: "variants" };
   const http = (json: string, declared?: number) =>
     parseHttpResponse(
       new TextEncoder().encode(
@@ -332,24 +245,23 @@ describe("an accepted image answer", () => {
     );
 
   it("has no warnings when it is what was pinned", () => {
-    const r = decodeImageResponse(http('{"images":["AAAA","AAAA"],"request":{"data":{"model":"z-image-turbo","variants":2}}}'), terms);
-    expect(r.images).toHaveLength(2);
+    const r = checkImageResponse(http('{"images":["AAAA","AAAA"],"request":{"model":"z-image-turbo","variants":2}}'), "venice", want);
+    expect(r.image.data).toHaveLength(2);
     expect(r.warnings).toEqual([]);
   });
 
   it("reports a short count, another echoed model or count, a cut body, never throws", () => {
-    const short = decodeImageResponse(http('{"images":["AAAA"],"request":{"model":"other","variants":1}}'), terms);
-    expect(short.images).toHaveLength(1);
+    const short = checkImageResponse(http('{"images":["AAAA"],"request":{"model":"other","variants":1}}'), "venice", want);
+    expect(short.image.data).toHaveLength(1);
     expect(short.warnings.join(" ")).toMatch(/1 of 2/);
-    expect(short.warnings.join(" ")).toMatch(/model "other"/);
-    expect(short.warnings.join(" ")).toMatch(/count 1/);
-    const cut = decodeImageResponse(http('{"images":["AA', 9999), terms);
-    expect(cut.images).toEqual([]);
-    expect(cut.warnings.join(" ")).toMatch(/declared length/);
+    expect(short.warnings.join(" ")).toMatch(/model other/);
+    expect(short.warnings.join(" ")).toMatch(/variants=1/);
+    const cut = checkImageResponse(http('{"images":["AA', 9999), "venice", want);
+    expect(cut.image.data).toEqual([]);
+    expect(cut.warnings.join(" ")).toMatch(/incomplete/);
     expect(cut.warnings.join(" ")).toMatch(/not JSON/);
   });
 });
-
 describe("proof channel verification", () => {
   it("refuses a verification that reports no checks", async () => {
     const ch = new ProofChannel({} as never);
@@ -366,11 +278,11 @@ describe("image response handling", () => {
   it("accepts only a 2xx; discloses an error; neither for anything else", () => {
     expect(imageOutcome(200)).toBe("accept");
     expect(imageOutcome(204)).toBe("accept");
-    expect(imageOutcome(302)).toBe("invalid");
-    expect(imageOutcome(0)).toBe("invalid");
-    expect(imageOutcome(100)).toBe("invalid");
-    expect(imageOutcome(400)).toBe("error");
-    expect(imageOutcome(503)).toBe("error");
+    expect(imageOutcome(302)).toBe("refuse");
+    expect(imageOutcome(0)).toBe("refuse");
+    expect(imageOutcome(100)).toBe("refuse");
+    expect(imageOutcome(400)).toBe("disclose");
+    expect(imageOutcome(503)).toBe("disclose");
   });
 
   it("decodes base64 straight to bytes, padded or not, with whitespace", () => {
