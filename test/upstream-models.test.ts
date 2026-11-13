@@ -35,6 +35,19 @@ describe("upstream_models", () => {
     }
   });
 
+  it("only a provider prefix may differ from the public id (finding 17)", () => {
+    const one = (pub: string, id: string) => upstreamModelsProblem({ price_list: { [pub]: RATES }, upstream_models: { [pub]: id } });
+    expect(one("llama-3.2-1b-instruct", "@cf/meta/llama-3.2-1b-instruct")).toBeUndefined();
+    expect(one("lfm-2.5-2.6b:free", "liquid/lfm-2.5-2.6b:free")).toBeUndefined();
+    expect(one("claude-fable-latest", "~anthropic/claude-fable-latest")).toBeUndefined();
+    for (const swap of ["qwen/qwen3.8-27b", "claude-opus-4.5-x", "xclaude-opus-4.5", "a/claude-opus-4.5/x", "/claude-opus-4.5x"]) {
+      expect(one("claude-opus-4.5", swap)).toMatch(/names another model/);
+      expect(() =>
+        validateOfferShape(v3OfferFields({ ...BOTH, price_list: { "claude-opus-4.5": RATES }, upstream_models: { "claude-opus-4.5": swap } })),
+      ).toThrow(/upstream_models/);
+    }
+  });
+
   it("the body ends with the suffix pinning the provider's id", () => {
     const params = { model: PUBLIC, messages: [{ role: "user" as const, content: "x" }] };
     const body = new TextDecoder().decode(buildPinnedBody(params as never, pinnedModelId(MAPPED, PUBLIC), 20, VENICE_CHAT));
