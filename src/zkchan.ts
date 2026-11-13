@@ -239,6 +239,12 @@ export class ProofChannel {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // A proof or top-up still waiting is answered now: its timer (up to 60 s)
+    // would otherwise be the only thing to settle it, after the connection is gone.
+    const closed = new ProverError("proof channel closed");
+    this.readyRej(closed);
+    for (const w of this.pending.values()) w.rej(closed);
+    this.pending.clear();
     this.relay?.command({ cmd: "close" });
     // Let the driver flush its last bytes before the socket goes.
     this.relay?.close(500);

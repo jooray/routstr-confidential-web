@@ -14,6 +14,7 @@ import { canonicalJson } from "../src/canonical.js";
 import { ConnectionDepositError, TwoPcVersionMismatchError, UpgradeRequiredError } from "../src/errors.js";
 import { chatSuffixKeys } from "../src/suffix.js";
 import { TwoPcSession } from "../src/twopc.js";
+import { ProofChannel } from "../src/zkchan.js";
 import { createConfidentialClient } from "../src/client.js";
 import type { WasmHost } from "../src/wasm/host.js";
 import { VENICE_CHAT } from "./fixtures/chat.js";
@@ -203,5 +204,30 @@ describe("caller aborts", () => {
     // The connection settled its request and stays in the pool.
     expect(c.connections()).toMatchObject([{ state: "idle", requests: 1 }]);
     c.close();
+  });
+});
+
+describe("close() ends the waits it leaves (review finding 22)", () => {
+  it("a proof or top-up waiting on the proof channel is rejected at once", async () => {
+    const ch = new ProofChannel({} as WasmHost);
+    (ch as unknown as { used: boolean }).used = true;
+    const t = Date.now();
+    const proof = ch.run("prove", "pi_win", {}, undefined, 60_000);
+    const topup = ch.topup(60_000);
+    const ready = ch.ready(120_000);
+    ch.close();
+    await expect(proof).rejects.toThrow(/proof channel closed/);
+    await expect(topup).rejects.toThrow(/proof channel closed/);
+    await expect(ready).resolves.toBe(false);
+    expect(Date.now() - t).toBeLessThan(1000);
+  });
+
+  it("a 2PC wait (the key share) is rejected at once", async () => {
+    const s = new TwoPcSession({} as WasmHost);
+    const t = Date.now();
+    const share = s.keyShare(120_000);
+    s.close();
+    await expect(share).rejects.toThrow(/2PC closed/);
+    expect(Date.now() - t).toBeLessThan(1000);
   });
 });
