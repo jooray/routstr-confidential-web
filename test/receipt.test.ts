@@ -75,9 +75,13 @@ describe("receipt verification", () => {
     expect(() => checkUpstreamErrorReceipt(err(503, { cost_msats: 2001, reserved_msats: 9000 }), 503, 2000)).toThrow(
       ReceiptVerificationError,
     );
-    // Other 5xx: at most the reservation the receipt names.
-    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0)).toThrow(
+    // Other 5xx: at most the reservation the receipt names, and a bound known before the release.
+    const known = { reservationMsat: 9000 };
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0, known)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toThrow(
+      /no reservation bound/,
+    );
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0, known)).toThrow(
       /reservation/,
     );
     expect(() => checkUpstreamErrorReceipt(err(502, { cost_msats: 1e12 }), 502, 0)).toThrow(/reservation/);

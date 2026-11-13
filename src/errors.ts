@@ -6,30 +6,35 @@
  * message. All errors extend `ConfidentialError` and carry a stable `code`.
  */
 
-export type ConfidentialErrorCode =
-  | "offer_unavailable"
-  | "offer_malformed"
-  | "offer_bad_signature"
-  | "offer_unpinned"
-  | "offer_pin_mismatch"
-  | "offer_unsupported_version"
-  | "node_protocol_outdated"
-  | "upgrade_required"
-  | "twopc_version_mismatch"
-  | "request_refused"
-  | "trusted_host_rejected"
-  | "session_protocol"
-  | "session_rejected"
-  | "prover_failed"
-  | "prover_missing"
-  | "receipt_verification"
-  | "response_verification"
-  | "timeout"
-  | "not_configured"
-  | "unsupported_endpoint"
-  | "offer_no_images"
-  | "pinned_parameter"
-  | "upstream_error";
+/** Every `code` a confidential error carries (stable; callers match on it). */
+export const CONFIDENTIAL_ERROR_CODES = [
+  "offer_unavailable",
+  "offer_malformed",
+  "offer_bad_signature",
+  "offer_unpinned",
+  "offer_pin_mismatch",
+  "offer_unsupported_version",
+  "node_protocol_outdated",
+  "upgrade_required",
+  "twopc_version_mismatch",
+  "request_refused",
+  "trusted_host_rejected",
+  "session_protocol",
+  "session_rejected",
+  "prover_failed",
+  "prover_missing",
+  "receipt_verification",
+  "response_verification",
+  "timeout",
+  "not_configured",
+  "unsupported_endpoint",
+  "offer_no_images",
+  "pinned_parameter",
+  "upstream_error",
+  "reservation_above_ceiling",
+] as const;
+
+export type ConfidentialErrorCode = (typeof CONFIDENTIAL_ERROR_CODES)[number];
 
 export class ConfidentialError extends Error {
   readonly code: ConfidentialErrorCode;
@@ -253,3 +258,56 @@ export class UpstreamImageError extends ConfidentialError {
     this.result = result;
   }
 }
+
+/**
+ * The node announced a reservation for the request (`request_ok`
+ * `reserved_msats`) above the caller's ceiling (`maxReservationMsat`). The
+ * client stopped before any record of the request was sent (framing "1.1":
+ * before the ClientHello): nothing of it reached the provider, and the
+ * connection is closed. Another node may serve the request.
+ */
+export class ReservationAboveCeilingError extends ConfidentialError {
+  /** What the node announced (msat). */
+  readonly reservedMsat: number;
+  /** The caller's ceiling (msat). */
+  readonly ceilingMsat: number;
+  constructor(reservedMsat: number, ceilingMsat: number) {
+    super(
+      "reservation_above_ceiling",
+      `the node reserves ${reservedMsat} msat for the request, above the client's ceiling of ${ceilingMsat} msat`,
+    );
+    this.name = "ReservationAboveCeilingError";
+    this.reservedMsat = reservedMsat;
+    this.ceilingMsat = ceilingMsat;
+  }
+}
+
+/**
+ * The property the client sets (true, not enumerable) on every error that
+ * leaves a request once the request's body was released towards the
+ * provider, or a response head was seen: the request may have run there, so
+ * it must not be sent again, to this node or another.
+ */
+export const MAY_HAVE_REACHED_PROVIDER = "mayHaveReachedProvider";
+
+/**
+ * True when `error` carries the release marker. Read by shape: the error
+ * may come from another bundle.
+ */
+export function mayHaveReachedProvider(error: unknown): boolean {
+  return (
+    error !== null &&
+    (typeof error === "object" || typeof error === "function") &&
+    (error as Record<string, unknown>)[MAY_HAVE_REACHED_PROVIDER] === true
+  );
+}
+
+/** The `code` of a confidential error, read by shape (any bundle); undefined for anything else. */
+export function confidentialErrorCode(error: unknown): ConfidentialErrorCode | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && (CONFIDENTIAL_ERROR_CODES as readonly string[]).includes(code)
+    ? (code as ConfidentialErrorCode)
+    : undefined;
+}
+

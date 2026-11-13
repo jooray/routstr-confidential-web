@@ -88,6 +88,21 @@ padding in this library). An `http: 2` session (`connection.ts`) sends exactly o
 HTTP/2 frame per record, up to the full 2^14 bytes of content, and must know
 each record's plaintext to check the node's π_WIN windows against it.
 
+## Protocol v3 hook: `destroySecrets` (SDK and this library)
+
+Marked `// FORK PATCH (v3, SDK and this library)` (`lib/make-tls-client.js`,
+typed in `lib/make-tls-client.d.ts`), mirrored from the SDK's fork. Not in the
+reference client's copy (`crypto/client/vendor/tls`). `destroySecrets()`
+zero-fills the traffic secrets and IVs the client holds (the current `keys`
+and the handshake secrets: `clientSecret`, `serverSecret`, `masterSecret`,
+`clientIv`, `serverIv`, and `earlySecret`), drops every key reference (the
+AES-GCM keys are `CryptoKey` objects, which cannot be zeroed), clears
+`handshakeDone` and marks the client ended, so no record is read or written
+afterwards. The connection (`connection.ts`) calls it on every terminal path.
+Best effort only: JavaScript cannot erase copies the runtime or the caller
+made (WebCrypto's key material, garbage-collected buffers, the hex strings
+exchanged with the wasm 2PC and prover).
+
 ## Security patches (TLS-01 … TLS-16)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are

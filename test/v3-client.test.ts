@@ -385,7 +385,7 @@ describe("a refused request (§12.4)", () => {
     expect([r.n, r.connection]).toEqual([2, "reused"]);
     expect(connect).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledTimes(3);
-    expect(urls).toHaveLength(2);
+    expect(urls.filter((u) => u.includes("/v1/confidential/offer"))).toHaveLength(2);
   });
 
   it("offer_changed opens a new connection on the new offer's terms", async () => {

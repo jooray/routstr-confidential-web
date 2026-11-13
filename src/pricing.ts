@@ -29,8 +29,10 @@ export interface ModelPricing {
    * a full-context prompt plus `maxTokens` and the offer's
    * `reserve_margin_tokens` at the signed rates, plus the larger of the
    * session and abandon fees. Without a context length: the model's maximum
-   * cost (`sats_pricing.max_cost`) raised by the rate surcharge, plus the
-   * margin at the signed completion rate, plus the same fee. Undefined when
+   * cost (`sats_pricing.max_cost`) scaled by max(1, cache_write / in) (when
+   * both signed rates are positive: the prompt may be all cache writes) and
+   * raised by the rate surcharge, plus the margin at the signed completion
+   * rate, plus the same fee. Undefined when
    * neither is known. The key needs at least this available balance; the
    * unused part is released at settlement.
    */
@@ -93,7 +95,46 @@ export function reservationMsat(
   const maxCost = maxCostSats(m);
   if (maxCost === undefined) return undefined;
   const pct = surchargePct(offer);
-  return Math.ceil(Math.ceil(maxCost * 1000) * (1 + pct / 100) + (margin * rates.out) / 1000) + fee;
+  // The node scales the undiscounted maximum by the cache-write premium of the
+  // signed rates, in the same order:
+  // ceil(undiscounted × ratio × (1 + pct/100) + margin × out / 1000).
+  const baseIn = positive(rates.in);
+  const write = positive(rates.cache_write);
+  const ratio = baseIn && write ? Math.max(1, write / baseIn) : 1;
+  return Math.ceil(Math.ceil(maxCost * 1000) * ratio * (1 + pct / 100) + (margin * rates.out) / 1000) + fee;
+}
+
+/**
+ * The ceiling (msat) a client may hold a node's announced reservation for a
+ * confidential chat request to (`maxReservationMsat`): never below what an
+ * honest node reserves. Only computed where the node's formula depends on
+ * nothing but the signed offer and the model's context length: the offer
+ * prices the model, the model has a known context length (the fallback
+ * branch reads the model's maximum cost in sats, which moves with the
+ * exchange rate) and the offer takes a connection deposit, whose amount the
+ * node never sets below its minimum reservation (`min_request_msat`, the
+ * floor of every reservation). `maxTokens` is the request's pinned completion
+ * cap. Undefined: no ceiling.
+ */
+export function reservationCeilingMsat(
+  offer: VerifiedOffer,
+  model: string,
+  m: NodeModel | undefined,
+  maxTokens: number,
+): number | undefined {
+  if (!Object.hasOwn(offer.price_list, model)) return undefined;
+  if (promptLimit(m) === undefined) return undefined;
+  const deposit = offerConnectionDepositMsat(offer);
+  if (deposit <= 0) return undefined;
+  const msats = reservationMsat(offer, offer.price_list[model]!, m, maxTokens);
+  if (msats === undefined || !Number.isFinite(msats)) return undefined;
+  const fee = Math.max(sessionFeeMsat(offer), offerAbandonFeeMsat(offer));
+  // max(min_request_msat, formula) + fee, with min_request_msat ≤ deposit.
+  return Math.max(msats, deposit + fee);
+}
+
+function positive(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 }
 
 function surchargePct(offer: VerifiedOffer): number {

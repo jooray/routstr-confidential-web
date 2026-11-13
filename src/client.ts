@@ -33,7 +33,9 @@ import {
   ConfidentialError,
   ConnectionDepositError,
   NodeProtocolOutdatedError,
+  MAY_HAVE_REACHED_PROVIDER,
   RequestRefusedError,
+  ReservationAboveCeilingError,
   SessionRejectedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
@@ -56,7 +58,7 @@ import {
 } from "./offer.js";
 import { base64ToBytes, buildImageBody, imageMimeType, imageSuffix, pinnedImageKeys, planImageRequest } from "./images.js";
 import { NodeApi, type NodeModel } from "./node-api.js";
-import { modelPricing, type ModelPricing } from "./pricing.js";
+import { modelPricing, reservationCeilingMsat, type ModelPricing } from "./pricing.js";
 import { aggregateChatCompletion, buildPinnedBody, requestedMaxTokens, SseParser } from "./request.js";
 import {
   ConfidentialConnection,
@@ -254,6 +256,67 @@ function errorText(e: unknown): string {
 
 const aborted = () => new DOMException("aborted", "AbortError");
 
+/**
+ * Mark an error that leaves a request after its body was released (or a
+ * response head was seen) with `MAY_HAVE_REACHED_PROVIDER` (not enumerable):
+ * the provider may have run the request, so the caller must not send it
+ * again, to this node or another, whatever the error's text says (a node's
+ * close reason is its own text). Returns the error (a non-object becomes a
+ * `ConfidentialError`).
+ */
+function withReleased(error: unknown, released: boolean): unknown {
+  if (!released) return error;
+  const e = error !== null && typeof error === "object" ? error : new ConfidentialError("session_rejected", String(error));
+  try {
+    Object.defineProperty(e, MAY_HAVE_REACHED_PROVIDER, { value: true, enumerable: false, writable: true, configurable: true });
+  } catch {
+    /* a frozen error: the caller then sees it unmarked */
+  }
+  return e;
+}
+
+/** The caller's reservation ceiling for a chat request priced by `offer` (undefined: none). */
+function reservationCeiling(
+  ceiling: ReservationCeiling | undefined,
+  offer: VerifiedOffer,
+  request: { model: string; maxTokens: number },
+): number | undefined {
+  const v = typeof ceiling === "function" ? ceiling(offer, request) : ceiling;
+  if (v === undefined) return undefined;
+  if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) {
+    throw new ConfidentialError("not_configured", `maxReservationMsat ${String(v)} is not an amount of msat`);
+  }
+  return Math.floor(v);
+}
+
+/** Whether anything of the call's request may have reached the provider. */
+function releasedNow(state: RunState): boolean {
+  return (state.handle?.bodyReleased ?? false) || state.headSeen;
+}
+
+/**
+ * The most the node may reserve for a chat request (msat), or a function of
+ * the verified offer the request is priced by and the request's pinned terms
+ * that returns it (undefined: no ceiling).
+ */
+export type ReservationCeiling = number | ((offer: VerifiedOffer, request: { model: string; maxTokens: number }) => number | undefined);
+
+/** Per-request options of `chat.completions.create`. */
+export interface ChatRequestOptions {
+  signal?: AbortSignal;
+  /**
+   * The most the node may reserve for the request (msat). A node announcing
+   * more in `request_ok` (`reserved_msats`) gets no record of the request:
+   * the call fails with `ReservationAboveCeilingError` before anything
+   * reaches the provider, and the connection is closed. The ceiling also
+   * bounds a receipt that charges the reservation for a provider error when
+   * the node announced none. It must never be below what an honest node
+   * reserves. Default: `reservationCeilingMsat` for the model on this node
+   * (none when the client cannot compute that bound).
+   */
+  maxReservationMsat?: ReservationCeiling;
+}
+
 /** The node no longer holds the offer the setup or the request named, or its connection-level terms or fees changed. */
 export function isOfferExpired(e: unknown): boolean {
   if (!(e instanceof SessionRejectedError)) return false;
@@ -310,6 +373,8 @@ export function chooseFraming(
  */
 export function http2OpenFailure(error: unknown): boolean {
   if (error instanceof RequestRefusedError || error instanceof ConnectionDepositError) return false;
+  // The node's reservation, not the framing: "1.1" would be refused the same way.
+  if (error instanceof ReservationAboveCeilingError) return false;
   if (error instanceof UpgradeRequiredError || error instanceof TwoPcVersionMismatchError) return false;
   if (error instanceof SessionRejectedError) {
     if (error.nodeCode?.startsWith("h2_") || error.nodeCode === "upstream_unreachable" || error.fault === "upstream") return true;
@@ -321,7 +386,7 @@ export function http2OpenFailure(error: unknown): boolean {
 
 /** A request that failed on a pooled connection before release may run again on a fresh one, unless the node refused it with a status. */
 function retryOnFreshConnection(error: unknown): boolean {
-  if (error instanceof RequestRefusedError) return false;
+  if (error instanceof RequestRefusedError || error instanceof ReservationAboveCeilingError) return false;
   return !(error instanceof SessionRejectedError && error.status !== undefined && error.status !== 408);
 }
 
@@ -494,6 +559,8 @@ interface RequestSpec {
   maxTokens: number;
   image?: { variant: string; count: number };
   body: Uint8Array;
+  /** The caller's reservation ceiling for this request (msat). */
+  maxReservationMsat?: number;
   onResponseHead?: (h: Head) => void;
   onResponseBody?: (chunk: Uint8Array) => void;
 }
@@ -621,6 +688,21 @@ export class ConfidentialClient {
     }
   }
 
+  /**
+   * The node's model list for a request's default reservation ceiling: the
+   * cached list, else a fetch bounded by a few seconds (none then: the
+   * request runs without that ceiling).
+   */
+  private async modelsForCeiling(): Promise<NodeModel[] | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<undefined>((res) => (timer = setTimeout(res, 5000)));
+    try {
+      return await Promise.race([this.models(), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async models(): Promise<NodeModel[]> {
     if (this.modelsCache && Date.now() - this.modelsCache.at < 300_000) return this.modelsCache.models;
     const models = await this.api.models().catch(() => [] as NodeModel[]);
@@ -723,7 +805,8 @@ export class ConfidentialClient {
       );
       let lease: PoolLease<ConfidentialConnection>;
       try {
-        lease = await pool.acquire(key, framing, open, signal);
+        // This request's reuse policy, held for its acquisition and its lease.
+        lease = await pool.acquire(key, framing, open, signal, this.opts.http2?.reuse ?? "shared");
       } catch (error) {
         traffic.done();
         if (signal?.aborted) throw error;
@@ -754,6 +837,7 @@ export class ConfidentialClient {
           image: spec.image,
           body: spec.body,
           padBucket: this.opts.padBucket,
+          maxReservationMsat: spec.maxReservationMsat,
           onResponseHead: (h) => {
             state.headSeen = true;
             spec.onResponseHead?.(h);
@@ -845,7 +929,7 @@ export class ConfidentialClient {
     // has the request: the caller gets an AbortError at once and the request
     // settles in the background (accept, or the error head).
     const abort = () => {
-      rejectAborted(aborted());
+      rejectAborted(withReleased(aborted(), releasedNow(state)));
       if (state.handle?.bodyReleased) {
         detached = true;
         this.emit({ ev: "request_aborted", kind: "images", released: true, msg: "settling in the background" });
@@ -855,12 +939,15 @@ export class ConfidentialClient {
       }
     };
     signal?.addEventListener("abort", abort, { once: true });
-    const runP = this.runOnPool(offer, auth, { kind: "images", model, maxTokens: 0, image: { variant: variant.id, count }, body }, state, signal).finally(
-      () => {
+    const runP = this.runOnPool(offer, auth, { kind: "images", model, maxTokens: 0, image: { variant: variant.id, count }, body }, state, signal)
+      // Every failure after the release says so.
+      .catch((error: unknown) => {
+        throw withReleased(error, releasedNow(state));
+      })
+      .finally(() => {
         signal?.removeEventListener("abort", abort);
         this.prewarmer?.noteSettled();
-      },
-    );
+      });
     runP.catch(() => {});
     let r: ConnectionRequestResult;
     try {
@@ -868,11 +955,29 @@ export class ConfidentialClient {
     } catch (e) {
       if (!detached && !(e instanceof RequestRefusedError)) state.handle?.close();
       // Retried only while nothing could have reached the provider.
-      if (isOfferExpired(e) && !freshOffer && !state.handle?.bodyReleased && !signal?.aborted) {
+      if (isOfferExpired(e) && !freshOffer && !releasedNow(state) && !signal?.aborted) {
         return this.generateImages(params, signal, true);
       }
-      throw e;
+      throw withReleased(e, releasedNow(state));
     }
+    try {
+      return this.imageResult(r, state, tRequest, images, model, variant, count);
+    } catch (e) {
+      // The provider ran the request: an error past this point is never a reason to send it again.
+      throw withReleased(e, true);
+    }
+  }
+
+  /** The settled image request as the caller gets it (an HTTP error of the provider throws `UpstreamImageError`). */
+  private imageResult(
+    r: ConnectionRequestResult,
+    state: RunState,
+    tRequest: number,
+    images: ConfidentialImagesOffer,
+    model: string,
+    variant: ConfidentialImageVariant,
+    count: number,
+  ): ImageGenerateResult {
     let warnings: string[] = r.warnings ?? [];
     let blobs: Blob[] = [];
     if (r.status >= 200 && r.status < 300) {
@@ -921,16 +1026,16 @@ export class ConfidentialClient {
 
   readonly chat = {
     completions: {
-      create: ((params: ChatCompletionCreateParams, options?: { signal?: AbortSignal }) => this.create(params, options)) as {
-        (params: ChatCompletionCreateParams & { stream: true }, options?: { signal?: AbortSignal }): Promise<ConfidentialStream>;
-        (params: ChatCompletionCreateParams & { stream?: false }, options?: { signal?: AbortSignal }): Promise<ChatCompletion>;
-        (params: ChatCompletionCreateParams, options?: { signal?: AbortSignal }): Promise<ConfidentialStream | ChatCompletion>;
+      create: ((params: ChatCompletionCreateParams, options?: ChatRequestOptions) => this.create(params, options)) as {
+        (params: ChatCompletionCreateParams & { stream: true }, options?: ChatRequestOptions): Promise<ConfidentialStream>;
+        (params: ChatCompletionCreateParams & { stream?: false }, options?: ChatRequestOptions): Promise<ChatCompletion>;
+        (params: ChatCompletionCreateParams, options?: ChatRequestOptions): Promise<ConfidentialStream | ChatCompletion>;
       },
     },
   };
 
-  private async create(params: ChatCompletionCreateParams, options: { signal?: AbortSignal } = {}): Promise<ConfidentialStream | ChatCompletion> {
-    const stream = await this.runStream(params, options.signal, false);
+  private async create(params: ChatCompletionCreateParams, options: ChatRequestOptions = {}): Promise<ConfidentialStream | ChatCompletion> {
+    const stream = await this.runStream(params, options.signal, false, options.maxReservationMsat);
     if (params.stream) return stream;
     const events: ChatCompletionChunk[] = [];
     for await (const c of stream) events.push(c);
@@ -938,15 +1043,27 @@ export class ConfidentialClient {
     return { ...aggregateChatCompletion(events as never[]), confidential: result };
   }
 
-  private async runStream(params: ChatCompletionCreateParams, signal: AbortSignal | undefined, freshOffer: boolean): Promise<ConfidentialStream> {
+  private async runStream(
+    params: ChatCompletionCreateParams,
+    signal: AbortSignal | undefined,
+    freshOffer: boolean,
+    ceiling?: ReservationCeiling,
+  ): Promise<ConfidentialStream> {
     const auth = this.credential;
     if (!auth) throw new ConfidentialError("not_configured", "no credential: fund the wallet or paste an sk- key");
-    const offer = await this.offer(freshOffer);
+    // The node's model list gives the context length the default reservation ceiling needs.
+    const [offer, nodeModels] = await Promise.all([this.offer(freshOffer), ceiling === undefined ? this.modelsForCeiling() : undefined]);
     const model = params.model;
     if (!Object.hasOwn(offer.price_list, model)) {
       throw new ConfidentialError("offer_malformed", `the node does not serve ${model} confidentially`);
     }
     const maxTokens = requestedMaxTokens(params, Number(offer.max_tokens_cap ?? 4096));
+    // The caller's ceiling, else the node's own formula for this model on this node (none when unknown).
+    const maxReservationMsat = reservationCeiling(
+      ceiling ?? ((o, req) => reservationCeilingMsat(o, req.model, nodeModels?.find((m) => m.id === req.model), req.maxTokens)),
+      offer,
+      { model, maxTokens },
+    );
     // The suffix pins the provider's id (`upstream_models`); the request names the public one.
     const body = buildPinnedBody(params, pinnedModelId(offer, model), maxTokens, offer.chat);
     const pw = this.prewarmer;
@@ -982,8 +1099,8 @@ export class ConfidentialClient {
     const abort = () => {
       if (callerAborted) return;
       callerAborted = true;
-      failure ??= aborted();
-      rejectAborted(aborted());
+      failure ??= withReleased(aborted(), releasedNow(state));
+      rejectAborted(withReleased(aborted(), releasedNow(state)));
       if (state.handle?.bodyReleased) {
         detached = true;
         queue.length = 0;
@@ -1006,6 +1123,7 @@ export class ConfidentialClient {
         model,
         maxTokens,
         body,
+        maxReservationMsat,
         onResponseHead: (h) => resolveHead(h),
         onResponseBody: (chunk) => {
           if (!chunk.length) return;
@@ -1017,11 +1135,18 @@ export class ConfidentialClient {
       },
       state,
       signal,
-    );
+    )
+      // Every failure after the release says so (the stream's error too).
+      .catch((error: unknown) => {
+        throw withReleased(error, releasedNow(state));
+      });
     const verification = runP
       .then((r) => {
         const text = new TextDecoder().decode(concatParts(textParts));
         return requestResult(r, state.conn!, state.warm ?? "cold", tRequest, { responseText: text, fellBack: state.fellBack });
+      })
+      .catch((error: unknown) => {
+        throw withReleased(error, releasedNow(state));
       })
       .finally(() => {
         signal?.removeEventListener("abort", abort);
@@ -1044,11 +1169,11 @@ export class ConfidentialClient {
     const first = await Promise.race([head.then(() => "head" as const), verification.then(() => "done" as const), abortedP]).catch(
       async (e: unknown) => {
         // Retried only while nothing could have reached the provider.
-        if (isOfferExpired(e) && !freshOffer && !state.handle?.bodyReleased && !isAborted()) return "retry" as const;
-        throw e;
+        if (isOfferExpired(e) && !freshOffer && !releasedNow(state) && !isAborted()) return "retry" as const;
+        throw withReleased(e, releasedNow(state));
       },
     );
-    if (first === "retry") return this.runStream(params, signal, true);
+    if (first === "retry") return this.runStream(params, signal, true, ceiling);
 
     const iterator = async function* (): AsyncGenerator<ChatCompletionChunk> {
       for (;;) {

@@ -158,6 +158,15 @@ Other caveats:
   requests under one API key already are). `reuseScope` separates what must
   not be linked; `http2.reuse: "none"` opens a connection per request (and a
   connection kept before reuse was turned off is never handed out again).
+- **Secrets in memory.** When a connection ends (it fails or is closed, or a
+  framing-`"1.1"` connection settled its one request), its copies of the
+  traffic secrets (`c_ap_1`, `s_ap_0`, and the anchors beside them) are
+  zero-filled and dropped, and the TLS fork zero-fills its traffic secrets and
+  IVs and drops its keys (`destroySecrets`, see `src/tls-fork/FORK-NOTES.md`).
+  This is best effort: JavaScript cannot erase every copy (the hex strings
+  exchanged with the wasm 2PC and prover, WebCrypto `CryptoKey` objects,
+  buffers the runtime copied, the decrypted response), and those stay until
+  the garbage collector reclaims them.
 - **Body size.** The body length is exact unless `padBucket` is set (a
   multiple of N bytes, or `"pow2"`): the body is then padded with JSON
   whitespace before the pinned suffix. Off by default; it hides the size from
@@ -203,6 +212,19 @@ Other caveats:
   prompt filling the model's whole context (the larger context length, at the
   dearer of the input and cache-write rates), plus `max_tokens`, plus the fee.
   A new connection needs that plus the deposit (`ModelPricing.requiredMsat`).
+- **Reservation ceiling**: the node names a request's whole reservation in
+  `request_ok` (`reserved_msats`; older nodes omit it). A chat request holds it
+  to a ceiling, by default the node's own formula for the model
+  (`reservationCeilingMsat`, from the signed offer and the node's context
+  length; none when the model has no context length or the offer no deposit),
+  or the caller's (`chat.completions.create(params, { maxReservationMsat })`,
+  a number or a function of the offer and the request). A larger announcement
+  stops the request before any of its records is sent (framing `"1.1"`: before
+  the ClientHello) with `ReservationAboveCeilingError`, and the connection is
+  closed (the node's abort rules apply). A receipt that charges the
+  reservation for a provider 5xx (other than 503) must name the announced
+  reservation, else stay within the ceiling (images: price × count plus the
+  abandon fee); with neither only the fee is accepted.
 - **Funding**: Lightning invoices from the node (`/lightning/invoice`; your
   wallet may add routing fees). Cashu tokens can create a key
   (`/v1/balance/create`) or top one up (`/v1/balance/topup`); the mint's
@@ -215,7 +237,14 @@ Other caveats:
   `offer_changed`: the library refetches the offer and retries once),
   `ConnectionDepositError` (the deposit is not funded, or above the maximum),
   `NodeProtocolOutdatedError` (a v2 node), `UpgradeRequiredError` (426),
-  `TwoPcVersionMismatchError`.
+  `TwoPcVersionMismatchError`, `ReservationAboveCeilingError`.
+- **After the release nothing is sent again.** Every error a request throws
+  once its body was released towards the provider (or a response head was
+  seen) carries `mayHaveReachedProvider: true` (not enumerable;
+  `mayHaveReachedProvider(error)`): the provider may have run it, so a caller
+  must not retry it on this node or another. Match errors by type or
+  `confidentialErrorCode(error)`, never by message: a close reason is the
+  node's own text.
 
 ## Library usage
 
