@@ -6,6 +6,8 @@
  * message. All errors extend `ConfidentialError` and carry a stable `code`.
  */
 
+import type { ConfidentialReceipt } from "./wire.js";
+
 /** Every `code` a confidential error carries (stable; callers match on it). */
 export const CONFIDENTIAL_ERROR_CODES = [
   "offer_unavailable",
@@ -217,6 +219,30 @@ export class ProverMissingError extends ConfidentialError {
   constructor(message: string, detail?: string) {
     super("prover_missing", message, detail);
     this.name = "ProverMissingError";
+  }
+}
+
+/**
+ * The provider did not process the request (RFC 9113 §8.7): it refused the
+ * stream (`RST_STREAM(REFUSED_STREAM)`) or went away with a last-stream-id
+ * below it (`GOAWAY`). Nothing of the response came; the request may run
+ * again on another connection.
+ */
+export class StreamNotProcessedError extends SessionRejectedError {
+  /**
+   * The node's verified receipt when the client proved the refusal
+   * (`disclose_reset`, PROTOCOL-V3.md §12.8): it settled like a 429, the
+   * session fee if it was still due on the connection, nothing more.
+   */
+  readonly receipt?: ConfidentialReceipt;
+  /** What that receipt charged (msats). */
+  readonly costMsats?: number;
+
+  constructor(message: string, settled?: { receipt: ConfidentialReceipt; costMsats: number }) {
+    super(message);
+    this.name = "StreamNotProcessedError";
+    this.receipt = settled?.receipt;
+    this.costMsats = settled?.costMsats;
   }
 }
 

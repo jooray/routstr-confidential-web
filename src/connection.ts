@@ -51,6 +51,7 @@ import {
   ResponseVerificationError,
   SessionProtocolError,
   SessionRejectedError,
+  StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
 } from "./errors.js";
@@ -69,9 +70,11 @@ import {
   frame,
   frameHeader,
   latin1,
+  refusalProblem,
   requestBlock,
   requestStream,
   splitBody,
+  type Refusal,
   type RxFrame,
   type WinSource,
 } from "./h2.js";
@@ -97,7 +100,14 @@ import { checkPiC3SParams, checkPiNKParams, serverTailEpoch, type ServerPostReco
 import { certInfo, type ProviderVerification } from "./certinfo.js";
 import { matchHostname } from "./hosts.js";
 import { WasmProverBackend } from "./prover.js";
-import { checkUpstreamErrorReceipt, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt.js";
+import {
+  checkAnnouncedReservation,
+  checkRefusedReceipt,
+  checkUpstreamErrorReceipt,
+  parseSignedReceipt,
+  verifyFlatReceipt,
+  verifyReceipt,
+} from "./receipt.js";
 import {
   countKeyUpdates,
   cryptoRandom,
@@ -411,6 +421,12 @@ interface Cur {
   parts: { off: number; data: Uint8Array }[];
   ended: boolean;
   reset?: number;
+  /**
+   * The provider refused the stream without processing it (RST_STREAM with
+   * REFUSED_STREAM on it, or GOAWAY with NO_ERROR below it) before any response
+   * head: the stream offset where the refusing frame ends (§5.4, `disclose_reset`).
+   */
+  refusal?: { seen: Refusal; end: number };
   proofs: ProofTiming[];
   settled: boolean;
   /** The signed receipt's bytes and signature, and our own usage event (chat 2xx). */
@@ -1532,11 +1548,18 @@ export class ConfidentialConnection {
         if (f.payload.length >= 4) {
           const last = u32(f.payload) & 0x7fffffff;
           this.goawayLast = Math.min(this.goawayLast ?? last, last);
+          // A graceful GOAWAY below the request's stream: it was not processed, provably.
+          if (cur && f.stream === 0 && f.payload.length >= 8 && last < cur.stream && u32(f.payload, 4) === 0) {
+            this.noteRefusal(cur, { kind: "goaway", lastStreamId: last }, f);
+          }
         }
         this.event({ ev: "goaway", last_stream: this.goawayLast });
         break;
       case FRAME.RST_STREAM:
-        if (cur && f.stream === cur.stream && f.payload.length >= 4) cur.reset = u32(f.payload);
+        if (cur && f.stream === cur.stream && f.payload.length >= 4) {
+          cur.reset = u32(f.payload);
+          if (f.payload.length === 4 && cur.reset === 7) this.noteRefusal(cur, { kind: "rst_stream" }, f);
+        }
         break;
       case FRAME.HEADERS: {
         if (!cur || f.stream !== cur.stream) break; // the probe stream's answer, if any
@@ -1582,6 +1605,12 @@ export class ConfidentialConnection {
       default:
         break;
     }
+  }
+
+  /** The first refusal of `cur`'s stream before any response head (§5.4, `disclose_reset`). */
+  private noteRefusal(cur: Cur, seen: Refusal, f: RxFrame): void {
+    if (cur.refusal || cur.status !== undefined) return;
+    cur.refusal = { seen, end: f.off + 9 + f.payload.length };
   }
 
   private streamEnded(cur: Cur): void {
@@ -1921,6 +1950,9 @@ export class ConfidentialConnection {
     const errored = () => (cur.status ?? 0) >= 400;
     const beyond = () => this.goawayBeyond(cur);
     await this.until(() => cur.released || errored() || cur.reset !== undefined || beyond(), `body_released for request ${n}`, this.timeouts.released);
+    // A refusal the provider sent before any response head is proven (§5.4,
+    // `disclose_reset`) and settled like a 429; the request may run again.
+    await this.settleRefusal(cur);
     if (beyond() && !cur.releaseSent) {
       // Nothing of the request was released: it may run again on a new connection.
       throw new SessionRejectedError(`the provider's GOAWAY (last stream ${this.goawayLast}) excludes stream ${stream}`);
@@ -1936,6 +1968,7 @@ export class ConfidentialConnection {
       idleMs,
       () => Math.max(cur.tLastData, cur.tReleased ?? 0),
     );
+    await this.settleRefusal(cur);
     // An error head the provider sent before it reset the stream (RFC 9113
     // §8.1: a server that answers before the request is complete resets it
     // with NO_ERROR) is still disclosed and settled by its status (finding 18).
@@ -2474,7 +2507,121 @@ export class ConfidentialConnection {
       chunks.set(x.abs, take);
       left -= take;
     }
-    const shape = checkPiWinParams(m.params, {
+    const shape = this.checkServerWindows(m.params, chunks, keyUpdates, epochStart);
+    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
+    cur.proofs.push({ ...t, purpose: "error_head", ...shape });
+    const { receipt } = await this.takeReceipt(cur, att.json);
+    this.checkErrorReceipt(cur, receipt, status);
+    return { receipt, attestation: att.a };
+  }
+
+  /**
+   * What `disclose_reset` discloses (§5.4): R from byte 0 of the first server
+   * record received after the request was sent (no later than the node's
+   * interval start `S_k`) to the end of the refusing frame, every frame in
+   * between walked. Returns the disclosure, or why there is none.
+   */
+  private refusalDisclosure(cur: Cur):
+    | { record: number; raw: Uint8Array; seen: Refusal; keyUpdates: number; epochStart: number; chunks: Map<number, number> }
+    | string {
+    const refusal = cur.refusal;
+    if (!refusal || cur.status !== undefined) return "no refusal before a response head";
+    const recs = this.reader.records.filter((x) => x.start < refusal.end);
+    let first = recs.find((x) => x.abs >= cur.recvAtSend);
+    // A GOAWAY that came while the request was being prepared lies before it.
+    if (!first || first.start >= refusal.end) first = recs.find((x) => x.start + x.content.length >= refusal.end);
+    if (!first) return "the refusing frame is no longer held";
+    const covered = recs.filter((x) => x.abs >= first!.abs);
+    if (covered.length > 8) return `R spans ${covered.length} records (at most 8)`;
+    for (let i = 0; i < covered.length; i++) {
+      const x = covered[i]!;
+      if (x.abs !== first.abs + i) return "a record that is not application data lies inside R";
+      const post = this.serverPost[x.abs - this.hsCipher];
+      if (!post || !post.data || post.keyUpdates > 0) return "a KeyUpdate lies inside R";
+      if (!this.plain.has(x.abs) || !this.serverRecords.has(x.abs)) return "a record of R is no longer held";
+    }
+    const raw = this.reader.slice(first.start, refusal.end);
+    if (raw.length > 16 << 10) return `R is ${raw.length} bytes (at most 16 KiB)`;
+    const checked = refusalProblem(raw, cur.stream, cur.releaseSent);
+    if (typeof checked === "string") return checked;
+    if (checked.kind !== refusal.seen.kind) return "the walk ends at another refusal than the one seen";
+    let keyUpdates = 0;
+    let epochStart = 0;
+    for (let i = 0; i < first.abs - this.hsCipher; i++) {
+      if (this.serverPost[i]!.keyUpdates > 0) {
+        keyUpdates += this.serverPost[i]!.keyUpdates;
+        epochStart = i + 1;
+      }
+    }
+    const chunks = new Map<number, number>();
+    let left = raw.length;
+    for (const x of covered) {
+      if (left <= 0) break;
+      const take = Math.min(left, x.content.length);
+      chunks.set(x.abs, take);
+      left -= take;
+    }
+    return { record: first.abs, raw, seen: checked, keyUpdates, epochStart, chunks };
+  }
+
+  /**
+   * A refusal of the request's stream before any response head (RFC 9113
+   * §8.7: not processed): disclosed with `disclose_reset`, proven with one
+   * π_WIN under `s_ap_0` as an error head is, and settled like a 429 (the
+   * session fee if still due, nothing more; §12.10). Throws
+   * `StreamNotProcessedError` with the receipt; returns when there is nothing
+   * to disclose (the caller's checks then decide, as before).
+   */
+  private async settleRefusal(cur: Cur): Promise<void> {
+    if (this.framing !== "2" || !cur.refusal || cur.status !== undefined) return;
+    await this.drained();
+    const d = this.refusalDisclosure(cur);
+    if (typeof d === "string") {
+      this.event({ ev: "refusal_not_disclosable", n: cur.n, why: d });
+      return;
+    }
+    // Our own records must be proven first (one π_WIN at a time).
+    await this.until(
+      () => this.unproven.size === 0 && cur.proofs.some((p) => p.proof === "pi_win"),
+      "our records to be proven",
+      this.timeouts.proof,
+    );
+    const msg: Record<string, unknown> = { type: "disclose_reset", n: cur.n, record: d.record, r: hex(d.raw) };
+    if (d.keyUpdates > 0) {
+      msg.key_updates = d.keyUpdates;
+      msg.epoch_start = d.epochStart;
+    }
+    this.sendOrdered(msg);
+    const att = await this.checkAttestation((await this.wait(["attestation"], this.timeouts.attestation)).msg, cur, undefined);
+    const m = (await this.wait(["zk_params:pi_win:refusal"], this.timeouts.zkParams)).msg;
+    const shape = this.checkServerWindows(m.params, d.chunks, d.keyUpdates, d.epochStart);
+    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
+    cur.proofs.push({ ...t, purpose: "refusal", ...shape });
+    const { receipt } = await this.takeReceipt(cur, att.json);
+    this.checkPinnedModel(cur, receipt);
+    checkRefusedReceipt(receipt, d.seen, this.feeDue(cur), {
+      abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
+      image: cur.image ? { model: cur.model, variant: cur.image.variant.id, count: cur.image.count } : undefined,
+    });
+    // The node closes the connection after it (§12.9 `error_settled`).
+    this.goaway = true;
+    const cost = receipt.cost_msats ?? 0;
+    this.event({ ev: "refusal_settled", n: cur.n, refused: d.seen.kind, cost_msats: cost });
+    throw new StreamNotProcessedError(
+      d.seen.kind === "rst_stream"
+        ? `the provider refused stream ${cur.stream} (REFUSED_STREAM): request ${cur.n} was not processed (proven; ${cost} msats)`
+        : `the provider is going away (GOAWAY, last stream ${d.seen.lastStreamId}): request ${cur.n} on stream ${cur.stream} was not processed (proven; ${cost} msats)`,
+      { receipt, costMsats: cost },
+    );
+  }
+
+  /**
+   * π_WIN parameters over server records (an error head, a refusal): the
+   * windows may touch only the disclosed bytes `[0, take)` of each record and
+   * its final type byte.
+   */
+  private checkServerWindows(params: unknown, chunks: Map<number, number>, keyUpdates: number, epochStart: number) {
+    return checkPiWinParams(params, {
       anchor: this.secrets().h2,
       keyUpdates,
       lookup: (seq) => {
@@ -2487,11 +2634,6 @@ export class ConfidentialConnection {
       },
       covered: [...chunks.keys()].map((abs) => abs - this.hsCipher - epochStart),
     });
-    const t = await this.proof("pi_win", "prove", m.params, { Secret: Array.from(this.secrets().serverAp0) });
-    cur.proofs.push({ ...t, purpose: "error_head", ...shape });
-    const { receipt } = await this.takeReceipt(cur, att.json);
-    this.checkErrorReceipt(cur, receipt, status);
-    return { receipt, attestation: att.a };
   }
 
   /**
@@ -2692,6 +2834,8 @@ export class ConfidentialConnection {
         `receipt is for http ${JSON.stringify(receipt.http ?? null).slice(0, 16)} request ${String(receipt.n).slice(0, 16)}, not "${this.framing}" request ${cur.n}`,
       );
     }
+    // Every receipt names the reservation the node announced (§12.4).
+    checkAnnouncedReservation(receipt, cur.reservedMsat);
     // The connection's first settled request returns the deposit: its
     // (signed) receipt says so, once, with the offer's amount (§12.8, §12.10).
     const back = receipt.deposit_released_msat;

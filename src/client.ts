@@ -37,6 +37,7 @@ import {
   RequestRefusedError,
   ReservationAboveCeilingError,
   SessionRejectedError,
+  StreamNotProcessedError,
   TwoPcVersionMismatchError,
   UpgradeRequiredError,
   UpstreamImageError,
@@ -376,6 +377,8 @@ export function http2OpenFailure(error: unknown): boolean {
   // The node's reservation, not the framing: "1.1" would be refused the same way.
   if (error instanceof ReservationAboveCeilingError) return false;
   if (error instanceof UpgradeRequiredError || error instanceof TwoPcVersionMismatchError) return false;
+  // The provider refused one stream or went away: the framing worked.
+  if (error instanceof StreamNotProcessedError) return false;
   if (error instanceof SessionRejectedError) {
     if (error.nodeCode?.startsWith("h2_") || error.nodeCode === "upstream_unreachable" || error.fault === "upstream") return true;
     return error.status === undefined || error.status >= 500 || error.status === 408;
@@ -873,6 +876,20 @@ export class ConfidentialClient {
         else if (refused && offerChangedRefusal(error)) conn.close("offer_changed");
         lease.release();
         traffic.done();
+        // A request the provider did not process (RFC 9113 §8.7: REFUSED_STREAM,
+        // or a stream above a GOAWAY's last one) runs again on a new
+        // connection, even after its release. Proven (`disclose_reset`), it
+        // cost what its receipt says (the session fee if still due); unproven
+        // and released, the node may still charge its reservation (§12.10).
+        if (error instanceof StreamNotProcessedError && !state.headSeen && !signal?.aborted && attempt < 3) {
+          this.emit({
+            ev: "request_retry",
+            reason: `not processed by the provider: ${errorText(error)}`,
+            ...(error.costMsats !== undefined ? { refused_cost_msats: error.costMsats } : {}),
+          });
+          state.handle = undefined;
+          continue;
+        }
         if (refused || handle.bodyReleased || state.headSeen || signal?.aborted || attempt >= 3) throw error;
         const first = handle.n === 1 && lease.warm !== "open";
         if (first && fallbackTo11(error)) {

@@ -264,6 +264,63 @@ export function checkUpstreamErrorReceipt(
 }
 
 /**
+ * A receipt for a refusal the client proved (`disclose_reset`, PROTOCOL-V3.md
+ * §12.8): its `usage` names the refusal we saw (`{"refused":"rst_stream",
+ * "error_code":7}` or `{"refused":"goaway","error_code":0,"last_stream_id"}`,
+ * `choices: []`), and it costs at most the session fee still due on the
+ * connection (§12.10: settled like a 429), with fee fields no higher than the
+ * signed ones. An image request's receipt names its own terms. Throws.
+ */
+export function checkRefusedReceipt(
+  receipt: ConfidentialReceipt,
+  seen: { kind: "rst_stream" } | { kind: "goaway"; lastStreamId: number },
+  sessionFeeMsat = 0,
+  options: { abandonFeeMsat?: number; image?: { model: string; variant: string; count: number } } = {},
+): void {
+  const fail = (what: string): never => {
+    throw new ReceiptVerificationError(`refusal receipt: ${what}`);
+  };
+  const u = receipt.usage as unknown as Record<string, unknown> | undefined;
+  if (!u || typeof u !== "object") return fail("no usage");
+  if (u.refused !== seen.kind) fail(`names ${JSON.stringify(u.refused ?? null).slice(0, 32)}, we saw ${seen.kind}`);
+  if (u.error_code !== (seen.kind === "rst_stream" ? 7 : 0)) fail(`error code ${String(u.error_code).slice(0, 16)}`);
+  if (seen.kind === "goaway" && u.last_stream_id !== seen.lastStreamId) {
+    fail(`last stream ${String(u.last_stream_id).slice(0, 16)}, the GOAWAY named ${seen.lastStreamId}`);
+  }
+  if (!Array.isArray(u.choices) || u.choices.length !== 0) fail("choices is not []");
+  const fee = Math.max(0, sessionFeeMsat);
+  if (typeof receipt.session_fee_msat === "number" && receipt.session_fee_msat > fee) {
+    fail(`session fee ${receipt.session_fee_msat} msats exceeds the ${fee} msats due`);
+  }
+  if (typeof receipt.abandon_fee_msat === "number" && receipt.abandon_fee_msat > Math.max(fee, options.abandonFeeMsat ?? 0)) {
+    fail(`abandon fee ${receipt.abandon_fee_msat} msats exceeds the signed one`);
+  }
+  if (!isMsatAmount(receipt.cost_msats)) return fail(`cost ${String(receipt.cost_msats)} is not a valid amount`);
+  if (receipt.cost_msats > fee) fail(`cost ${receipt.cost_msats} msats exceeds the session fee due (${fee} msats)`);
+  const image = options.image;
+  if (image) {
+    if (receipt.kind !== "images") fail(`kind ${String(receipt.kind)} is not images`);
+    if (receipt.model !== image.model) fail(`model ${String(receipt.model)} is not ${image.model}`);
+    if (receipt.variant !== image.variant) fail(`variant ${String(receipt.variant)} is not ${image.variant}`);
+    if (receipt.count !== image.count) fail(`count ${String(receipt.count)} is not ${image.count}`);
+  }
+}
+
+/**
+ * Every receipt that names `reserved_msats` must name the reservation the node
+ * announced in `request_ok` (§12.4), when it announced one. Throws.
+ */
+export function checkAnnouncedReservation(receipt: ConfidentialReceipt, announcedMsat: number | undefined): void {
+  const reserved = (receipt as { reserved_msats?: unknown }).reserved_msats;
+  if (announcedMsat === undefined || reserved === undefined) return;
+  if (reserved !== announcedMsat) {
+    throw new ReceiptVerificationError(
+      `receipt names a reservation of ${String(reserved).slice(0, 32)} msats, the node announced ${announcedMsat} msats in request_ok`,
+    );
+  }
+}
+
+/**
  * A flat-priced (image) receipt: the charge is fixed at setup by the signed
  * offer, so everything is checked for equality: the model, variant and count
  * we pinned, the signed price per image, and the cost

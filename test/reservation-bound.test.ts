@@ -17,6 +17,7 @@ import {
   ReservationAboveCeilingError,
   SessionProtocolError,
   SessionRejectedError,
+  StreamNotProcessedError,
   confidentialErrorCode,
   mayHaveReachedProvider,
 } from "../src/errors.js";
@@ -473,6 +474,24 @@ describe("errors after the release carry the release marker", () => {
       .catch((e: unknown) => e);
     expect(upstream).toMatchObject({ code: "upstream_error", status: 500 });
     expect(mayHaveReachedProvider(upstream)).toBe(true);
+  });
+
+  it("a request the provider did not process runs again on a new connection, even after its release", async () => {
+    mockNode();
+    let calls = 0;
+    const run = fakeRun(async (s) => {
+      s.released = true;
+      if (++calls === 1) {
+        throw new StreamNotProcessedError("refused (proven)", { receipt: { sid: "s", model: "cheap", usage: {} as never }, costMsats: 0 });
+      }
+      s.onResponseHead?.(SSE_HEAD);
+      return SSE_HEAD;
+    });
+    const events: Record<string, unknown>[] = [];
+    await chat(client({ onEvent: (e: Record<string, unknown>) => events.push(e) }));
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(events.find((e) => e.ev === "request_retry")).toMatchObject({ refused_cost_msats: 0 });
+    expect(http2OpenFailure(new StreamNotProcessedError("x"))).toBe(false);
   });
 
   it("an abort after the release is marked; one before it is not", async () => {

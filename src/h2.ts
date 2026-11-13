@@ -309,6 +309,62 @@ export function errorHeadPrefixProblem(prefix: Uint8Array, stream: number): stri
   return p === prefix.length ? undefined : "a frame before the response head runs into it";
 }
 
+/** RST_STREAM's code for a stream the server did not process (RFC 9113 §8.7). */
+export const REFUSED_STREAM = 7;
+/** GOAWAY's code of a graceful end. */
+export const NO_ERROR = 0;
+
+/** The refusal a disclosed R ends with (PROTOCOL-V3.md §5.4, `disclose_reset`). */
+export type Refusal = { kind: "rst_stream" } | { kind: "goaway"; lastStreamId: number };
+
+/**
+ * A provider's refusal of a stream it did not process, as the sidecar checks
+ * it (`disclose_reset`, PROTOCOL-V3.md §5.4; `h2::parse_refusal`): R is the
+ * plaintext from byte 0 of a server record to the end of the refusing frame,
+ * walked frame by frame. The refusal is RST_STREAM(REFUSED_STREAM) on
+ * `stream` (only with `rstAllowed`: some record of the request may have been
+ * written), or GOAWAY(NO_ERROR) on stream 0 whose last-stream-id is below
+ * `stream`. Before it only frames that carry nothing of the client's and no
+ * response on the stream: SETTINGS, PING, WINDOW_UPDATE on stream 0, a
+ * WINDOW_UPDATE on `stream`, frames of the probe stream (1), and a GOAWAY that
+ * does not refuse `stream`. Returns the refusal, or why R is not one.
+ */
+export function refusalProblem(r: Uint8Array, stream: number, rstAllowed: boolean): Refusal | string {
+  if (stream === 0 || stream === 1) return "not a request stream";
+  const probe: number[] = [FRAME.HEADERS, FRAME.CONTINUATION, FRAME.DATA, FRAME.RST_STREAM, FRAME.WINDOW_UPDATE];
+  const word = (b: Uint8Array, at: number) => ((b[at]! << 24) | (b[at + 1]! << 16) | (b[at + 2]! << 8) | b[at + 3]!) >>> 0;
+  let p = 0;
+  for (;;) {
+    if (r.length - p < 9) return "a partial frame header";
+    const len = (r[p]! << 16) | (r[p + 1]! << 8) | r[p + 2]!;
+    const type = r[p + 3]!;
+    const flags = r[p + 4]!;
+    // The reserved bit is kept: a set one never equals a stream id.
+    const s = word(r, p + 5);
+    if (len > MAX_FRAME_SIZE) return `a frame of ${len} bytes`;
+    if (r.length < p + 9 + len) return "a frame extends past the disclosed bytes";
+    const body = r.subarray(p + 9, p + 9 + len);
+    const end = p + 9 + len === r.length;
+    const goawayLast = type === FRAME.GOAWAY && s === 0 && len >= 8 ? word(body, 0) & 0x7fffffff : undefined;
+    let refusal: Refusal | undefined;
+    if (type === FRAME.RST_STREAM && s === stream && len === 4 && word(body, 0) === REFUSED_STREAM && rstAllowed) {
+      refusal = { kind: "rst_stream" };
+    } else if (goawayLast !== undefined && goawayLast < stream && word(body, 4) === NO_ERROR) {
+      refusal = { kind: "goaway", lastStreamId: goawayLast };
+    }
+    if (refusal) return end ? refusal : "R must end with the refusing frame";
+    const ok =
+      (s === 0 && type === FRAME.SETTINGS && len % 6 === 0 && (flags & ~FLAG.ACK) === 0) ||
+      (s === 0 && type === FRAME.PING && len === 8) ||
+      (goawayLast !== undefined && goawayLast >= stream) ||
+      (type === FRAME.WINDOW_UPDATE && len === 4 && (s === 0 || s === stream)) ||
+      (s === 1 && probe.includes(type));
+    if (!ok) return `a frame of type ${type} on stream ${s} before the refusal (or a refusal that does not count)`;
+    p += 9 + len;
+    if (end) return "no refusal of the request's stream";
+  }
+}
+
 export function splitBody(body: Uint8Array, suffixLen: number, chunk = MAX_DATA_IN_RECORD): Uint8Array[] {
   if (suffixLen > chunk || suffixLen > body.length) fail('h2: the suffix does not fit one DATA frame')
   const parts: Uint8Array[] = []
