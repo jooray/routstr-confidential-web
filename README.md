@@ -107,6 +107,18 @@ with the same number after the offer is refetched; `offer_changed` closes the
 connection and the request opens a new one. A connection the node closes
 (`closed`, any reason, `evicted` included) leaves the pool.
 
+**A stream the provider refused.** On framing `"2"` the provider may refuse a
+request's stream before it processed it: RST_STREAM(REFUSED_STREAM), or a
+GOAWAY(NO_ERROR) whose last stream is below the request's. The node cannot see
+either frame (they are under `s_ap_0`), so the page proves it: `disclose_reset`
+with one π_WIN from no later than the request's first server record to the
+refusing frame. The node settles it like a 429 (the session fee if still due,
+nothing more), the connection closes, and the library runs the request again
+on a new connection (`request_retry`, `refused_cost_msats`); the caller sees
+only the answer. A request whose body was released and whose refusal could not
+be proven is not run again (`refusal_not_disclosable`; the node charges its
+reservation).
+
 The protocol and its security argument are in routstr-confidential:
 `docs/TWOPC-DESIGN.md` and `paper/`.
 
@@ -273,6 +285,30 @@ for await (const chunk of stream) out.textContent += chunk.choices[0]?.delta?.co
 const v = await stream.verification; // throws if any proof or receipt check failed
 console.log(v.framing, v.n, v.connection, v.deposit, v.bytes, v.ttftMs, v.receipt.cost_msats, v.provider?.alpn);
 ```
+
+The response headers a result carries are an allow-list of the provider's
+(`EXPOSED_PROVIDER_HEADERS`: `content-type`, `cache-control`, `date`,
+`retry-after`, `x-request-id`, `request-id`); everything else (the operator's
+balance and rate-limit counters, cookies, a provider's own headers) is read by
+the client and dropped.
+
+### Events
+
+`onEvent` gets plain objects with `ev`, `t` (ms), `kind` (`chat` or
+`images`) and, once known, `sid`. Never secrets. The ones a UI shows:
+
+| `ev` | When | Fields |
+|---|---|---|
+| `request` | a request starts on a connection | `model`, `http`, `n`, `path` (`cold`, `armed`, `reused`) |
+| `ready` | the node reserved the deposit and named the connection | `http`, `armed` |
+| `twopc_progress` | the 2PC download between `ready` and `armed`: at most 4 a second, and once at the end | `received` (bytes so far), `expected` (`TWOPC_DOWNLOAD_BYTES`, about 16.4 MB; a display hint, never checked) |
+| `armed` | the 2PC preprocessing and the key share are done | `http`, `arm_ms` |
+| `certificate_verified`, `open` | the provider's chain checked; the connection is open | |
+| `request_sent`, `body_sent`, `pi_win_ok` | the request's records went out and were proven | record counts |
+| `request_settled` | the receipt was checked | `n`, `status`, `total_ms` |
+| `request_retry`, `framing_fallback` | the library runs the request again (a refused stream, a failed open of `"2"`) | `reason` |
+| `deposit` | the deposit's outcome (released by a receipt, or the node's signed outcome in the last frame) | `msat`, `outcome`, `reason`, `signed` |
+| `warning` | `code: "deposit_outcome"`: the node's deposit outcome contradicts its signed terms (another amount; charged after a releasing receipt, after a fault of the node or the provider, or with a releasing reason). Detection only: the `deposit` event still comes | `code`, `message` |
 
 ### Images
 
