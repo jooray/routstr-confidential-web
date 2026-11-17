@@ -12,13 +12,16 @@ import {
   ConfidentialError,
   ConnectionDepositError,
   NodeProtocolOutdatedError,
+  OfferUnavailableError,
   RequestRefusedError,
   SessionProtocolError,
   SessionRejectedError,
   TwoPcVersionMismatchError,
+  StreamNotProcessedError,
   UpgradeRequiredError,
+  mayHaveReachedProvider,
 } from "../src/errors.js";
-import { verifyConfidentialOffer } from "../src/offer.js";
+import { fetchConfidentialOffer, verifyConfidentialOffer } from "../src/offer.js";
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../src/connection.js";
 import {
   BOTH,
@@ -594,5 +597,29 @@ describe("requests the client refuses before anything is sent", () => {
     await expect(image(client())).rejects.toBeInstanceOf(ConfidentialError);
     mockNodeOffer({ ...ONLY_11, capabilities: ["chat", "images"], images: IMAGES });
     await expect(image(client({ http: "2" }))).rejects.toThrow(/framing "2"/);
+  });
+});
+
+describe("a node whose offer cannot be fetched", () => {
+  it("is not asked again while it cools down", async () => {
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches++;
+      throw new TypeError("Failed to fetch");
+    }) as typeof fetch;
+    const c = client();
+    for (let i = 0; i < 3; i++) await expect(c.offer()).rejects.toBeInstanceOf(OfferUnavailableError);
+    expect(fetches).toBe(1);
+    // Another node is not affected.
+    await expect(client().offer()).rejects.toBeInstanceOf(OfferUnavailableError);
+    expect(fetches).toBe(2);
+  });
+
+  it("an offer fetch that hangs times out", async () => {
+    const t0 = Date.now();
+    const hang = ((_url: string, init?: RequestInit) =>
+      new Promise((_res, rej) => init?.signal?.addEventListener("abort", () => rej(init.signal!.reason)))) as typeof fetch;
+    await expect(fetchConfidentialOffer(freshNode(), { fetchImpl: hang, timeoutMs: 50 })).rejects.toThrow(OfferUnavailableError);
+    expect(Date.now() - t0).toBeLessThan(2_000);
   });
 });
