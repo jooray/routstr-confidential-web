@@ -1,6 +1,7 @@
 /**
- * Price display and checks from the *signed* offer (msat per 1k tokens) and
- * the node's model list (context length). Tolerant of extra offer fields: a
+ * Price display and checks from the *signed* offer (msat per 1k tokens, the
+ * prompt limit in `context_lengths`) and the node's model list (the context
+ * length where the offer signs none). Tolerant of extra offer fields: a
  * node may add a flat `session_fee_msat` and a `rate_surcharge_pct` (already
  * folded into the price list); both are read when present.
  */
@@ -17,7 +18,7 @@ export interface ModelPricing {
   id: string;
   name?: string;
   contextLength?: number;
-  /** The prompt limit the node reserves for (context − max completion), when known. */
+  /** The prompt limit the node reserves for: the signed one (`context_lengths`), else the model list's, when known. */
   promptLimit?: number;
   rates: ConfidentialPriceEntry;
   sessionFeeMsat: number;
@@ -66,6 +67,13 @@ export function promptLimit(m: NodeModel | undefined): number | undefined {
   return known.length ? Math.max(...known) : undefined;
 }
 
+/** The prompt limit the node's signed offer names for `model` (`context_lengths`), if any. */
+export function signedPromptLimit(offer: VerifiedOffer, model: string | undefined): number | undefined {
+  const m = offer.context_lengths;
+  const v = model !== undefined && m && typeof m === "object" && Object.hasOwn(m, model) ? m[model] : undefined;
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : undefined;
+}
+
 /** The model's undiscounted maximum cost in sats, from the node's model list. */
 function maxCostSats(m: NodeModel | undefined): number | undefined {
   const v: unknown = m?.sats_pricing?.max_cost;
@@ -75,17 +83,20 @@ function maxCostSats(m: NodeModel | undefined): number | undefined {
 /**
  * The reservation (msat) the node holds for a session on `m` with a pinned
  * completion cap of `maxTokens`, as routstr-core's confidential `reserve()`
- * computes it. See `ModelPricing.reservationMsat`.
+ * computes it. See `ModelPricing.reservationMsat`. The prompt limit is the
+ * one the offer signs for `model` (default `m.id`), else the model list's
+ * (which may be another upstream's row, or stale).
  */
 export function reservationMsat(
   offer: VerifiedOffer,
   rates: ConfidentialPriceEntry,
   m: NodeModel | undefined,
   maxTokens: number,
+  model: string | undefined = m?.id,
 ): number | undefined {
   const fee = Math.max(sessionFeeMsat(offer), offerAbandonFeeMsat(offer));
   const margin = offerReserveMarginTokens(offer);
-  const limit = promptLimit(m);
+  const limit = signedPromptLimit(offer, model) ?? promptLimit(m);
   if (limit !== undefined) {
     // The prompt is opaque and may be all prompt-cache writes: the node prices
     // it at the dearer of the input and cache-write rates.
@@ -108,13 +119,14 @@ export function reservationMsat(
  * The ceiling (msat) a client may hold a node's announced reservation for a
  * confidential chat request to (`maxReservationMsat`): never below what an
  * honest node reserves. Only computed where the node's formula depends on
- * nothing but the signed offer and the model's context length: the offer
- * prices the model, the model has a known context length (the fallback
+ * nothing but the signed offer: the offer prices the model, signs the prompt
+ * limit it reserves for (`context_lengths`; the model list's row may be
+ * another upstream's, and without a context length the node's fallback
  * branch reads the model's maximum cost in sats, which moves with the
- * exchange rate) and the offer takes a connection deposit, whose amount the
- * node never sets below its minimum reservation (`min_request_msat`, the
- * floor of every reservation). `maxTokens` is the request's pinned completion
- * cap. Undefined: no ceiling.
+ * exchange rate) and takes a connection deposit, whose amount the node never
+ * sets below its minimum reservation (`min_request_msat`, the floor of every
+ * reservation). `maxTokens` is the request's pinned completion cap; `m` is
+ * not read. Undefined: no ceiling.
  */
 export function reservationCeilingMsat(
   offer: VerifiedOffer,
@@ -123,10 +135,10 @@ export function reservationCeilingMsat(
   maxTokens: number,
 ): number | undefined {
   if (!Object.hasOwn(offer.price_list, model)) return undefined;
-  if (promptLimit(m) === undefined) return undefined;
+  if (signedPromptLimit(offer, model) === undefined) return undefined;
   const deposit = offerConnectionDepositMsat(offer);
   if (deposit <= 0) return undefined;
-  const msats = reservationMsat(offer, offer.price_list[model]!, m, maxTokens);
+  const msats = reservationMsat(offer, offer.price_list[model]!, m, maxTokens, model);
   if (msats === undefined || !Number.isFinite(msats)) return undefined;
   const fee = Math.max(sessionFeeMsat(offer), offerAbandonFeeMsat(offer));
   // max(min_request_msat, formula) + fee, with min_request_msat ≤ deposit.
@@ -168,9 +180,9 @@ export function modelPricing(offer: VerifiedOffer, models: NodeModel[], maxToken
   return Object.entries(offer.price_list)
     .map(([id, rates]) => {
       const m = byId.get(id);
-      const limit = promptLimit(m);
+      const limit = signedPromptLimit(offer, id) ?? promptLimit(m);
       const mt = Math.min(maxTokens, offer.max_tokens_cap);
-      const reservation = reservationMsat(offer, rates, m, mt);
+      const reservation = reservationMsat(offer, rates, m, mt, id);
       const deposit = offerConnectionDepositMsat(offer);
       return {
         id,

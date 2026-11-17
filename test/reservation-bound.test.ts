@@ -201,6 +201,7 @@ describe("the reservation ceiling a client derives", () => {
       abandon_fee_msat: 300,
       reserve_margin_tokens: 16,
       connection_deposit_msat: 2000,
+      context_lengths: { m: 8192 },
       ...extra,
     });
   const model = (extra: Record<string, unknown> = {}) =>
@@ -221,16 +222,16 @@ describe("the reservation ceiling a client derives", () => {
   it("is none where the client cannot bound what an honest node reserves", () => {
     // No deposit: the node's minimum reservation is unknown.
     expect(reservationCeilingMsat(offer({ connection_deposit_msat: 0 }), "m", model(), 100)).toBeUndefined();
-    // No context length: the node's fallback reads the model's sats price.
-    expect(reservationCeilingMsat(offer(), "m", model({ context_length: undefined }), 100)).toBeUndefined();
-    expect(reservationCeilingMsat(offer(), "m", undefined, 100)).toBeUndefined();
+    // No signed context length: the model list's row may be another
+    // upstream's, and the node's fallback reads the model's sats price.
+    expect(reservationCeilingMsat(offer({ context_lengths: undefined }), "m", model(), 100)).toBeUndefined();
     // The offer does not price the model.
     expect(reservationCeilingMsat(offer(), "other", model({ id: "other" }), 100)).toBeUndefined();
   });
 
   it("without a context length scales the maximum cost by the cache-write premium, like the node", () => {
     const rates = { in: 6000, cached_in: 600, cache_write: 7500, out: 30_000 };
-    const o = offer({ price_list: { m: rates }, rate_surcharge_pct: 20, session_fee_msat: 2000, abandon_fee_msat: 5000 });
+    const o = offer({ price_list: { m: rates }, rate_surcharge_pct: 20, session_fee_msat: 2000, abandon_fee_msat: 5000, context_lengths: undefined });
     const m = model({ context_length: undefined, sats_pricing: { max_cost: 70 } });
     // ceil(70 000 × 1.25 × 1.2 + 16 × 30 000 / 1000) + 5000
     expect(reservationMsat(o, rates, m, 100)).toBe(Math.ceil(70_000 * 1.25 * 1.2 + 480) + 5000);
@@ -540,9 +541,10 @@ describe("errors after the release carry the release marker", () => {
 
 describe("the client's reservation ceiling", () => {
   const MODELS = [{ id: "cheap", context_length: 8192 }];
+  const SIGNED = { ...BOTH, context_lengths: { cheap: 8192 } };
 
-  it("defaults to the node's own formula for the model on this node", async () => {
-    mockNode(BOTH, MODELS);
+  it("defaults to the node's own formula for the model on this node, by the prompt limit its offer signs", async () => {
+    mockNode(SIGNED, []);
     const seen: unknown[] = [];
     fakeRun(async (s, opts) => {
       seen.push(opts.maxReservationMsat);
@@ -551,13 +553,13 @@ describe("the client's reservation ceiling", () => {
       return SSE_HEAD;
     });
     await chat(client(), { max_tokens: 77 });
-    const offer = verified(BOTH);
-    expect(seen).toEqual([reservationCeilingMsat(offer, "cheap", MODELS[0] as NodeModel, 77)]);
+    const offer = verified(SIGNED);
+    expect(seen).toEqual([reservationCeilingMsat(offer, "cheap", undefined, 77)]);
     expect(typeof seen[0]).toBe("number");
   });
 
-  it("is none when the node lists no context length, and the caller's own value or function wins", async () => {
-    mockNode(BOTH, []);
+  it("is none when the offer signs no context length, and the caller's own value or function wins", async () => {
+    mockNode(BOTH, MODELS);
     const seen: unknown[] = [];
     fakeRun(async (s, opts) => {
       seen.push(opts.maxReservationMsat);

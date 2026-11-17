@@ -91,6 +91,7 @@ export {
   offerSupportsImages,
   pinnedModelId,
   upstreamModelsProblem,
+  contextLengthsProblem,
   validateImagesOffer,
   verifyConfidentialOffer,
   verifyOfferSignature,
@@ -113,7 +114,7 @@ export { canonicalSuffix, MAX_BODY_LEN, padBody, paddedBodyLength, type PadBucke
 export { buildPinnedBody, requestedMaxTokens, SseParser, aggregateChatCompletion } from "./request.js";
 export { mintInputFees, NodeApi, NodeApiError } from "./node-api.js";
 export type { BalanceInfo, LightningInvoice, LightningInvoiceStatus, MintFee, NodeModel } from "./node-api.js";
-export { costMsat, formatSats, modelPricing, promptLimit, reservationCeilingMsat, reservationMsat, roughTokens, sessionFeeMsat } from "./pricing.js";
+export { costMsat, formatSats, modelPricing, promptLimit, reservationCeilingMsat, reservationMsat, roughTokens, sessionFeeMsat, signedPromptLimit } from "./pricing.js";
 export type { ModelPricing } from "./pricing.js";
 export { InlineWasmHost, WorkerWasmHost, getDefaultWasmHost, setDefaultWasmHost } from "./wasm/host.js";
 export type { WasmHost } from "./wasm/host.js";

@@ -715,21 +715,6 @@ export class ConfidentialClient {
     }
   }
 
-  /**
-   * The node's model list for a request's default reservation ceiling: the
-   * cached list, else a fetch bounded by a few seconds (none then: the
-   * request runs without that ceiling).
-   */
-  private async modelsForCeiling(): Promise<NodeModel[] | undefined> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<undefined>((res) => (timer = setTimeout(res, 5000)));
-    try {
-      return await Promise.race([this.models(), late]);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   async models(): Promise<NodeModel[]> {
     if (this.modelsCache && Date.now() - this.modelsCache.at < 300_000) return this.modelsCache.models;
     const models = await this.api.models().catch(() => [] as NodeModel[]);
@@ -1108,16 +1093,16 @@ export class ConfidentialClient {
   ): Promise<ConfidentialStream> {
     const auth = this.credential;
     if (!auth) throw new ConfidentialError("not_configured", "no credential: fund the wallet or paste an sk- key");
-    // The node's model list gives the context length the default reservation ceiling needs.
-    const [offer, nodeModels] = await Promise.all([this.offer(freshOffer), ceiling === undefined ? this.modelsForCeiling() : undefined]);
+    const offer = await this.offer(freshOffer);
     const model = params.model;
     if (!Object.hasOwn(offer.price_list, model)) {
       throw new ConfidentialError("offer_malformed", `the node does not serve ${model} confidentially`);
     }
     const maxTokens = requestedMaxTokens(params, Number(offer.max_tokens_cap ?? 4096));
-    // The caller's ceiling, else the node's own formula for this model on this node (none when unknown).
+    // The caller's ceiling, else the node's own formula for this model, by the
+    // prompt limit its offer signs (none when it signs none).
     const maxReservationMsat = reservationCeiling(
-      ceiling ?? ((o, req) => reservationCeilingMsat(o, req.model, nodeModels?.find((m) => m.id === req.model), req.maxTokens)),
+      ceiling ?? ((o, req) => reservationCeilingMsat(o, req.model, undefined, req.maxTokens)),
       offer,
       { model, maxTokens },
     );
