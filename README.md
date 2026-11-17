@@ -209,14 +209,15 @@ Other caveats:
   the node, its sidecar or the provider releases it; the node signs the
   outcome in the connection's last frame.
 - **Balance needed**: while a request runs, the node reserves its worst case: a
-  prompt filling the model's whole context (the larger context length, at the
+  prompt filling the model's whole context (the prompt limit the offer signs
+  in `context_lengths`, else the model list's larger context length, at the
   dearer of the input and cache-write rates), plus `max_tokens`, plus the fee.
   A new connection needs that plus the deposit (`ModelPricing.requiredMsat`).
 - **Reservation ceiling**: the node names a request's whole reservation in
   `request_ok` (`reserved_msats`; older nodes omit it). A chat request holds it
   to a ceiling, by default the node's own formula for the model
-  (`reservationCeilingMsat`, from the signed offer and the node's context
-  length; none when the model has no context length or the offer no deposit),
+  (`reservationCeilingMsat`, from the signed offer alone, by the prompt limit
+  it signs for the model; none when it signs none or takes no deposit),
   or the caller's (`chat.completions.create(params, { maxReservationMsat })`,
   a number or a function of the offer and the request). A larger announcement
   stops the request before any of its records is sent (framing `"1.1"`: before
