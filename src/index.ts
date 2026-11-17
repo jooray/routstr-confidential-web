@@ -53,7 +53,7 @@ export type {
   DepositOutcome,
   ProofTiming,
 } from "./connection.js";
-export { ConnectionPool, FRAMING_BAD_MS, HTTP2_DEFAULTS, PREWARM_DEFAULTS, poolIdleMs, poolKey } from "./pool.js";
+export { ConnectionPool, FRAMING_BAD_MS, HTTP2_DEFAULTS, PREWARM_DEFAULTS, PoolBusyError, poolIdleMs, poolKey } from "./pool.js";
 export type { Http2Options, PoolLease } from "./pool.js";
 export { requestResult } from "./result.js";
 export type {

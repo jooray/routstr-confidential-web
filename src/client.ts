@@ -69,7 +69,7 @@ import {
   type ConnectionRequestHandle,
   type ConnectionRequestResult,
 } from "./connection.js";
-import { ConnectionPool, poolKey, type Http2Options, type PoolLease } from "./pool.js";
+import { ConnectionPool, PoolBusyError, poolKey, type Http2Options, type PoolLease } from "./pool.js";
 import { requestResult, type ConfidentialRequestResult } from "./result.js";
 import { checkImageResponse } from "./wire.js";
 import type { PadBucket } from "./suffix.js";
@@ -380,6 +380,8 @@ export function http2OpenFailure(error: unknown): boolean {
   if (error instanceof UpgradeRequiredError || error instanceof TwoPcVersionMismatchError) return false;
   // The provider refused one stream or went away: the framing worked.
   if (error instanceof StreamNotProcessedError) return false;
+  // Waiting for a free connection of the pool says nothing about the framing.
+  if (error instanceof PoolBusyError) return false;
   if (error instanceof SessionRejectedError) {
     if (error.nodeCode?.startsWith("h2_") || error.nodeCode === "upstream_unreachable" || error.fault === "upstream") return true;
     return error.status === undefined || error.status >= 500 || error.status === 408;
@@ -782,6 +784,26 @@ export class ConfidentialClient {
   }
 
   /**
+   * How to open a connection for a pool key. Built outside `runOnPool`: the
+   * pool keeps it for pre-warming, and a closure there would keep the request
+   * (its body) reachable for the key's life.
+   */
+  private connectionOpener(offer: VerifiedOffer, auth: string, kind: RequestSpec["kind"]): (framing: ConfidentialFraming) => ConfidentialConnection {
+    return (framing) =>
+      new ConfidentialConnection({
+        baseUrl: this.node,
+        offer,
+        framing,
+        auth,
+        host: this.host,
+        webSocketImpl: this.opts.webSocketImpl,
+        allowInsecureTransport: this.opts.allowInsecureTransport,
+        maxDepositMsat: this.maxDepositMsat(),
+        onEvent: (e) => this.emit({ ...e, kind }),
+      });
+  }
+
+  /**
    * One request on a pooled connection: an idle open one, else an armed one,
    * else a new one. A pooled connection may have died since its last request;
    * while nothing of this request was released towards the provider it runs
@@ -804,18 +826,7 @@ export class ConfidentialClient {
       bearer: auth,
       scope: `${this.opts.reuseScope ?? ""}\0${connectionTerms(offer)}${oneOff ? `\0${crypto.randomUUID()}` : ""}`,
     });
-    const open = (framing: ConfidentialFraming) =>
-      new ConfidentialConnection({
-        baseUrl: this.node,
-        offer,
-        framing,
-        auth,
-        host: this.host,
-        webSocketImpl: this.opts.webSocketImpl,
-        allowInsecureTransport: this.opts.allowInsecureTransport,
-        maxDepositMsat: this.maxDepositMsat(),
-        onEvent: (e) => this.emit({ ...e, kind: spec.kind }),
-      });
+    const open = this.connectionOpener(offer, auth, spec.kind);
     let forced: ConfidentialFraming | undefined;
     for (let attempt = 0; ; attempt++) {
       if (signal?.aborted) throw aborted();
