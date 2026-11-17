@@ -2830,12 +2830,11 @@ export class ConfidentialConnection {
 
   private checkErrorReceipt(cur: Cur, receipt: ConfidentialReceipt, status: number): void {
     this.checkPinnedModel(cur, receipt);
-    // The reservation as known before the release: the node's announcement,
-    // else the caller's ceiling (never the receipt's own number).
-    const announced = cur.reservedMsat !== undefined;
+    // The reservation as known before the release: the node's announcement
+    // (never the receipt's own number). Without one, the session fee due.
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
-      reservationMsat: announced ? cur.reservedMsat : cur.opts.maxReservationMsat,
-      reservationAnnounced: announced,
+      reservationMsat: cur.reservedMsat,
+      reservationAnnounced: cur.reservedMsat !== undefined,
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
       image: cur.image
         ? {

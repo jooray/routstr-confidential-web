@@ -224,8 +224,9 @@ Other caveats:
   the ClientHello) with `ReservationAboveCeilingError`, and the connection is
   closed (the node's abort rules apply). A receipt that charges the
   reservation for a provider 5xx (other than 503) must name the announced
-  reservation, else stay within the ceiling (images: price × count plus the
-  abandon fee); with neither only the fee is accepted.
+  reservation and stay within it (images: also within price × count plus the
+  abandon fee); without an announcement only the session fee still due is
+  accepted, for chat and images (the caller's ceiling is no announcement).
 - **Funding**: Lightning invoices from the node (`/lightning/invoice`; your
   wallet may add routing fees). Cashu tokens can create a key
   (`/v1/balance/create`) or top one up (`/v1/balance/topup`); the mint's

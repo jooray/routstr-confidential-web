@@ -167,11 +167,12 @@ export function errorStatusCharge(status: number): "abandon_fee" | "session_fee"
  *
  * A status billed at the reservation is never bounded by the receipt's own
  * `reserved_msats` alone (the node signs that number too): a charge above the
- * fee needs a bound the client knew before the release, `reservationMsat`
- * (the reservation the node announced in `request_ok`, or else the caller's
- * ceiling), or the image terms. With `reservationAnnounced` the receipt must
- * name exactly the announced reservation. Without any such bound only the fee
- * is accepted. A charge outside these bounds throws.
+ * session fee due needs the reservation the node announced in `request_ok`
+ * (`reservationMsat` with `reservationAnnounced`), and the receipt must name
+ * exactly that reservation (§12.4). Without an announcement only the session
+ * fee due is accepted, for chat and images alike (§12.10): neither the
+ * caller's ceiling nor an image's price × count stands in for it. A charge
+ * outside these bounds throws.
  */
 export function checkUpstreamErrorReceipt(
   receipt: ConfidentialReceipt,
@@ -180,9 +181,12 @@ export function checkUpstreamErrorReceipt(
   options: {
     abandonFeeMsat?: number;
     image?: { model: string; variant: string; count: number; msatPerImage: number };
-    /** The most the request may have reserved (msat), known before its release. */
+    /** The reservation the node announced for the request (msat), known before its release. */
     reservationMsat?: number;
-    /** `reservationMsat` is the node's own announcement (`request_ok.reserved_msats`). */
+    /**
+     * `reservationMsat` is the node's own announcement (`request_ok.reserved_msats`).
+     * Only an announced reservation bounds a charge above the session fee due.
+     */
     reservationAnnounced?: boolean;
   } = {},
 ): boolean {
@@ -247,11 +251,13 @@ export function checkUpstreamErrorReceipt(
       );
     }
     // The receipt's own number is the node's word: the charge must also be
-    // within a bound the client held before anything was released.
-    const bound = known ?? imageCeiling;
+    // within the reservation the node announced before anything was released.
+    // Without one, the session fee due is all a 5xx may cost.
+    const bound = options.reservationAnnounced ? known : undefined;
     if (bound === undefined) {
       throw new ReceiptVerificationError(
-        `node charged ${cost} msats for upstream error ${status}, and no reservation bound is known for the request`,
+        `node charged ${cost} msats for upstream error ${status}, and the node announced no reservation for the request:` +
+          ` only the session fee due (${fee} msats) is accepted`,
       );
     }
     if (cost > bound) {

@@ -76,11 +76,15 @@ describe("receipt verification", () => {
       ReceiptVerificationError,
     );
     // Other 5xx: at most the reservation the receipt names, and a bound known before the release.
-    const known = { reservationMsat: 9000 };
+    const known = { reservationMsat: 9000, reservationAnnounced: true };
     expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0, known)).toBe(true);
     expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0)).toThrow(
-      /no reservation bound/,
+      /announced no reservation/,
     );
+    // The caller's own ceiling is no announcement: only the session fee due.
+    expect(() =>
+      checkUpstreamErrorReceipt(err(500, { cost_msats: 9000, reserved_msats: 9000 }), 500, 0, { reservationMsat: 9000 }),
+    ).toThrow(/announced no reservation/);
     expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 9001, reserved_msats: 9000 }), 500, 0, known)).toThrow(
       /reservation/,
     );
@@ -128,10 +132,15 @@ describe("receipt verification", () => {
     for (const other of [{ kind: undefined }, { model: "y" }, { variant: "1K-webp" }, { count: 1 }]) {
       expect(() => checkUpstreamErrorReceipt(err(400, { cost_msats: 2000, ...other }), 400, 0, { abandonFeeMsat: 2000, image: image })).toThrow(/image error receipt/);
     }
-    // Other 5xx: at most price × count + abandon fee, even under a larger named reservation.
-    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image: image })).toBe(true);
-    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26001, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image: image })).toThrow(
+    // Other 5xx: at most price × count + abandon fee, even under a larger announced reservation.
+    const announced = { abandonFeeMsat: 2000, image: image, reservationMsat: 1e12, reservationAnnounced: true };
+    expect(checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, announced)).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26001, reserved_msats: 1e12 }), 500, 0, announced)).toThrow(
       /image error receipt/,
+    );
+    // Without an announcement: only the session fee due.
+    expect(() => checkUpstreamErrorReceipt(err(500, { cost_msats: 26000, reserved_msats: 1e12 }), 500, 0, { abandonFeeMsat: 2000, image: image })).toThrow(
+      /announced no reservation/,
     );
   });
 
