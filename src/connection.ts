@@ -488,6 +488,21 @@ class Inbox {
 
 const u32 = (b: Uint8Array, i = 0) => ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0;
 
+/**
+ * Deposit reasons that release the deposit (§12.10): a `charged` outcome
+ * naming one of them contradicts itself.
+ */
+const DEPOSIT_RELEASED_REASONS = new Set([
+  "request_settled",
+  "not_started",
+  "provider_unreachable",
+  "sidecar_failure",
+  "provider_closed",
+  "node_failure",
+  "request_received",
+  "provider_refused",
+]);
+
 export class ConfidentialConnection {
   readonly uuid = randomUUID();
   readonly baseUrl: string;
@@ -1037,8 +1052,30 @@ export class ConfidentialConnection {
       typeof pubkey === "string" &&
       verifySchnorrSignature(json, m.deposit_sig, pubkey) &&
       (d.sid === this.sid || (d.sid === null && !this.sid));
+    const released = this.deposit?.outcome === "released";
     this.deposit = { msat: Number(d.msat), outcome: d.outcome, reason: String(d.reason ?? "").slice(0, 64), signed };
     this.event({ ev: "deposit", ...this.deposit });
+    // Detection only: the node's own word against its signed terms (§12.10).
+    const problems: string[] = [];
+    if (this.deposit.msat !== this.depositMsat) {
+      problems.push(`a deposit of ${String(d.msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat} msat`);
+    }
+    if (this.deposit.outcome === "charged") {
+      if (released) problems.push("charged, though a receipt of this connection released it");
+      if (m.type === "error" && (m.fault === "node" || m.fault === "upstream")) {
+        problems.push(`charged after a fault of the ${m.fault === "node" ? "node" : "provider"} (released by §12.10 rows 3 and 4)`);
+      }
+      if (DEPOSIT_RELEASED_REASONS.has(this.deposit.reason)) {
+        problems.push(`charged with reason ${JSON.stringify(this.deposit.reason)}, which releases it`);
+      }
+    }
+    if (problems.length) {
+      this.event({
+        ev: "warning",
+        code: "deposit_outcome",
+        message: `the node's ${signed ? "signed " : "unsigned "}deposit outcome names ${problems.join("; ")}`,
+      });
+    }
   }
 
   /** `p`, or the connection's failure, whichever comes first (nothing is kept once `p` settles). */

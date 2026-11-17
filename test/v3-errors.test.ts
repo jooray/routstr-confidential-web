@@ -231,3 +231,76 @@ describe("close() ends the waits it leaves (review finding 22)", () => {
     expect(Date.now() - t).toBeLessThan(1000);
   });
 });
+
+describe("the deposit outcome is checked against the signed terms (detection only)", () => {
+  const signedDeposit = (d: Record<string, unknown>) => {
+    const deposit = { sid: null, msat: 3000, cost_msats: 0, balance_msats: 10, time: 1, ...d };
+    const json = canonicalJson(deposit);
+    return { deposit, deposit_json: json, deposit_sig: bytesToHex(schnorr.sign(sha256(utf8ToBytes(json)), PRIV)) };
+  };
+  /** Arms against a node whose last frame is `last`; returns the events seen. */
+  async function lastFrame(last: Record<string, unknown>) {
+    const events: Record<string, unknown>[] = [];
+    const c = conn(nodeSocket(() => [last]), { onEvent: (e: Record<string, unknown>) => events.push(e) });
+    await c.arm().catch(() => {});
+    return { c, events, warnings: events.filter((e) => e.ev === "warning") };
+  }
+
+  it("an outcome within the rules raises no warning and keeps the deposit event", async () => {
+    for (const last of [
+      { type: "error", status: 503, reason: "x", ...signedDeposit({ outcome: "released", reason: "not_started" }) },
+      { type: "closed", reason: "idle", ...signedDeposit({ outcome: "charged", reason: "unused" }) },
+      { type: "error", status: 400, reason: "x", ...signedDeposit({ outcome: "charged", reason: "unused" }) },
+    ]) {
+      const { events, warnings } = await lastFrame(last);
+      expect(events.some((e) => e.ev === "deposit")).toBe(true);
+      expect(warnings).toEqual([]);
+    }
+  });
+
+  it("another amount than the signed offer's is a deposit_outcome warning", async () => {
+    const { c, events, warnings } = await lastFrame({
+      type: "closed",
+      reason: "idle",
+      ...signedDeposit({ outcome: "released", reason: "not_started", msat: 2999 }),
+    });
+    expect(c.deposit).toMatchObject({ msat: 2999, outcome: "released" });
+    expect(events.some((e) => e.ev === "deposit")).toBe(true);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ ev: "warning", code: "deposit_outcome" });
+    expect(String(warnings[0].message)).toMatch(/2999 msat, the signed offer's is 3000/);
+  });
+
+  it("charged after a fault of the node or the provider is a warning", async () => {
+    for (const fault of ["node", "upstream"]) {
+      const { warnings } = await lastFrame({
+        type: "error",
+        status: 502,
+        reason: "x",
+        fault,
+        ...signedDeposit({ outcome: "charged", reason: "unused" }),
+      });
+      expect(warnings).toHaveLength(1);
+      expect(String(warnings[0].message)).toMatch(new RegExp(`fault of the ${fault === "node" ? "node" : "provider"}`));
+    }
+  });
+
+  it("charged with a reason that releases the deposit is a warning", async () => {
+    for (const reason of ["request_settled", "not_started", "provider_unreachable", "sidecar_failure", "provider_closed", "node_failure", "request_received", "provider_refused"]) {
+      const { warnings } = await lastFrame({ type: "closed", reason: "x", ...signedDeposit({ outcome: "charged", reason }) });
+      expect(warnings, reason).toHaveLength(1);
+      expect(String(warnings[0].message)).toContain(JSON.stringify(reason));
+    }
+  });
+
+  it("charged after a receipt of the connection released it is a warning", async () => {
+    const events: Record<string, unknown>[] = [];
+    const c = conn(nodeSocket(() => []), { onEvent: (e: Record<string, unknown>) => events.push(e) }) as any;
+    c.deposit = { msat: 3000, outcome: "released", reason: "request_settled", signed: true };
+    c.onText(JSON.stringify({ type: "closed", reason: "idle", ...signedDeposit({ outcome: "charged", reason: "unused" }) }));
+    const warnings = events.filter((e) => e.ev === "warning");
+    expect(warnings).toHaveLength(1);
+    expect(String(warnings[0].message)).toMatch(/a receipt of this connection released it/);
+    c.close();
+  });
+});
