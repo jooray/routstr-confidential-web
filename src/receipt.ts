@@ -464,7 +464,7 @@ export function checkAttestationBinding(
     thSF?: Uint8Array;
     /** Hex `c_commit` of the π_NK statement we verified (required). */
     cCommit?: string;
-    /** SHA-256 of the provider's certificate DERs, concatenated in order. */
+    /** SHA-256 of the provider's certificate DERs, concatenated in order (required). */
     certChainHash?: Uint8Array;
     /** Complete TLS records received from upstream (all content types). */
     serverRecords?: number;
@@ -504,7 +504,10 @@ export function checkAttestationBinding(
   if (a.c_commit !== own.cCommit) {
     throw new ReceiptVerificationError("attestation names a different head-record commitment");
   }
-  if (own.certChainHash && a.cert_chain_hash !== hex(own.certChainHash)) {
+  if (!own.certChainHash) {
+    throw new ReceiptVerificationError("no certificate chain hash to check the attestation against");
+  }
+  if (a.cert_chain_hash !== hex(own.certChainHash)) {
     throw new ReceiptVerificationError("attestation names a different certificate chain");
   }
   if (own.serverRecords !== undefined && a.server_records !== own.serverRecords) {

@@ -13,6 +13,10 @@ import {
 } from "../src/receipt.js";
 import { hex, sha256 } from "../src/bytes.js";
 import { makeKey, sign } from "./helpers.js";
+import { ConfidentialConnection } from "../src/connection.js";
+import { chatSuffixKeys } from "../src/suffix.js";
+import { VENICE_CHAT } from "./fixtures/chat.js";
+import { BOTH } from "./fixtures/v3.js";
 
 const ownUsage = { model: "m", usage: { prompt_tokens: 9, completion_tokens: 1 } };
 const base = { sid: "abc", model: "m", usage: { ...ownUsage }, reserved_msats: 20000 };
@@ -174,9 +178,10 @@ describe("receipt verification", () => {
   it("accepts only an attestation naming this session and handshake", () => {
     const thSH = new Uint8Array(32).fill(7);
     const thSF = new Uint8Array(32).fill(9);
-    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) };
+    const chain = new Uint8Array(32).fill(3);
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32), certChainHash: chain };
     const att = (o: Record<string, unknown>) =>
-      canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: "ab".repeat(32), ...o });
+      canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: "ab".repeat(32), cert_chain_hash: hex(chain), ...o });
     expect(() => checkAttestationBinding(att({}), own)).not.toThrow();
     // The commitment is always checked: without ours there is nothing to compare.
     expect(() => checkAttestationBinding(att({}), { sid: "s1", thSH, thSF })).toThrow(/commitment/);
@@ -212,6 +217,64 @@ describe("receipt verification", () => {
     expect(() => checkAttestationBinding(att({ server_records: 8 }), own)).toThrow(/upstream records/);
     expect(() => checkAttestationBinding(att({ sha256_recv: "00".repeat(32) }), own)).toThrow(/upstream bytes/);
   });
+
+  it("refuses an attestation when the client captured no certificate chain hash", () => {
+    const thSH = new Uint8Array(32).fill(7);
+    const thSF = new Uint8Array(32).fill(9);
+    const own = { sid: "s1", thSH, thSF, cCommit: "ab".repeat(32) };
+    const json = canonicalJson({ sid: "s1", th_sh: hex(thSH), th_sf: hex(thSF), c_commit: "ab".repeat(32), cert_chain_hash: "11".repeat(32) });
+    expect(() => checkAttestationBinding(json, own)).toThrow(/no certificate chain hash/);
+  });
+
+  for (const framing of ["1.1", "2"] as const) {
+    it(`framing ${framing}: the connection refuses an attestation when it captured no certificate chain hash`, async () => {
+      const { priv, pubHex } = makeKey();
+      const c = new ConfidentialConnection({
+        baseUrl: "http://127.0.0.1:8010",
+        offer: {
+          v: 3,
+          notary_pubkey: pubHex,
+          chat: VENICE_CHAT,
+          suffix_keys: chatSuffixKeys(VENICE_CHAT),
+          sig: "ab".repeat(32),
+          upstream_host: "api.venice.ai",
+          ...(framing === "2" ? BOTH : {}),
+        },
+        framing,
+        auth: "sk-x",
+      } as never) as any;
+      const sid = "cd".repeat(32);
+      c.sid = sid;
+      c.ready = { pubkey: pubHex, sid };
+      c.thSH = new Uint8Array(32).fill(7);
+      c.thSF = new Uint8Array(32).fill(9);
+      c.cCommitHex = "ab".repeat(32);
+      const cur = { n: 1, stream: 3, recvAtSend: 0 };
+      const att = (chain: string) => {
+        const a_json = canonicalJson({
+          sid,
+          http: framing,
+          n: 1,
+          ...(framing === "2" ? { stream: 3 } : {}),
+          th_sh: hex(c.thSH),
+          th_sf: hex(c.thSF),
+          c_commit: "ab".repeat(32),
+          cert_chain_hash: chain,
+          s_k: 0,
+          server_records: 0,
+        });
+        return { a_json, sig: sign(a_json, priv) };
+      };
+      const check = (m: unknown) => (framing === "2" ? c.checkAttestation(m, cur, undefined) : c.checkAttestation11(m));
+      await expect(check(att("11".repeat(32)))).rejects.toThrow(/no certificate chain hash/);
+      // With a captured hash, another chain is refused and the same one passes this check.
+      c.certChainHash = new Uint8Array(32).fill(0x11);
+      await expect(check(att("22".repeat(32)))).rejects.toThrow(/different certificate chain/);
+      const passed = await check(att("11".repeat(32))).catch((e: Error) => e);
+      expect(String((passed as Error)?.message ?? "")).not.toMatch(/certificate chain/);
+      c.close();
+    });
+  }
 
   it("never refuses the node's cached-input charge for float rounding", () => {
     const usage = { prompt_tokens: 10000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 1 } };

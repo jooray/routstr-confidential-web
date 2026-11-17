@@ -2380,7 +2380,9 @@ export class ConfidentialConnection {
       bad("names a different TLS handshake");
     }
     if (!this.cCommitHex || a.c_commit !== this.cCommitHex) bad("names a different head-record commitment");
-    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) bad("names a different certificate chain");
+    // Always compared: without our own hash there is nothing to bind it to.
+    if (!this.certChainHash) bad("cannot be checked: no certificate chain hash was captured");
+    if (a.cert_chain_hash !== hex(this.certChainHash!)) bad("names a different certificate chain");
     // Records may still be on their way to us when the attestation arrives.
     if (Number.isSafeInteger(a.server_records)) {
       await this.until(() => this.recvRecords >= a.server_records, "the records the attestation counts", 15_000).catch((e) => {
@@ -2746,7 +2748,9 @@ export class ConfidentialConnection {
       bad("names a different TLS handshake");
     }
     if (!this.cCommitHex || a.c_commit !== this.cCommitHex) bad("names a different head-record commitment");
-    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) bad("names a different certificate chain");
+    // Always compared: without our own hash there is nothing to bind it to.
+    if (!this.certChainHash) bad("cannot be checked: no certificate chain hash was captured");
+    if (a.cert_chain_hash !== hex(this.certChainHash!)) bad("names a different certificate chain");
     const sK = a.s_k;
     const count = a.server_records;
     if (!Number.isSafeInteger(sK) || !Number.isSafeInteger(count) || sK < 0 || count < 0) bad("interval malformed");
