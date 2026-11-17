@@ -23,6 +23,7 @@ import {
 } from "../src/errors.js";
 import { fetchConfidentialOffer, verifyConfidentialOffer } from "../src/offer.js";
 import { ConfidentialConnection, type ConnectionRequestOptions } from "../src/connection.js";
+import { TWOPC_DOWNLOAD_BYTES } from "../src/twopc.js";
 import {
   BOTH,
   BOTH_IMAGES,
@@ -774,5 +775,80 @@ describe("ready names the connection deposit the setup reserved (§12.3)", () =>
       expect(started).toHaveBeenCalledTimes(1);
       c.close();
     }
+  });
+});
+
+describe("progress of the 2PC download between ready and armed", () => {
+  it("emits twopc_progress at most 4 times a second and once at the end, before armed", async () => {
+    let recv = 0;
+    const grow = setInterval(() => (recv = Math.min(recv + 300_000, 16_000_000)), 20);
+    const fake2pc = {
+      start() {},
+      get bytesRecv() {
+        return recv;
+      },
+      get bytesSent() {
+        return 0;
+      },
+      get bytes() {
+        return { sent: 0, recv };
+      },
+      timings: [],
+      failed: false,
+      keyShare: () =>
+        new Promise((res) =>
+          setTimeout(() => {
+            clearInterval(grow);
+            recv = 16_339_747;
+            res(new Uint8Array(65).fill(4));
+          }, 1300),
+        ),
+      close() {},
+    };
+    const fakeChan = { start() {}, ready: async () => true, close() {}, timings: [], failed: false, bytesSent: 0, bytesRecv: 0 };
+    const events: Record<string, unknown>[] = [];
+    const c = new ConfidentialConnection({
+      baseUrl: "http://127.0.0.1:8010",
+      offer: verified({ ...ONLY_11, connection_deposit_msat: 1000 }),
+      framing: "1.1",
+      auth: "sk-x",
+      host: NO_HOST,
+      webSocketImpl: readySocket({ deposit_msat: 1000 }) as unknown as typeof WebSocket,
+      twoPcFactory: () => fake2pc as never,
+      proofChannelFactory: () => fakeChan as never,
+      onEvent: (e: Record<string, unknown>) => events.push({ ...e, at: Date.now() }),
+    } as never);
+    try {
+      await c.arm();
+    } finally {
+      clearInterval(grow);
+    }
+    const progress = events.filter((e) => e.ev === "twopc_progress");
+    const ready = events.findIndex((e) => e.ev === "ready");
+    const armed = events.findIndex((e) => e.ev === "armed");
+    expect(progress.length).toBeGreaterThanOrEqual(3);
+    // Between ready and armed, received never falls, expected is the fixed download.
+    for (const e of progress) {
+      const i = events.indexOf(e);
+      expect(i).toBeGreaterThan(ready);
+      expect(i).toBeLessThan(armed);
+      expect(e.expected).toBe(TWOPC_DOWNLOAD_BYTES);
+      expect(typeof e.received).toBe("number");
+    }
+    for (let i = 1; i < progress.length; i++) expect(progress[i].received as number).toBeGreaterThanOrEqual(progress[i - 1].received as number);
+    // The last one is the end of the download.
+    expect(progress[progress.length - 1].received).toBe(16_339_746 + 1);
+    // At most 4 a second, not counting the final one.
+    const periodic = progress.slice(0, -1);
+    for (let i = 4; i < periodic.length; i++) {
+      expect((periodic[i].at as number) - (periodic[i - 4].at as number)).toBeGreaterThanOrEqual(990);
+    }
+    expect(periodic.length).toBeLessThanOrEqual(6);
+    c.close();
+  });
+
+  it("the expected download is about 16.4 MB", () => {
+    expect(TWOPC_DOWNLOAD_BYTES).toBeGreaterThan(16_000_000);
+    expect(TWOPC_DOWNLOAD_BYTES).toBeLessThan(17_000_000);
   });
 });

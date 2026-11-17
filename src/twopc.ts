@@ -36,6 +36,14 @@ export interface TwoPcTiming {
   bytes_recv?: number;
 }
 
+/**
+ * Bytes the client receives on the 2PC socket of `split-public-1` up to the
+ * joint key share (the version tag, the preprocessing and the key share,
+ * about 16.4 MB). Shown as the denominator of a progress bar
+ * (`twopc_progress`); never used for a check.
+ */
+export const TWOPC_DOWNLOAD_BYTES = 16_339_747;
+
 /** What a 2PC version mismatch means for the user of this page. */
 const TWOPC_MISMATCH_TEXT =
   "twopc_version_mismatch: this page and the node's sidecar run different versions of the two-party key schedule " +

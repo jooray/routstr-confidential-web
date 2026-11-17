@@ -126,7 +126,7 @@ export { costMsat, formatSats, modelPricing, promptLimit, reservationCeilingMsat
 export type { ModelPricing } from "./pricing.js";
 export { InlineWasmHost, WorkerWasmHost, getDefaultWasmHost, setDefaultWasmHost } from "./wasm/host.js";
 export type { WasmHost } from "./wasm/host.js";
-export { TwoPcSession } from "./twopc.js";
+export { TWOPC_DOWNLOAD_BYTES, TwoPcSession } from "./twopc.js";
 export { ProofChannel, type ProofChannelTopup } from "./zkchan.js";
 export { probeProviderTls } from "./diagnostics.js";
 export type { TlsProbeResult } from "./diagnostics.js";

@@ -130,7 +130,7 @@ import {
   type UpstreamUsageEvent,
 } from "./suffix.js";
 import { makeTLSClient } from "./tls-fork/lib/index.js";
-import { TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc.js";
+import { TWOPC_DOWNLOAD_BYTES, TwoPcSession, type TwoPcApplicationSecrets, type TwoPcTiming } from "./twopc.js";
 import type { WasmHost } from "./wasm/host.js";
 import { ProofChannel } from "./zkchan.js";
 
@@ -488,6 +488,9 @@ class Inbox {
 }
 
 const u32 = (b: Uint8Array, i = 0) => ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0;
+
+/** `twopc_progress` events come at most this often (4 a second). */
+const TWOPC_PROGRESS_INTERVAL_MS = 250;
 
 /**
  * Deposit reasons that release the deposit (§12.10): a `charged` outcome
@@ -1034,6 +1037,29 @@ export class ConfidentialConnection {
   }
 
   /**
+   * `twopc_progress` events while the 2PC preprocessing downloads (between
+   * `ready` and `armed`): the bytes received on the 2PC socket so far against
+   * the fixed download, at most 4 a second, and one final event at the end.
+   */
+  private watchTwoPcDownload(twoPc: TwoPcSession): { stop(): void; final(): void } {
+    let last = -1;
+    const emit = () => {
+      const received = twoPc.bytesRecv;
+      if (received === last) return;
+      last = received;
+      this.event({ ev: "twopc_progress", received, expected: TWOPC_DOWNLOAD_BYTES });
+    };
+    const timer = setInterval(emit, TWOPC_PROGRESS_INTERVAL_MS);
+    return {
+      stop: () => clearInterval(timer),
+      final: () => {
+        last = -1;
+        emit();
+      },
+    };
+  }
+
+  /**
    * The deposit's outcome in the connection's last frame (`closed` or
    * `error`): `deposit`, with the node's signature over `deposit_json`.
    */
@@ -1256,7 +1282,13 @@ export class ConfidentialConnection {
     // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
     this.zkChan = this.proofChannelFactory?.() ?? new ProofChannel(this.host, { webSocketImpl: this.WS });
     this.zkChan.start(this.zkUrl("zkchan"));
-    this.keyShare = await this.orFail(twoPc.keyShare(this.timeouts.twoPcKeyShare));
+    const progress = this.watchTwoPcDownload(twoPc);
+    try {
+      this.keyShare = await this.orFail(twoPc.keyShare(this.timeouts.twoPcKeyShare));
+    } finally {
+      progress.stop();
+    }
+    progress.final();
     const tKeyShare = Date.now();
     this.setupTimings.readyMs = this.tReady - t0;
     this.setupTimings.twoPcKeyShareMs = tKeyShare - this.tReady;
