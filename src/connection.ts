@@ -1232,8 +1232,14 @@ export class ConfidentialConnection {
     if (this.ready.armed !== undefined && this.ready.armed !== prewarm) {
       throw new SessionProtocolError("ready names another armed state than the setup");
     }
-    // What the setup reserved must be the signed offer's deposit (a sidecar
-    // without a node names none).
+    // What the setup reserved must be the signed offer's deposit (§12.3). An
+    // offer that names a deposit (a node's always does) needs it in `ready`;
+    // a sidecar without a node names none.
+    if (this.offer.connection_deposit_msat !== undefined && this.ready.deposit_msat === undefined) {
+      throw new SessionProtocolError(
+        `node's ready names no connection deposit, the signed offer's is ${this.depositMsat} msat`,
+      );
+    }
     if (this.ready.deposit_msat !== undefined && this.ready.deposit_msat !== this.depositMsat) {
       throw new SessionProtocolError(
         `node reserved a connection deposit of ${String(this.ready.deposit_msat).slice(0, 32)} msat, the signed offer's is ${this.depositMsat}`,

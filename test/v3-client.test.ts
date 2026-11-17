@@ -690,3 +690,89 @@ describe("a node whose offer cannot be fetched", () => {
     expect(Date.now() - t0).toBeLessThan(2_000);
   });
 });
+
+/** A control socket that answers the setup with `ready` (plus `extra`) and stays open. */
+function readySocket(extra: Record<string, unknown>) {
+  return class {
+    binaryType = "arraybuffer";
+    onopen?: () => void;
+    onmessage?: (ev: { data: string }) => void;
+    onclose?: (ev: { reason?: string }) => void;
+    onerror?: () => void;
+    constructor() {
+      setTimeout(() => this.onopen?.(), 0);
+    }
+    send(d: string) {
+      const m = JSON.parse(d) as Record<string, unknown>;
+      if (m.type !== "setup") return;
+      const ready = { type: "ready", v: 3, http: m.http, sid: "ab".repeat(32), pubkey: NODE_PUB, ...extra };
+      for (const k of Object.keys(ready)) if ((ready as Record<string, unknown>)[k] === undefined) delete (ready as Record<string, unknown>)[k];
+      setTimeout(() => this.onmessage?.({ data: JSON.stringify(ready) }), 0);
+    }
+    close() {
+      setTimeout(() => this.onclose?.({}), 0);
+    }
+  };
+}
+
+describe("ready names the connection deposit the setup reserved (§12.3)", () => {
+  const open = (offerExtra: Record<string, unknown> | "unverified-without-deposit", readyExtra: Record<string, unknown>) => {
+    const started = vi.fn(() => {
+      throw new Error("2PC started");
+    });
+    const c = new ConfidentialConnection({
+      baseUrl: "http://127.0.0.1:8010",
+      // A verified offer always names a deposit (0 when the node signs none);
+      // only an offer object without the field (a sidecar without a node) has none.
+      offer:
+        offerExtra === "unverified-without-deposit"
+          ? (() => {
+              const o = { ...verified(ONLY_11) } as Record<string, unknown>;
+              delete o.connection_deposit_msat;
+              return o;
+            })()
+          : verified({ ...ONLY_11, ...offerExtra }),
+      framing: "1.1",
+      auth: "sk-x",
+      host: NO_HOST,
+      webSocketImpl: readySocket(readyExtra) as unknown as typeof WebSocket,
+      twoPcFactory: started as never,
+    } as never);
+    return { c, started };
+  };
+
+  it("a ready without deposit_msat fails the connection before the 2PC starts", async () => {
+    const { c, started } = open({ connection_deposit_msat: 1000 }, {});
+    const e = await c.arm().catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(SessionProtocolError);
+    expect(String((e as Error).message)).toMatch(/names no connection deposit/);
+    expect(started).not.toHaveBeenCalled();
+  });
+
+  it("a ready with another deposit fails the connection before the 2PC starts", async () => {
+    const { c, started } = open({ connection_deposit_msat: 1000 }, { deposit_msat: 999 });
+    const e = await c.arm().catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(SessionProtocolError);
+    expect(started).not.toHaveBeenCalled();
+  });
+
+  it("a verified offer without a signed deposit still needs deposit_msat (0) in ready", async () => {
+    const { c, started } = open({ connection_deposit_msat: undefined }, {});
+    expect(await c.arm().catch((x: unknown) => x)).toBeInstanceOf(SessionProtocolError);
+    expect(started).not.toHaveBeenCalled();
+  });
+
+  it("the offer's deposit in ready goes on; an offer object without a deposit needs none in ready", async () => {
+    for (const [offerExtra, readyExtra] of [
+      [{ connection_deposit_msat: 1000 }, { deposit_msat: 1000 }],
+      [{ connection_deposit_msat: undefined }, { deposit_msat: 0 }],
+      ["unverified-without-deposit", {}],
+    ] as const) {
+      const { c, started } = open(offerExtra, readyExtra);
+      const e = await c.arm().catch((x: unknown) => x);
+      expect((e as Error).message).toBe("2PC started");
+      expect(started).toHaveBeenCalledTimes(1);
+      c.close();
+    }
+  });
+});
