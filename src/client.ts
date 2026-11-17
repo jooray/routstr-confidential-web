@@ -571,10 +571,16 @@ interface RequestSpec {
   onResponseBody?: (chunk: Uint8Array) => void;
 }
 
-/** Nodes whose offer could not be fetched (unreachable, an HTTP error, a timeout), until when. */
-const offerUnreachable = new Map<string, { until: number; failures: number; error: Error }>();
-const OFFER_COOLDOWN_BASE_MS = 30_000;
-const OFFER_COOLDOWN_MAX_MS = 10 * 60_000;
+/** Nodes whose offer could not be fetched (unreachable, an HTTP error, a timeout): when, and why. */
+const offerUnreachable = new Map<string, { at: number; error: Error }>();
+/**
+ * How long after a failed offer fetch the node is not asked again. A client
+ * serves one node, so the node is always its last candidate: a cooldown that
+ * grew while the client's own network was down would keep it failing long
+ * after the network is back. This short one only keeps a caller retrying in
+ * a loop to one fetch per interval.
+ */
+const OFFER_RETRY_MS = 10_000;
 
 export class ConfidentialClient {
   readonly node: string;
@@ -681,13 +687,13 @@ export class ConfidentialClient {
     const policy = { pinnedPubkeys: this.opts.nodePubkeys, trustedHosts: this.opts.trustedHosts };
     const hit = this.offerCache;
     if (!fresh && hit && Date.now() - hit.at < 30_000) return verifyConfidentialOffer(hit.offer, policy);
-    // A node whose offer could not be fetched lately is not asked again until
-    // its cooldown ends (30 s, doubling to 10 min while it keeps failing):
-    // each request would otherwise wait for it before failing.
+    // A node whose offer could not be fetched lately is not asked again for
+    // `OFFER_RETRY_MS`: each request would otherwise wait for it before failing.
     const cool = offerUnreachable.get(this.node);
-    if (cool && Date.now() < cool.until) {
+    const left = cool ? cool.at + OFFER_RETRY_MS - Date.now() : 0;
+    if (cool && left > 0) {
       throw new OfferUnavailableError(
-        `${this.node} did not serve its offer lately; not asked again for ${Math.ceil((cool.until - Date.now()) / 1000)} s`,
+        `${this.node} did not serve its offer lately; not asked again for ${Math.ceil(left / 1000)} s`,
         cool.error.message,
       );
     }
@@ -697,11 +703,7 @@ export class ConfidentialClient {
       this.offerCache = { offer, at: Date.now() };
       return offer;
     } catch (e) {
-      if (e instanceof OfferUnavailableError) {
-        const failures = (cool?.failures ?? 0) + 1;
-        const ms = Math.min(OFFER_COOLDOWN_BASE_MS * 2 ** (failures - 1), OFFER_COOLDOWN_MAX_MS);
-        offerUnreachable.set(this.node, { until: Date.now() + ms, failures, error: e });
-      }
+      if (e instanceof OfferUnavailableError) offerUnreachable.set(this.node, { at: Date.now(), error: e });
       if (e instanceof NodeProtocolOutdatedError && !this.outdatedReported) {
         this.outdatedReported = true;
         this.emit({ ev: "node_protocol_outdated", node: this.node, node_version: e.nodeVersion });

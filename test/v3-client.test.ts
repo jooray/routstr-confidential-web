@@ -651,6 +651,37 @@ describe("a node whose offer cannot be fetched", () => {
     expect(fetches).toBe(2);
   });
 
+  it("is asked again a few seconds after its last failure: an outage does not block it for minutes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.parse("2026-11-17T12:00:00Z");
+      let down = true;
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        fetches++;
+        if (down) throw new TypeError("Failed to fetch");
+        return new Response(JSON.stringify(signedV3Offer(BOTH)), { status: 200 });
+      }) as typeof fetch;
+      const c = client();
+      // A caller retrying through the outage.
+      for (const s of [0, 40, 110, 240]) {
+        vi.setSystemTime(t0 + s * 1000);
+        await expect(c.offer()).rejects.toBeInstanceOf(OfferUnavailableError);
+      }
+      expect(fetches).toBe(4);
+      down = false;
+      // Right after a failure it still fails fast, without a fetch.
+      vi.setSystemTime(t0 + 243_000);
+      await expect(c.offer()).rejects.toThrow(/not asked again/);
+      expect(fetches).toBe(4);
+      vi.setSystemTime(t0 + 252_000);
+      await expect(c.offer()).resolves.toBeTruthy();
+      expect(fetches).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("an offer fetch that hangs times out", async () => {
     const t0 = Date.now();
     const hang = ((_url: string, init?: RequestInit) =>
