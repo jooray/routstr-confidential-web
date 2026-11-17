@@ -230,17 +230,48 @@ export interface ParsedHttpResponse {
 }
 
 /**
- * Provider headers describing the operator's own account (its balance and
- * rate-limit counters). The client decrypts them like any other byte of the
- * response, but they are not the caller's business, so they are not exposed.
+ * The provider response headers handed on to the caller. Everything else is
+ * dropped: the provider account's state (balances, rate-limit counters),
+ * cookies and any provider's own headers belong to the node operator's
+ * account. The client still reads them in the decrypted response (the framing
+ * headers drive the parser); they are just not passed on.
  */
-export function isOperatorHeader(name: string): boolean {
-  const n = name.toLowerCase();
-  return n.startsWith("x-venice-balance-") || n.startsWith("x-ratelimit-");
+export const EXPOSED_PROVIDER_HEADERS: ReadonlySet<string> = new Set([
+  "content-type",
+  "cache-control",
+  "date",
+  "retry-after",
+  "x-request-id",
+  "request-id",
+]);
+
+/** Whether a provider response header is passed on to the caller (`EXPOSED_PROVIDER_HEADERS`). */
+export function exposedProviderHeader(name: string): boolean {
+  return EXPOSED_PROVIDER_HEADERS.has(name.toLowerCase());
 }
 
-/** One response head: status, reason and headers (lower-cased names). */
-function parseHead(bytes: Uint8Array, end: number): { status: number; statusText: string; headers: Record<string, string> } {
+/**
+ * The caller's headers from decoded HTTP/2 header fields: pseudo-headers and
+ * every name outside `EXPOSED_PROVIDER_HEADERS` dropped, repeated names joined.
+ */
+export function exposedHeaderFields(fields: readonly (readonly [string, string])[]): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of fields) {
+    const n = name.toLowerCase();
+    if (n.startsWith(":") || !exposedProviderHeader(n)) continue;
+    headers[n] = n in headers ? `${headers[n]}, ${value}` : value;
+  }
+  return headers;
+}
+
+/**
+ * One response head: status, reason, the caller's headers (lower-cased names,
+ * allow-listed) and the framing headers the parser itself reads.
+ */
+function parseHead(
+  bytes: Uint8Array,
+  end: number,
+): { status: number; statusText: string; headers: Record<string, string>; chunked: boolean; contentLength?: string } {
   const lines = latin1(bytes.subarray(0, end)).split("\r\n");
   const statusLine = lines.shift() ?? "";
   const m = /^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/.exec(statusLine);
@@ -248,14 +279,24 @@ function parseHead(bytes: Uint8Array, end: number): { status: number; statusText
     throw new ResponseVerificationError(`malformed status line: ${JSON.stringify(statusLine)}`);
   }
   const headers: Record<string, string> = {};
+  let transferEncoding: string | undefined;
+  let contentLength: string | undefined;
   for (const line of lines) {
     const idx = line.indexOf(":");
     if (idx <= 0) continue;
     const name = line.slice(0, idx).trim().toLowerCase();
-    if (isOperatorHeader(name)) continue;
-    headers[name] = line.slice(idx + 1).trim();
+    const value = line.slice(idx + 1).trim();
+    if (name === "transfer-encoding") transferEncoding = value;
+    else if (name === "content-length") contentLength = value;
+    if (exposedProviderHeader(name)) headers[name] = value;
   }
-  return { status: Number(m[1]), statusText: m[2] ?? "", headers };
+  return {
+    status: Number(m[1]),
+    statusText: m[2] ?? "",
+    headers,
+    chunked: /chunked/i.test(transferEncoding ?? ""),
+    contentLength,
+  };
 }
 
 /** An interim 1xx status: another head follows. 101 switches protocols and is final. */
@@ -292,12 +333,12 @@ export function parseHttpResponse(bytes: Uint8Array): ParsedHttpResponse {
   const rawBody = bytes.subarray(headerEnd + 4);
   let body: Uint8Array;
   let complete: boolean;
-  if (/chunked/i.test(headers["transfer-encoding"] ?? "")) {
+  if (head.chunked) {
     const d = dechunkAll(rawBody);
     body = d.body;
     complete = d.done;
   } else {
-    const declared = headers["content-length"];
+    const declared = head.contentLength;
     body = rawBody;
     complete = declared === undefined || (/^\d+$/.test(declared) && Number(declared) === rawBody.length);
   }
@@ -588,8 +629,8 @@ export class IncrementalHttpResponse {
       start = end + 4;
       // An interim 1xx head is not the response: keep reading.
       if (isInterimStatus(head.status)) continue;
-      this.head = head;
-      this.chunked = /chunked/i.test(head.headers["transfer-encoding"] ?? "");
+      this.head = { status: head.status, statusText: head.statusText, headers: head.headers };
+      this.chunked = head.chunked;
       this.headDone = true;
       const rest = merged.subarray(start);
       this.buf = new Uint8Array(0);

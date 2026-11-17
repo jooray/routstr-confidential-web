@@ -10,6 +10,9 @@ import {
   canonicalSuffix,
   ChunkedDecoder,
   extractUsageDisclosure,
+  EXPOSED_PROVIDER_HEADERS,
+  exposedHeaderFields,
+  exposedProviderHeader,
   IncrementalHttpResponse,
   parseHttpResponse,
   usageEventFromDisclosure,
@@ -126,13 +129,55 @@ describe("streaming", () => {
     expect(r.status).toBe(200);
     expect(r.bodyText).toBe('{"a":1}');
     expect(r.complete).toBe(true);
-    expect(Object.keys(r.headers).sort()).toEqual(["content-length", "content-type"]);
+    expect(Object.keys(r.headers).sort()).toEqual(["content-type"]);
     expect(parseHttpResponse(enc("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nshort")).complete).toBe(false);
     expect(parseHttpResponse(enc("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")).complete).toBe(false);
     const inc = new IncrementalHttpResponse();
     for (const b of enc(raw)) inc.push(new Uint8Array([b]));
     expect(inc.head?.status).toBe(200);
     expect(inc.head?.headers["x-venice-balance-usd"]).toBeUndefined();
+  });
+
+  it("hands the caller only the allow-listed provider headers, and still reads the framing headers", () => {
+    expect([...EXPOSED_PROVIDER_HEADERS].sort()).toEqual(
+      ["cache-control", "content-type", "date", "request-id", "retry-after", "x-request-id"],
+    );
+    for (const n of ["Content-Type", "cache-control", "DATE", "Retry-After", "x-request-id", "request-id"]) {
+      expect(exposedProviderHeader(n), n).toBe(true);
+    }
+    for (const n of ["set-cookie", "server", "x-acme-balance-usd", "x-ratelimit-remaining-requests", "x-provider-account", "content-length", "transfer-encoding", "cf-ray"]) {
+      expect(exposedProviderHeader(n), n).toBe(false);
+    }
+    const head =
+      "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nDate: Mon, 16 Nov 2026 10:00:00 GMT\r\n" +
+      "Retry-After: 3\r\nX-Request-Id: abc\r\nRequest-Id: def\r\nSet-Cookie: s=1\r\nServer: edge\r\nX-Acme-Account-Balance: 9\r\n" +
+      "X-RateLimit-Remaining-Tokens: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const raw = head + "7\r\n{\"a\":1}\r\n0\r\n\r\n";
+    const want = ["cache-control", "content-type", "date", "request-id", "retry-after", "x-request-id"];
+    const r = parseHttpResponse(enc(raw));
+    expect(Object.keys(r.headers).sort()).toEqual(want);
+    // Chunked is still decoded, though transfer-encoding is not handed on.
+    expect(r.bodyText).toBe('{"a":1}');
+    expect(r.complete).toBe(true);
+    expect(r.contentType).toBe("application/json");
+    const inc = new IncrementalHttpResponse();
+    const parts: Uint8Array[] = [];
+    for (const b of enc(raw)) parts.push(...inc.push(new Uint8Array([b])));
+    expect(Object.keys(inc.head?.headers ?? {}).sort()).toEqual(want);
+    expect(dec(Uint8Array.from(parts.flatMap((p) => [...p])))).toBe('{"a":1}');
+    // A Content-Length body is still judged complete by its length.
+    expect(parseHttpResponse(enc("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")).complete).toBe(true);
+    // Framing "2": the response HEADERS fields, pseudo-headers dropped, repeated names joined.
+    expect(
+      exposedHeaderFields([
+        [":status", "200"],
+        ["content-type", "text/event-stream"],
+        ["x-ratelimit-remaining-requests", "3"],
+        ["set-cookie", "a=1"],
+        ["cache-control", "no-cache"],
+        ["cache-control", "no-store"],
+      ]),
+    ).toEqual({ "content-type": "text/event-stream", "cache-control": "no-cache, no-store" });
   });
 
   it("treats 101 Switching Protocols as the final status", () => {

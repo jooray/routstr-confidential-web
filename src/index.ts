@@ -110,7 +110,15 @@ export { checkH2Offer, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParam
 export { checkPiC3SParams, checkPiNKParams, headRouteProblem, headTemplateProblem } from "./params.js";
 export { checkUpstreamErrorReceipt, maxChargeMsats, parseSignedReceipt, verifyFlatReceipt, verifyReceipt } from "./receipt.js";
 export { canonicalJson, npubToHex, verifySchnorrSignature } from "./canonical.js";
-export { canonicalSuffix, MAX_BODY_LEN, padBody, paddedBodyLength, type PadBucket } from "./suffix.js";
+export {
+  canonicalSuffix,
+  EXPOSED_PROVIDER_HEADERS,
+  exposedProviderHeader,
+  MAX_BODY_LEN,
+  padBody,
+  paddedBodyLength,
+  type PadBucket,
+} from "./suffix.js";
 export { buildPinnedBody, requestedMaxTokens, SseParser, aggregateChatCompletion } from "./request.js";
 export { mintInputFees, NodeApi, NodeApiError } from "./node-api.js";
 export type { BalanceInfo, LightningInvoice, LightningInvoiceStatus, MintFee, NodeModel } from "./node-api.js";

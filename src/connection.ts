@@ -122,6 +122,7 @@ import {
   disclosureTailLens,
   effectiveModelFromText,
   extractUsageDisclosure,
+  exposedHeaderFields,
   IncrementalHttpResponse,
   usageEventFromDisclosure,
   usageEventProblem,
@@ -1647,11 +1648,7 @@ export class ConfidentialConnection {
           cur.status = Number(status);
           cur.head = { off: f.off, raw: concat(frameHeader(f.payload.length, f.type, f.flags, f.stream), f.payload) };
           if (cur.status >= 200) {
-            const headers: Record<string, string> = {};
-            for (const [n, v] of fields) {
-              if (n.startsWith(":")) continue;
-              headers[n] = n in headers ? `${headers[n]}, ${v}` : v;
-            }
+            const headers = exposedHeaderFields(fields);
             cur.headers = headers;
             cur.tLastData = Date.now();
             cur.opts.onResponseHead?.({ status: cur.status, statusText: "", headers });
