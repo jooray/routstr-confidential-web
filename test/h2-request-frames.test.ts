@@ -145,6 +145,16 @@ describe("framing 2: the provider's frames during a request", () => {
     conn.close();
   });
 
+  it("leaves no failure waiter behind on a live connection", async () => {
+    const { conn } = connection();
+    const h = conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    await tick();
+    feed(conn, frame(FRAME.RST_STREAM, 0, conn.cur.stream, new Uint8Array([0, 0, 0, 2])));
+    await h.done.catch(() => {});
+    expect(conn.failWaiters.size).toBe(0);
+    conn.close();
+  });
+
   it("SETTINGS_INITIAL_WINDOW_SIZE applies to the open stream (RFC 9113 §6.9.2)", async () => {
     const { conn, wire } = connection();
     conn.initialWindow = 0;
