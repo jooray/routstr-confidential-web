@@ -15,7 +15,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 
 import { canonicalJson } from "../src/canonical.js";
 import { ConfidentialConnection } from "../src/connection.js";
-import { ResponseVerificationError, SessionProtocolError, SessionRejectedError } from "../src/errors.js";
+import { ResponseVerificationError, SessionProtocolError, SessionRejectedError, StreamNotProcessedError } from "../src/errors.js";
 import { FLAG, FRAME, FrameReader, frame, type RxFrame } from "../src/h2.js";
 import { verifyConfidentialOffer } from "../src/offer.js";
 import { canonicalSuffix } from "../src/suffix.js";
@@ -142,6 +142,50 @@ describe("framing 2: the provider's frames during a request", () => {
     expect(String((e as Error).message)).toMatch(/GOAWAY/);
     expect(h.bodyReleased).toBe(false);
     expect(wire.map((m) => m.type)).not.toContain("release");
+    conn.close();
+  });
+
+  it("a GOAWAY(NO_ERROR) below the stream before any release: not processed, may run again even when the refusal is not proven", async () => {
+    const { conn } = connection();
+    conn.onAccepted = (cur: any) => feed(conn, frame(FRAME.GOAWAY, 0, 0, new Uint8Array([0, 0, 0, cur.stream - 2, 0, 0, 0, 0])));
+    const h = conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    const e = await h.done.catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(StreamNotProcessedError);
+    expect((e as StreamNotProcessedError).receipt).toBeUndefined();
+    expect(h.bodyReleased).toBe(false);
+    conn.close();
+  });
+
+  it("a GOAWAY with an error code does not count as not processed, before or after the release", async () => {
+    const before = connection();
+    before.conn.onAccepted = (cur: any) => feed(before.conn, frame(FRAME.GOAWAY, 0, 0, new Uint8Array([0, 0, 0, cur.stream - 2, 0, 0, 0, 1])));
+    const h1 = before.conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    const e1 = await h1.done.catch((x: unknown) => x);
+    expect(e1).toBeInstanceOf(SessionRejectedError);
+    expect(e1).not.toBeInstanceOf(StreamNotProcessedError);
+    expect(h1.bodyReleased).toBe(false);
+    before.conn.close();
+
+    const after = connection();
+    const h2 = after.conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    await tick();
+    expect(h2.bodyReleased).toBe(true);
+    feed(after.conn, frame(FRAME.GOAWAY, 0, 0, new Uint8Array([0, 0, 0, after.conn.cur.stream - 2, 0, 0, 0, 2])));
+    const e2 = await h2.done.catch((x: unknown) => x);
+    expect(e2).toBeInstanceOf(Error);
+    expect(e2).not.toBeInstanceOf(StreamNotProcessedError);
+    after.conn.close();
+  });
+
+  it("REFUSED_STREAM after the release that is not proven fails the request, not as one to run again", async () => {
+    const { conn, wire } = connection();
+    const h = conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    await tick();
+    expect(h.bodyReleased).toBe(true);
+    feed(conn, frame(FRAME.RST_STREAM, 0, conn.cur.stream, new Uint8Array([0, 0, 0, 7])));
+    const e = await h.done.catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ResponseVerificationError);
+    expect(wire.map((m) => m.type)).not.toContain("disclose_reset");
     conn.close();
   });
 

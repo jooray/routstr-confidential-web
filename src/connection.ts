@@ -648,6 +648,12 @@ export class ConfidentialConnection {
   private goaway = false;
   /** The last-stream-id of the provider's GOAWAY: a stream above it is not processed (RFC 9113 §6.8). */
   private goawayLast?: number;
+  /**
+   * The last-stream-id of a GOAWAY(NO_ERROR): only such a GOAWAY says a
+   * stream above it was not processed (§5.4.1). One with an error code is a
+   * connection error, which the client's own frames may have caused.
+   */
+  private goawayGracefulLast?: number;
   private cur?: Cur;
   private kicks: (() => void)[] = [];
 
@@ -1573,6 +1579,7 @@ export class ConfidentialConnection {
         if (f.payload.length >= 4) {
           const last = u32(f.payload) & 0x7fffffff;
           this.goawayLast = Math.min(this.goawayLast ?? last, last);
+          if (f.payload.length >= 8 && u32(f.payload, 4) === 0) this.goawayGracefulLast = Math.min(this.goawayGracefulLast ?? last, last);
           // A graceful GOAWAY below the request's stream: it was not processed, provably.
           if (cur && f.stream === 0 && f.payload.length >= 8 && last < cur.stream && u32(f.payload, 4) === 0) {
             this.noteRefusal(cur, { kind: "goaway", lastStreamId: last }, f);
@@ -1979,8 +1986,15 @@ export class ConfidentialConnection {
     // `disclose_reset`) and settled like a 429; the request may run again.
     await this.settleRefusal(cur);
     if (beyond() && !cur.releaseSent) {
-      // Nothing of the request was released: it may run again on a new connection.
-      throw new SessionRejectedError(`the provider's GOAWAY (last stream ${this.goawayLast}) excludes stream ${stream}`);
+      // Nothing of the request was released: it may run again on a new
+      // connection. Only a GOAWAY(NO_ERROR) says the provider did not process
+      // it; one with an error code is a connection error.
+      if (this.goawayGracefulLast !== undefined && stream > this.goawayGracefulLast) {
+        throw new StreamNotProcessedError(
+          `the provider is going away (GOAWAY, last stream ${this.goawayGracefulLast}): request ${n} on stream ${stream} was not processed; nothing of it was released`,
+        );
+      }
+      throw new SessionRejectedError(`the provider's GOAWAY (last stream ${this.goawayLast}, an error code) excludes stream ${stream}; nothing of it was released`);
     }
     // An image response is silent until the image is done: wait as long as
     // the signed offer says the provider may take.

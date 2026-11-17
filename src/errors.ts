@@ -225,8 +225,11 @@ export class ProverMissingError extends ConfidentialError {
 /**
  * The provider did not process the request (RFC 9113 §8.7): it refused the
  * stream (`RST_STREAM(REFUSED_STREAM)`) or went away with a last-stream-id
- * below it (`GOAWAY`). Nothing of the response came; the request may run
- * again on another connection.
+ * below it (`GOAWAY` with `NO_ERROR`). Nothing of the response came; the
+ * request may run again on another connection: thrown only when nothing of it
+ * was released, or when the refusal was proven and settled (`receipt` is set).
+ * A released request whose refusal could not be proven fails with another
+ * error (the node charges its reservation: PROTOCOL-V3.md §9.4, §12.10).
  */
 export class StreamNotProcessedError extends SessionRejectedError {
   /**

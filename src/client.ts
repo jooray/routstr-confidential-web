@@ -910,11 +910,18 @@ export class ConfidentialClient {
         lease.release();
         traffic.done();
         // A request the provider did not process (RFC 9113 §8.7: REFUSED_STREAM,
-        // or a stream above a GOAWAY's last one) runs again on a new
-        // connection, even after its release. Proven (`disclose_reset`), it
-        // cost what its receipt says (the session fee if still due); unproven
-        // and released, the node may still charge its reservation (§12.10).
-        if (error instanceof StreamNotProcessedError && !state.headSeen && !signal?.aborted && attempt < 3) {
+        // or a stream above a GOAWAY(NO_ERROR)'s last one) runs again on a new
+        // connection: when nothing of it was released, or when the refusal was
+        // proven (`disclose_reset`) and settled, at what its receipt says (the
+        // session fee if still due). A released request without that proof
+        // fails (§9.4): the node charges its reservation (§12.10).
+        if (
+          error instanceof StreamNotProcessedError &&
+          (error.receipt !== undefined || !handle.bodyReleased) &&
+          !state.headSeen &&
+          !signal?.aborted &&
+          attempt < 3
+        ) {
           this.emit({
             ev: "request_retry",
             reason: `not processed by the provider: ${errorText(error)}`,

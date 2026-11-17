@@ -460,6 +460,42 @@ describe("a pooled connection is a cache, never a promise", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
+  it("runs a request the provider did not process again when nothing of it was released", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const { connect } = fakeConnections(() =>
+      calls++ === 0 ? { fail: new StreamNotProcessedError("the provider is going away (GOAWAY, last stream 1)") } : {},
+    );
+    const { r } = await chat(client());
+    expect(r.connection).toBe("new");
+    expect(framings(connect)).toEqual(["2", "2"]);
+  });
+
+  it("never runs a released request again when its refusal was not proven", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const { connect } = fakeConnections(() =>
+      calls++ === 0 ? { released: true, fail: new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM)") } : {},
+    );
+    const err = await chat(client()).catch((e) => e);
+    expect(err).toBeInstanceOf(StreamNotProcessedError);
+    expect(mayHaveReachedProvider(err)).toBe(true);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs a released request again once its refusal was proven and settled", async () => {
+    mockNodeOffer();
+    let calls = 0;
+    const refused = new StreamNotProcessedError("the provider refused stream 3 (REFUSED_STREAM): proven", {
+      receipt: { sid: "ab".repeat(32), model: "cheap", usage: { refused: "rst_stream", error_code: 7, choices: [] } as never, cost_msats: 0 } as never,
+      costMsats: 0,
+    });
+    const { connect } = fakeConnections(() => (calls++ === 0 ? { released: true, fail: refused } : {}));
+    const { r } = await chat(client());
+    expect(r.connection).toBe("new");
+    expect(framings(connect)).toEqual(["2", "2"]);
+  });
+
   it("never runs a released request again", async () => {
     mockNodeOffer();
     const { connect } = fakeConnections((_c, n) => (n === 2 ? { released: true, fail: new SessionRejectedError("connection closed") } : {}));
