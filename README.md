@@ -15,7 +15,7 @@ For more depth, there is a programmer's guide, [How routstr confidential mode wo
   inference.
 - `crates/client-wasm`: the client side of protocol v3 compiled to
   `wasm32-unknown-unknown`. It runs the two-party key schedule
-  (`cu-2pc`, `split-public-1`) and the proof channel (`cu-prover --channel`:
+  (`cu-2pc`, `split-public-2`) and the proof channel (`cu-prover --channel`:
   verify π_NK, prove π_WIN and π_C3S), plus the per-proof fallback.
 - The demo app is a separate repository,
   [routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa)
@@ -26,7 +26,7 @@ For more depth, there is a programmer's guide, [How routstr confidential mode wo
 It speaks protocol v3 of
 [routstr-confidential](https://github.com/jooray/routstr-confidential)
 (`PROTOCOL-V3.md` there): a **connection** that carries **requests**, the
-two-party key schedule `split-public-1` (node-only authenticated garbling,
+two-party key schedule `split-public-2` (node-only authenticated garbling,
 16.4 MB of tables down instead of v2's 22.1 MB), and two framings towards the
 provider: `"2"` (HTTP/2, many requests on one connection and one 2PC) and
 `"1.1"` (one request per connection). It needs a v3 node: a v2 node's offer
@@ -39,7 +39,8 @@ v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`
 1. **Offer.** The page fetches `GET /v1/confidential/offer?v=3`. It verifies the
    BIP-340 signature over the signed payload, checks it against the **pinned
    node key**, and accepts only a **trusted provider host**
-   (`api.venice.ai`), `v = 3`, the key schedule `split-public-1`, the framings
+   (`api.venice.ai`), `v = 3`, the key schedule `split-public-2` (a node that offers the earlier
+   `split-public-1` is `node_protocol_outdated`), the framings
    it knows (`http`, the operator's order) and an `h2` block in range. Prices,
    fees, the connection deposit and the head templates come from the signed
    bytes only.
@@ -52,7 +53,7 @@ v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`
    a request yet). A deposit above `maxConnectionDepositMsat` (default
    100 sats) is refused before anything is sent.
 4. **2PC.** A Web Worker runs the wasm 2PC with the node over
-   `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-1`
+   `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-2`
    first; another tag is `twopc_version_mismatch`): OT preprocessing (about
    1.1 MB up, 16.4 MB down) and the joint P-256 key share. The proof channel's
    OT/VOLE setup runs alongside (`?proof=zkchan`). A connection ready up to
@@ -383,7 +384,7 @@ Rebuilding the wasm needs rustup (the toolchain is pinned in
 (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`). `wasm-opt`
 comes from the `binaryen` devDependency. `.cargo/config.toml` selects the
 getrandom `wasm_js` backend and enables `simd128`, which every evergreen
-browser supports (Safari ≥ 16.4). The wasm is 5.97 MB, 1.83 MB gzipped. Commit
+browser supports (Safari ≥ 16.4). The wasm is 5.99 MB, 1.84 MB gzipped. Commit
 `wasm/pkg/` after rebuilding.
 
 **Checking the committed wasm.** The build is meant to be byte-reproducible:
@@ -413,13 +414,16 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 ## Dependencies on routstr-confidential
 
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
-`jooray/routstr-confidential` (branch `main`, protocol v3) at the commit named in
-`crates/vendor/UPSTREAM`, with the wasm32 patch applied. The patch is
-`patches/routstr-confidential-wasm32.patch`, explained in
-`patches/README.md`; applying it to that commit reproduces `crates/vendor/`
+`jooray/routstr-confidential` (protocol v3), with the wasm32 patch applied:
+`twopc` at the commit named in `crates/vendor/UPSTREAM` (branch
+`split-public-2`), `cu-crypto` and `zkbench` at 55f381e with the mpz2 pin of
+98a78e8. The patch is `patches/routstr-confidential-wasm32.patch`, explained in
+`patches/README.md`; applying it to that commit reproduces `crates/vendor/twopc`
 exactly. Once it is upstream, the vendored copies can become a git dependency
-on that repository. mpz2 is pinned at the same rev (`8f89783`) and needed no
-change. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `h2.ts`,
+on that repository. mpz2 is pinned at the same rev (`eaca5f9`) and needs no
+change. The 2PC hash vectors `test/fixtures/twopc-hash-vectors.json` (a copy of
+`crypto/conformance/twopc-hash-vectors.json`) are checked natively and on wasm32
+by `crates/client-wasm/tests/twopc_vectors.rs`. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `h2.ts`,
 `hpack-tables.ts`, `pool.ts`, `wire.ts`, `suffix.ts`, `hosts.ts`,
 `canonical.ts`, `errors.ts` and the TLS fork come from routstr-sdk
 (branch `confidential-2pc` of jooray/routstr-sdk) with node-only imports replaced (`hash.ts` stands in for
@@ -434,7 +438,7 @@ npm test                                             # vitest: offer/receipt/fee
 cargo test --release -p client-wasm                  # the wasm drivers' logic natively, against the real node side (2PC + proof channel)
 cargo test --release -p twopc -p zkbench             # the vendored crates with the patch, natively (unchanged results)
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo test --target wasm32-unknown-unknown -p client-wasm --test web   # in Node; add WASM_BINDGEN_USE_BROWSER=1 CHROMEDRIVER=… for headless Chrome
+  cargo test --target wasm32-unknown-unknown -p client-wasm --test web --test twopc_vectors   # in Node; add WASM_BINDGEN_USE_BROWSER=1 CHROMEDRIVER=… for headless Chrome
 
 # Local benchmark peer: the node side of the 2PC and proof channel, no credential:
 cargo build --release -p bench-node && target/release/bench-node serve --port 7450 &

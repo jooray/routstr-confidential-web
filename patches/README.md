@@ -3,16 +3,23 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at 55f381e (branch `main`, protocol v3; the base is
-recorded in `crates/vendor/UPSTREAM`), and `git apply` of it there
-reproduces `crates/vendor/` byte for byte (`cu-crypto` needs no change and
-is a plain copy):
+`jooray/routstr-confidential` at 71cce77 (branch `split-public-2`, protocol v3
+with the key schedule `split-public-2`; the base is recorded in
+`crates/vendor/UPSTREAM`), and `git apply` of it there reproduces
+`crates/vendor/twopc` byte for byte:
 
 ```bash
-cd routstr-confidential && git checkout 55f381e && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
+cd routstr-confidential && git checkout 71cce77 && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
 cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
+
+Only `twopc` was re-vendored for `split-public-2`. `cu-crypto` is a plain copy
+of 55f381e (it needs no change), and `zkbench` is 55f381e's with the patch and
+the mpz2 pin of 98a78e8 (`eaca5f9`, in both manifests). Against 71cce77 they
+differ only in what the browser does not run: `cu-crypto`'s GHASH multiply
+without branches (c1ec95a; in the wasm only the zkbench test fixtures call it), and
+`zkbench`'s `build.rs` and `cu-prover --version` (4a5785d).
 
 This repository vendors the patched crates in `crates/vendor/`. To re-vendor
 after a change upstream: copy `crypto/{cu-crypto,twopc,zkbench}` (without
@@ -34,9 +41,11 @@ What it changes:
    executor-agnostic.
 3. **`twopc/src/lib.rs`**: `tokio::task::spawn_blocking` → `rt::spawn_blocking`
    (4×), `tokio::spawn`/`sleep` → `rt::`, `std::time::Instant` → `rt::Instant`,
-   and the node-side `std::thread::scope` for the per-stage check rows of
-   `split-public-1` (five stages) becomes `scope_n` (threads natively,
-   sequential on wasm). `testutil` is native-only.
+   and the node-side `std::thread::scope` for the per-stage check rows
+   (five stages) becomes `scope_n` (threads natively, sequential on wasm).
+   `testutil` is native-only. `gc.rs`: the check-row tweak's range check
+   compares `idx as u64` with 2^32 (`1 << 32` overflows a 32-bit `usize`,
+   and rustc refuses it on wasm32; same check natively).
 4. **`zkbench`**: `channel.rs` uses `rt::Instant` and `rt::timeout` (the
    hello timeout); `proofs.rs` spawns with
    `rt::spawn`; the emulated `transport` module and `run_pair_transport`
@@ -48,4 +57,10 @@ What it changes:
 A wasm consumer must also select the getrandom backend for 0.3/0.4 with
 `--cfg getrandom_backend="wasm_js"` (see `.cargo/config.toml` here) and enable
 `getrandom` 0.2 `js`, 0.3/0.4 `wasm_js` (see `crates/client-wasm/Cargo.toml`).
-mpz2 at rev 8f89783 needed no change.
+mpz2 at rev eaca5f9 needs no change.
+
+The vendored `twopc`'s test `hash_vectors_match_conformance_file` reads
+`crates/vendor/conformance/twopc-hash-vectors.json`, a symlink to the shared
+vector file `test/fixtures/twopc-hash-vectors.json` (a byte-identical copy of
+`crypto/conformance/twopc-hash-vectors.json`); `crates/client-wasm/tests/twopc_vectors.rs`
+checks the same vectors natively and on wasm32.

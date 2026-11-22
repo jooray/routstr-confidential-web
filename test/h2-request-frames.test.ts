@@ -29,7 +29,7 @@ function connection(): { conn: any; wire: Record<string, unknown>[] } {
     v: 3,
     http: ["2", "1.1"],
     h2: { probe_path: "/api/v1/models", idle_secs: 300, max_requests: 100 },
-    twopc: "split-public-1",
+    twopc: "split-public-2",
     upstream_host: "api.venice.ai",
     notary_pubkey: pubHex,
     max_tokens_cap: 4096,

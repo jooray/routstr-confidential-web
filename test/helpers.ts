@@ -3,6 +3,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { canonicalJson } from "../src/canonical.js";
 import { VENICE_CHAT } from "./fixtures/chat.js";
+import v3NodeOffer from "./fixtures/v3-node-offer.json";
 
 export function makeKey(fill = 7) {
   const priv = new Uint8Array(32).fill(fill);
@@ -18,7 +19,7 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
   const { priv, pubHex } = makeKey(keyFill);
   const offer: Record<string, unknown> = {
     v: 3,
-    twopc: "split-public-1",
+    twopc: "split-public-2",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
@@ -38,4 +39,17 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
   };
   const payload = canonicalJson(offer);
   return { offer: { ...offer, sig_payload: payload, sig: sign(payload, priv) }, priv, pubHex };
+}
+
+/**
+ * The scratch node's signed v3 offer (`fixtures/v3-node-offer.json`, which
+ * names the key schedule `split-public-1`) as a node of `split-public-2`
+ * signs it: the same payload with `twopc` replaced, signed again under a test
+ * key (the node's own key was throwaway).
+ */
+export function v3NodeOfferSplitPublic2(keyFill = 11) {
+  const { priv, pubHex } = makeKey(keyFill);
+  const signed = { ...JSON.parse(v3NodeOffer.sig_payload), twopc: "split-public-2", notary_pubkey: pubHex };
+  const payload = canonicalJson(signed);
+  return { offer: { ...signed, sig_payload: payload, sig: sign(payload, priv) } as typeof v3NodeOffer, pubHex };
 }

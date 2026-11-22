@@ -238,20 +238,23 @@ async fn input_backlog_is_bounded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn twopc_version_mismatch_is_reported() {
     // A peer whose first bytes are another version tag (a v2 node sends no
-    // tag at all and starts with its own protocol bytes).
-    let (out_tx, mut out_rx) = unbounded::<Frame>();
-    let input = driver::spawn_twopc(out_tx);
-    input.unbounded_send((0, b"routstr-2pc/v2-other\n".to_vec())).unwrap();
-    let ev = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while let Some((ch, data)) = out_rx.next().await {
-            let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
-            if ch == 1 && v["ev"] == "error" {
-                return v;
+    // tag at all and starts with its own protocol bytes; a node of the
+    // previous key schedule sends `split-public-1`).
+    for tag in [&b"routstr-2pc/v2-other\n"[..], &b"routstr-2pc/split-public-1\n"[..]] {
+        let (out_tx, mut out_rx) = unbounded::<Frame>();
+        let input = driver::spawn_twopc(out_tx);
+        input.unbounded_send((0, tag.to_vec())).unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some((ch, data)) = out_rx.next().await {
+                let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+                if ch == 1 && v["ev"] == "error" {
+                    return v;
+                }
             }
-        }
-        Value::Null
-    })
-    .await
-    .unwrap();
-    assert_eq!(ev["code"], "twopc_version_mismatch", "{ev}");
+            Value::Null
+        })
+        .await
+        .unwrap();
+        assert_eq!(ev["code"], "twopc_version_mismatch", "{ev}");
+    }
 }

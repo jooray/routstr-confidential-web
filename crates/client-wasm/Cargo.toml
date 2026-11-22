@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
-description = "Browser (wasm32) build of the client side of the routstr confidential-mode protocol v3: the 2PC handshake (cu-2pc, split-public-1) and the proof channel (cu-prover --channel: π_NK, π_WIN, π_C3S)"
+description = "Browser (wasm32) build of the client side of the routstr confidential-mode protocol v3: the 2PC handshake (cu-2pc, split-public-2) and the proof channel (cu-prover --channel: π_NK, π_WIN, π_C3S)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -36,9 +36,13 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.38", features = ["full"] }
 
+[dev-dependencies]
+sha2 = "0.10"
+mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
+mpz-fields = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
-sha2 = "0.10"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

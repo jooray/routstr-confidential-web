@@ -131,7 +131,7 @@ describe("the node's refusals of a setup", () => {
   });
 });
 
-describe("the wasm 2PC driver's version tag (split-public-1)", () => {
+describe("the wasm 2PC driver's version tag (split-public-2)", () => {
   it("a driver error with code twopc_version_mismatch fails the 2PC with TwoPcVersionMismatchError", async () => {
     let emit!: (ch: number, data: Uint8Array) => void;
     const host: WasmHost = {
@@ -160,7 +160,7 @@ describe("the wasm 2PC driver's version tag (split-public-1)", () => {
     emit(1, new TextEncoder().encode(JSON.stringify({ ev: "error", code: "twopc_version_mismatch", msg: "twopc_version_mismatch: peer tag" })));
     const e = await share.catch((x) => x);
     expect(e).toBeInstanceOf(TwoPcVersionMismatchError);
-    expect(e.message).toMatch(/split-public-1/);
+    expect(e.message).toMatch(/split-public-2/);
     tp.close();
   });
 });
