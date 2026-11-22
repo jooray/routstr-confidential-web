@@ -38,11 +38,11 @@ export interface TwoPcTiming {
 
 /**
  * Bytes the client receives on the 2PC socket of `split-public-2` up to the
- * joint key share (the version tag, the preprocessing and the key share,
- * about 16.4 MB). Shown as the denominator of a progress bar
+ * joint key share (the version tag, the preprocessing and the key share with
+ * the node's proof of knowledge, about 16.4 MB). Shown as the denominator of a progress bar
  * (`twopc_progress`); never used for a check.
  */
-export const TWOPC_DOWNLOAD_BYTES = 16_425_817;
+export const TWOPC_DOWNLOAD_BYTES = 16_425_881;
 
 /** What a 2PC version mismatch means for the user of this page. */
 const TWOPC_MISMATCH_TEXT =
@@ -168,7 +168,7 @@ export class TwoPcSession {
     this.relay?.command(cmd);
   }
 
-  /** Preprocessing plus the commit-then-open joint key share P = P_C + P_N (65-byte SEC1). */
+  /** Preprocessing plus the commit-then-open joint key share P = P_C + P_N (65-byte SEC1); the wasm checks the node's proof of knowledge of its scalar first. */
   async keyShare(ms = 120_000): Promise<Uint8Array> {
     const m = await this.wait("key_share", ms);
     return hexField(m, "p", 65);

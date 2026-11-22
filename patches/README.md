@@ -3,20 +3,20 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at 71cce77 (branch `split-public-2`, protocol v3
+`jooray/routstr-confidential` at 401d21f (branch `main`, protocol v3
 with the key schedule `split-public-2`; the base is recorded in
 `crates/vendor/UPSTREAM`), and `git apply` of it there reproduces
 `crates/vendor/twopc` byte for byte:
 
 ```bash
-cd routstr-confidential && git checkout 71cce77 && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
+cd routstr-confidential && git checkout 401d21f && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
 cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
 
 Only `twopc` was re-vendored for `split-public-2`. `cu-crypto` is a plain copy
 of 55f381e (it needs no change), and `zkbench` is 55f381e's with the patch and
-the mpz2 pin of 98a78e8 (`eaca5f9`, in both manifests). Against 71cce77 they
+the mpz2 pin of 98a78e8 (`eaca5f9`, in both manifests). Against 401d21f they
 differ only in what the browser does not run: `cu-crypto`'s GHASH multiply
 without branches (c1ec95a; in the wasm only the zkbench test fixtures call it), and
 `zkbench`'s `build.rs` and `cu-prover --version` (4a5785d).
@@ -43,9 +43,8 @@ What it changes:
    (4×), `tokio::spawn`/`sleep` → `rt::`, `std::time::Instant` → `rt::Instant`,
    and the node-side `std::thread::scope` for the per-stage check rows
    (five stages) becomes `scope_n` (threads natively, sequential on wasm).
-   `testutil` is native-only. `gc.rs`: the check-row tweak's range check
-   compares `idx as u64` with 2^32 (`1 << 32` overflows a 32-bit `usize`,
-   and rustc refuses it on wasm32; same check natively).
+   `testutil` is native-only. (`gc.rs`'s check-row tweak range check, which
+   an earlier patch made compile on 32-bit targets, is upstream since 9842a20.)
 4. **`zkbench`**: `channel.rs` uses `rt::Instant` and `rt::timeout` (the
    hello timeout); `proofs.rs` spawns with
    `rt::spawn`; the emulated `transport` module and `run_pair_transport`

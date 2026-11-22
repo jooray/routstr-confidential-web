@@ -6,10 +6,19 @@
 //! where AES and the GF(2^64) arithmetic run without the native AES and
 //! carry-less multiply instructions. The vendored crate's own test
 //! (`hash_vectors_match_conformance_file`) reads the same file through
-//! `crates/vendor/conformance/`.
+//! `crates/vendor/conformance/`. The key share's proof of knowledge is private
+//! to `twopc`: `key_share_proof` recomputes it here with p256 (on wasm32 too),
+//! and the crate's own `key_share_proof_vector` runs its verifier on the
+//! same vector.
 
 use mpz_core::Block;
 use mpz_fields::p256::P256 as Fp;
+use p256::elliptic_curve::bigint::U256;
+use p256::elliptic_curve::group::Group;
+use p256::elliptic_curve::ops::Reduce;
+use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use p256::elliptic_curve::PrimeField;
+use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use twopc::gc;
@@ -56,6 +65,47 @@ fn fp_hex(x: Fp) -> String {
     hex::encode(le)
 }
 
+/// The row parameters from C's seed and N's hash parameters.
+fn row_params(seed: &Value, hparams: &Value) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"routstr-twopc-ag chi")
+        .chain_update(bytes::<32>(seed))
+        .chain_update(b"row-params")
+        .chain_update(bytes::<32>(hparams))
+        .finalize()
+        .into()
+}
+/// A scalar from a big-endian hex integer below the group order.
+fn scalar(v: &Value) -> Scalar {
+    Option::from(Scalar::from_repr(bytes::<32>(v).into())).expect("below n")
+}
+fn sec1(p: &ProjectivePoint) -> [u8; 65] {
+    p.to_affine().to_encoded_point(false).as_bytes().try_into().unwrap()
+}
+
+const KS_PROOF_TAG: &[u8] = b"routstr-twopc-split key-share proof";
+
+/// SHA-256 over the tag, the row parameters, C's commitment, `P_N` and `R`.
+fn ks_challenge(rp: &[u8; 32], com: &[u8; 32], p_n: &[u8; 65], r: &[u8; 65]) -> [u8; 32] {
+    Sha256::new().chain_update(KS_PROOF_TAG).chain_update(rp).chain_update(com).chain_update(p_n).chain_update(r).finalize().into()
+}
+
+/// C's check of N's key-share message `P_N ‖ e ‖ s`: `P_N` a curve point
+/// other than the identity, `s` < n, `R' = s·G − e·P_N` not the identity and
+/// its challenge equal to `e`.
+fn ks_verify(rp: &[u8; 32], com: &[u8; 32], msg: &[u8]) -> bool {
+    let Ok(msg) = <&[u8; 129]>::try_from(msg) else { return false };
+    let p_n: [u8; 65] = msg[..65].try_into().unwrap();
+    let e: [u8; 32] = msg[65..97].try_into().unwrap();
+    let Ok(ep) = EncodedPoint::from_bytes(p_n) else { return false };
+    let Some(point) = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep)) else { return false };
+    let Some(sv) = Option::<Scalar>::from(Scalar::from_repr(<[u8; 32]>::try_from(&msg[97..]).unwrap().into())) else {
+        return false;
+    };
+    let r = ProjectivePoint::GENERATOR * sv - ProjectivePoint::from(point) * <Scalar as Reduce<U256>>::reduce_bytes(&e.into());
+    p_n[0] == 4 && !bool::from(r.is_identity()) && ks_challenge(rp, com, &p_n, &sec1(&r)) == e
+}
+
 #[test]
 fn gf64_and_sigma() {
     let v = vectors();
@@ -91,16 +141,7 @@ fn garbling_hash() {
 fn row_params_and_check_rows() {
     let v = vectors();
     for c in v["row_params"].as_array().unwrap() {
-        let seed: [u8; 32] = bytes(&c["seed"]);
-        let hp: [u8; 32] = bytes(&c["hparams"]);
-        let rp: [u8; 32] = Sha256::new()
-            .chain_update(b"routstr-twopc-ag chi")
-            .chain_update(seed)
-            .chain_update(b"row-params")
-            .chain_update(hp)
-            .finalize()
-            .into();
-        assert_eq!(hex::encode(rp), s(&c["rparams"]), "{c}");
+        assert_eq!(hex::encode(row_params(&c["seed"], &c["hparams"])), s(&c["rparams"]), "{c}");
     }
     let rows = v["row"].as_array().unwrap();
     assert!(!rows.is_empty());
@@ -162,4 +203,56 @@ fn masked_input() {
         assert_eq!(fp_hex(x_c + delta + rho), s(&c["sum"]));
         assert_eq!(fp_hex(x_c + delta + rho), fp_hex(x_c + x_n));
     }
+}
+
+#[test]
+fn key_share_proof() {
+    let v = vectors();
+    let ks = &v["key_share"];
+    assert_eq!(s(&ks["proof_tag"]).as_bytes(), KS_PROOF_TAG);
+    let rp = row_params(&ks["seed"], &ks["hparams"]);
+    assert_eq!(hex::encode(rp), s(&ks["rparams"]));
+    let g = ProjectivePoint::GENERATOR;
+    let (a_c, a_n, k) = (scalar(&ks["a_c"]), scalar(&ks["a_n"]), scalar(&ks["k"]));
+    let (p_c, p_n, r) = (sec1(&(g * a_c)), sec1(&(g * a_n)), sec1(&(g * k)));
+    assert_eq!(hex::encode(p_c), s(&ks["p_c"]));
+    assert_eq!(hex::encode(p_n), s(&ks["p_n"]));
+    assert_eq!(hex::encode(r), s(&ks["r"]));
+    // C's commitment to P_C and its opening.
+    let opening = [&p_c[..], &bytes::<32>(&ks["nonce"])].concat();
+    assert_eq!(hex::encode(&opening), s(&ks["c_opening"]));
+    let com: [u8; 32] = Sha256::new().chain_update(s(&ks["commit_tag"])).chain_update(&opening).finalize().into();
+    assert_eq!(hex::encode(com), s(&ks["com"]));
+    // The challenge input, e and s = k + e·a_N mod n.
+    let input = [KS_PROOF_TAG, &rp, &com, &p_n, &r].concat();
+    assert_eq!(hex::encode(&input), s(&ks["challenge_input"]));
+    let e = ks_challenge(&rp, &com, &p_n, &r);
+    assert_eq!(<[u8; 32]>::from(Sha256::digest(&input)), e);
+    assert_eq!(hex::encode(e), s(&ks["e"]));
+    let sv = k + <Scalar as Reduce<U256>>::reduce_bytes(&e.into()) * a_n;
+    assert_eq!(hex::encode(sv.to_repr()), s(&ks["s"]));
+    // N's message (129 bytes) verifies; the joint point is P_C + P_N.
+    let msg = hex::decode(s(&ks["n_message"])).unwrap();
+    assert_eq!(msg, [&p_n[..], &e, &sv.to_repr()].concat());
+    assert!(ks_verify(&rp, &com, &msg));
+    assert_eq!(hex::encode(sec1(&(g * a_c + g * a_n))), s(&ks["joint"]));
+    // Refused: any flipped bit of the message, another point with the same
+    // proof, another commitment or preprocessing, s ≥ n, a short message.
+    for i in 0..msg.len() * 8 {
+        let mut m = msg.clone();
+        m[i / 8] ^= 1 << (i % 8);
+        assert!(!ks_verify(&rp, &com, &m), "bit {i}");
+    }
+    let mut m = msg.clone();
+    m[..65].copy_from_slice(&sec1(&(g * a_n + g)));
+    assert!(!ks_verify(&rp, &com, &m));
+    let (mut rp2, mut com2) = (rp, com);
+    rp2[0] ^= 1;
+    com2[0] ^= 1;
+    assert!(!ks_verify(&rp2, &com, &msg));
+    assert!(!ks_verify(&rp, &com2, &msg));
+    let mut m = msg.clone();
+    m[97..].fill(0xff);
+    assert!(!ks_verify(&rp, &com, &m));
+    assert!(!ks_verify(&rp, &com, &msg[..128]));
 }

@@ -55,7 +55,8 @@ v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`
 4. **2PC.** A Web Worker runs the wasm 2PC with the node over
    `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-2`
    first; another tag is `twopc_version_mismatch`): OT preprocessing (about
-   1.1 MB up, 16.4 MB down) and the joint P-256 key share. The proof channel's
+   1.1 MB up, 16.4 MB down) and the joint P-256 key share (the node proves
+   knowledge of its scalar before the page opens its commitment). The proof channel's
    OT/VOLE setup runs alongside (`?proof=zkchan`). A connection ready up to
    here is **armed**: it holds the deposit and no provider connection.
 5. **TLS 1.3 to the provider**, from the page, through the node's relay: the
@@ -384,7 +385,7 @@ Rebuilding the wasm needs rustup (the toolchain is pinned in
 (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`). `wasm-opt`
 comes from the `binaryen` devDependency. `.cargo/config.toml` selects the
 getrandom `wasm_js` backend and enables `simd128`, which every evergreen
-browser supports (Safari ≥ 16.4). The wasm is 5.99 MB, 1.84 MB gzipped. Commit
+browser supports (Safari ≥ 16.4). The wasm is 6.01 MB, 1.84 MB gzipped. Commit
 `wasm/pkg/` after rebuilding.
 
 **Checking the committed wasm.** The build is meant to be byte-reproducible:
@@ -416,7 +417,7 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
 `jooray/routstr-confidential` (protocol v3), with the wasm32 patch applied:
 `twopc` at the commit named in `crates/vendor/UPSTREAM` (branch
-`split-public-2`), `cu-crypto` and `zkbench` at 55f381e with the mpz2 pin of
+`main`), `cu-crypto` and `zkbench` at 55f381e with the mpz2 pin of
 98a78e8. The patch is `patches/routstr-confidential-wasm32.patch`, explained in
 `patches/README.md`; applying it to that commit reproduces `crates/vendor/twopc`
 exactly. Once it is upstream, the vendored copies can become a git dependency

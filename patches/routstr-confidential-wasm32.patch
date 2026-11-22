@@ -29,21 +29,8 @@ index 3026396..9596699 100644
  [dev-dependencies]
  cu-crypto = { path = "../cu-crypto" }
  # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
-diff --git a/crypto/twopc/src/gc.rs b/crypto/twopc/src/gc.rs
-index ed2b1e8..ac938a1 100644
---- a/crypto/twopc/src/gc.rs
-+++ b/crypto/twopc/src/gc.rs
-@@ -150,7 +150,7 @@ impl<'a> RowHash<'a> {
- 
-     #[inline]
-     fn tau(stage: usize, idx: usize) -> u64 {
--        assert!(stage < 8 && idx < (1 << 32), "row tweak out of range");
-+        assert!(stage < 8 && (idx as u64) < (1 << 32), "row tweak out of range");
-         ((stage as u64) << 32) | idx as u64
-     }
- 
 diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
-index 354f4f9..7598379 100644
+index d3599ab..e19f911 100644
 --- a/crypto/twopc/src/lib.rs
 +++ b/crypto/twopc/src/lib.rs
 @@ -28,8 +28,8 @@
@@ -57,7 +44,7 @@ index 354f4f9..7598379 100644
  //! transport and reads the peer's; anything else is
  //! [`Error::VersionMismatch`] (`twopc_version_mismatch`). `close` flushes the
  //! transport; `take_timings` returns per-step wall time and transport bytes.
-@@ -104,14 +104,16 @@ pub mod circuits;
+@@ -107,14 +107,16 @@ pub mod circuits;
  mod ectf;
  pub mod gc;
  mod mux;
@@ -75,7 +62,7 @@ index 354f4f9..7598379 100644
  
  use futures::{AsyncRead, AsyncWrite};
  use mpz_common::{Context, Flush};
-@@ -631,6 +633,29 @@ fn os_rng() -> StdRng {
+@@ -649,6 +651,29 @@ fn os_rng() -> StdRng {
      r
  }
  
@@ -105,7 +92,7 @@ index 354f4f9..7598379 100644
  fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
      let mut out = Vec::with_capacity(16 * v.len());
      for b in v {
-@@ -1020,7 +1045,7 @@ impl Party {
+@@ -1095,7 +1120,7 @@ impl Party {
          if *TRACE {
              let c = self.counters.clone();
              let who = if self.role == Role::C { "C" } else { "N" };
@@ -114,7 +101,7 @@ index 354f4f9..7598379 100644
                  let t0 = Instant::now();
                  let mut last = (0, 0, 0);
                  for _ in 0..200 {
-@@ -1035,7 +1060,7 @@ impl Party {
+@@ -1110,7 +1135,7 @@ impl Party {
                          );
                          last = v;
                      }
@@ -123,7 +110,7 @@ index 354f4f9..7598379 100644
                  }
              });
          }
-@@ -1071,7 +1096,7 @@ impl Party {
+@@ -1146,7 +1171,7 @@ impl Party {
          #[allow(unused_mut)]
          let mut rho = random_fp_le(&mut self.rng);
  
@@ -132,7 +119,7 @@ index 354f4f9..7598379 100644
              let hg = gc::HashG::new(&hparams);
              let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
              #[cfg(test)]
-@@ -1130,7 +1155,7 @@ impl Party {
+@@ -1205,7 +1230,7 @@ impl Party {
                      && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
                      && t0.elapsed() < TABLES_MAX_WAIT
                  {
@@ -141,7 +128,7 @@ index 354f4f9..7598379 100644
                  }
              }
          };
-@@ -1310,7 +1335,7 @@ impl Party {
+@@ -1385,7 +1410,7 @@ impl Party {
  
          // Product check, openings, consistency-check material, label-check
          // pairs (CPU, blocking).
@@ -150,7 +137,7 @@ index 354f4f9..7598379 100644
              let hg = gc::HashG::new(&hparams);
              let hg = &hg;
              let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
-@@ -1349,8 +1374,7 @@ impl Party {
+@@ -1424,8 +1449,7 @@ impl Party {
                  (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
              };
              let mut msgs: Vec<Vec<u8>> = Vec::new();
@@ -160,7 +147,7 @@ index 354f4f9..7598379 100644
                  let pw = gc::powers(chi_dv, lay.n_and);
                  let mut acc = (Block::ZERO, Block::ZERO);
                  gc::dvzk_prover_acc(&lay.ands, &lam, &mac, &t_mac, &pw, &mut acc);
-@@ -1396,7 +1420,6 @@ impl Party {
+@@ -1471,7 +1495,6 @@ impl Party {
                  let mut open = from_bits(&bits);
                  open.extend_from_slice(&hd);
                  msgs.push(open);
@@ -168,7 +155,7 @@ index 354f4f9..7598379 100644
              });
              for (r, y) in rows {
                  msgs.push(r);
-@@ -1567,7 +1590,7 @@ impl Party {
+@@ -1643,7 +1666,7 @@ impl Party {
          let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
          let pair_salt = chi(&seed, b"check-salt").to_bytes();
          let rparams = Zeroizing::new(row_params(&seed, &hparams));
@@ -177,7 +164,7 @@ index 354f4f9..7598379 100644
              let nb = lay.base.len();
              let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
              let t_key = &kfix[nb..nb + lay.n_and];
-@@ -2160,7 +2183,7 @@ impl Party {
+@@ -2272,7 +2295,7 @@ impl Party {
          let (hparams, rparams) = (st.hparams.clone(), st.rparams.clone());
          let tables = std::mem::take(&mut st.tables);
          let mut l = std::mem::take(&mut st.l);

@@ -40,8 +40,6 @@ tokio = { version = "1.38", features = ["full"] }
 sha2 = "0.10"
 mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
 mpz-fields = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
