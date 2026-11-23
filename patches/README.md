@@ -14,12 +14,23 @@ cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
 
-Only `twopc` was re-vendored for `split-public-2`. `cu-crypto` is a plain copy
-of 55f381e (it needs no change), and `zkbench` is 55f381e's with the patch and
-the mpz2 pin of 98a78e8 (`eaca5f9`, in both manifests). Against 401d21f they
-differ only in what the browser does not run: `cu-crypto`'s GHASH multiply
-without branches (c1ec95a; in the wasm only the zkbench test fixtures call it), and
-`zkbench`'s `build.rs` and `cu-prover --version` (4a5785d).
+All three crates are vendored from 401d21f: `cu-crypto` is a plain copy (it
+needs no change), and `twopc` and `zkbench` are 401d21f's with this patch (the
+mpz2 pin `eaca5f9` is upstream's). There are no other differences.
+`node scripts/vendor-check.mjs <routstr-confidential checkout>` (`npm run
+check:vendor` with `CU_UPSTREAM_DIR`) checks that, byte for byte, and CI runs it
+against a clone of `jooray/routstr-confidential`. `zkbench`'s `build.rs` (it
+records a commit for `cu-prover --version`, a binary the wasm does not contain)
+is built with `CU_BUILD_COMMIT=client-wasm` (`scripts/build-wasm.sh`), so the
+wasm does not depend on this checkout's HEAD.
+
+`cu-crypto`'s software GHASH (`aesgcm::gfmul`) runs in the wasm only in
+`fixturesV2()` (zkbench's proof fixtures for benchmarks, built from fixed test
+keys). The client's TLS records are sealed and opened by the TLS fork in
+JavaScript (WebCrypto AES-GCM), the proof statements recompute no GCM tag
+(`zkbench/src/statements.rs`, CTR keystream only), and `twopc` uses
+`cu-crypto` for HKDF in the circuits and AES-GCM only in its native tests. The branch-free multiply (upstream c1ec95a) is vendored
+all the same.
 
 This repository vendors the patched crates in `crates/vendor/`. To re-vendor
 after a change upstream: copy `crypto/{cu-crypto,twopc,zkbench}` (without

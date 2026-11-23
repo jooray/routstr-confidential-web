@@ -17,6 +17,10 @@ OUT="$ROOT/wasm/pkg"
 export PATH="$HOME/.cargo/bin:$PATH"
 CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
 cd "$ROOT"
+# zkbench's build.rs records a commit for `cu-prover --version` (a binary the
+# wasm does not contain); a fixed value keeps the build independent of this
+# checkout's HEAD.
+export CU_BUILD_COMMIT=client-wasm
 # Arrays given with --config are appended to .cargo/config.toml's rustflags.
 cargo build --locked --release --target wasm32-unknown-unknown -p client-wasm \
   --config "target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$CARGO_HOME_DIR=/cargo\", \"--remap-path-prefix=$ROOT=/build\"]"

@@ -1,6 +1,9 @@
 # Checks that the committed wasm/pkg is what the sources in the tree build to,
 # and runs the library's tests.
 #
+# - "vendored crates": crates/vendor must be the upstream crates at the commit in
+#   crates/vendor/UPSTREAM plus patches/routstr-confidential-wasm32.patch, byte for
+#   byte (scripts/vendor-check.mjs); any other difference fails.
 # - "source digest": the wasm's buildInfo() carries a digest of every source
 #   file that goes into it (crates/client-wasm/build.rs); this fails when
 #   wasm/pkg was not rebuilt after a source change. Cheap, host-independent.
@@ -31,6 +34,10 @@ jobs:
       - run: npm ci
       - name: source digest (wasm/pkg built from this tree)
         run: node scripts/source-digest.mjs --check
+      - name: vendored crates are upstream + patch (crates/vendor/UPSTREAM)
+        run: |
+          git clone --quiet --filter=blob:none --no-checkout https://github.com/jooray/routstr-confidential "$RUNNER_TEMP/upstream"
+          node scripts/vendor-check.mjs "$RUNNER_TEMP/upstream"
       - run: npm run typecheck
       - run: npm test
       - name: native driver tests (client-wasm against the real node side)

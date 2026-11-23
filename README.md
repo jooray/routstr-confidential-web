@@ -416,12 +416,13 @@ app's `vite.config.ts`). The page's CSP needs `script-src 'wasm-unsafe-eval'`,
 ## Dependencies on routstr-confidential
 
 `crates/vendor/{cu-crypto,twopc,zkbench}` are copies of
-`jooray/routstr-confidential` (protocol v3), with the wasm32 patch applied:
-`twopc` at the commit named in `crates/vendor/UPSTREAM` (branch
-`main`), `cu-crypto` and `zkbench` at 55f381e with the mpz2 pin of
-98a78e8. The patch is `patches/routstr-confidential-wasm32.patch`, explained in
-`patches/README.md`; applying it to that commit reproduces `crates/vendor/twopc`
-exactly. Once it is upstream, the vendored copies can become a git dependency
+`jooray/routstr-confidential` (protocol v3) at the commit named in
+`crates/vendor/UPSTREAM` (branch `main`), with the wasm32 patch applied. The
+patch is `patches/routstr-confidential-wasm32.patch`, explained in
+`patches/README.md`; applying it to a `git archive` of that commit reproduces
+all three crates byte for byte, and `node scripts/vendor-check.mjs <checkout>`
+(`npm run check:vendor` with `CU_UPSTREAM_DIR`; a CI step) fails on any other
+difference. Once it is upstream, the vendored copies can become a git dependency
 on that repository. mpz2 is pinned at the same rev (`eaca5f9`) and needs no
 change. The 2PC hash vectors `test/fixtures/twopc-hash-vectors.json` (a copy of
 `crypto/conformance/twopc-hash-vectors.json`) are checked natively and on wasm32
@@ -439,6 +440,7 @@ proofs on the wasm host and the provider's certificate path kept for display. Th
 npm test                                             # vitest: offer/receipt/fees/suffix/padding/params/SSE/pricing/worker host, and the wasm source digest
 cargo test --release -p client-wasm                  # the wasm drivers' logic natively, against the real node side (2PC + proof channel)
 cargo test --release -p twopc -p zkbench             # the vendored crates with the patch, natively (unchanged results)
+node scripts/vendor-check.mjs ../routstr-confidential  # crates/vendor = upstream (crates/vendor/UPSTREAM) + patch, byte for byte
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test --target wasm32-unknown-unknown -p client-wasm --test web --test twopc_vectors   # in Node; add WASM_BINDGEN_USE_BROWSER=1 CHROMEDRIVER=… for headless Chrome
 
