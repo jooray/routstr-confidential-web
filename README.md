@@ -423,7 +423,9 @@ patch is `patches/routstr-confidential-wasm32.patch`, explained in
 all three crates byte for byte, and `node scripts/vendor-check.mjs <checkout>`
 (`npm run check:vendor` with `CU_UPSTREAM_DIR`; a CI step) fails on any other
 difference. Once it is upstream, the vendored copies can become a git dependency
-on that repository. mpz2 is pinned at the same rev (`eaca5f9`) and needs no
+on that repository. mpz2 is pinned at the same rev as upstream (the fork
+`jooray/mpz2`, branch `routstr-ct-selects`, `eba78e0`: TLSNotary's `eaca5f9`
+plus branch-free selects on secret bits, the same values and bytes) and needs no
 change. The 2PC hash vectors `test/fixtures/twopc-hash-vectors.json` (a copy of
 `crypto/conformance/twopc-hash-vectors.json`) are checked natively and on wasm32
 by `crates/client-wasm/tests/twopc_vectors.rs`. The TS sources `offer.ts`, `receipt.ts`, `params.ts`, `h2.ts`,

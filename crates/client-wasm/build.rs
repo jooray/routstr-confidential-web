@@ -67,7 +67,11 @@ fn main() {
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
     let mpz = lock
         .lines()
-        .find_map(|l| l.strip_prefix("source = \"git+https://github.com/tlsnotary/mpz2").and_then(|r| r.split('#').nth(1)))
+        .find_map(|l| {
+            l.strip_prefix("source = \"git+https://github.com/")
+                .filter(|r| r.contains("/mpz2?"))
+                .and_then(|r| r.split('#').nth(1))
+        })
         .map(|r| r.trim_end_matches('"').chars().take(7).collect::<String>())
         .unwrap_or_else(|| "unknown".into());
 

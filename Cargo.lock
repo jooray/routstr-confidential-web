@@ -283,7 +283,7 @@ dependencies = [
 [[package]]
 name = "clmul"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -982,7 +982,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "matrix-transpose"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "thiserror",
 ]
@@ -1017,7 +1017,7 @@ dependencies = [
 [[package]]
 name = "mpz-circuits"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "mpz-circuits-core",
  "mpz-circuits-data",
@@ -1026,7 +1026,7 @@ dependencies = [
 [[package]]
 name = "mpz-circuits-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "bincode",
  "itybity 0.3.3",
@@ -1041,7 +1041,7 @@ dependencies = [
 [[package]]
 name = "mpz-circuits-data"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "bincode",
  "mpz-circuits-core",
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "mpz-cointoss"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "futures",
  "mpz-cointoss-core",
@@ -1064,7 +1064,7 @@ dependencies = [
 [[package]]
 name = "mpz-cointoss-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "mpz-core",
  "opaque-debug",
@@ -1075,7 +1075,7 @@ dependencies = [
 [[package]]
 name = "mpz-common"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-task",
  "async-trait",
@@ -1097,7 +1097,7 @@ dependencies = [
 [[package]]
 name = "mpz-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "aes 0.9.3",
  "bcs",
@@ -1122,7 +1122,7 @@ dependencies = [
 [[package]]
 name = "mpz-fields"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "crypto-bigint 0.7.5",
  "hybrid-array",
@@ -1139,7 +1139,7 @@ dependencies = [
 [[package]]
 name = "mpz-hash"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "itybity 0.3.3",
  "mpz-circuits",
@@ -1151,7 +1151,7 @@ dependencies = [
 [[package]]
 name = "mpz-memory-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "blake3",
  "futures",
@@ -1166,7 +1166,7 @@ dependencies = [
 [[package]]
 name = "mpz-ole"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-trait",
  "futures",
@@ -1184,7 +1184,7 @@ dependencies = [
 [[package]]
 name = "mpz-ole-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "hybrid-array",
  "mpz-common",
@@ -1199,7 +1199,7 @@ dependencies = [
 [[package]]
 name = "mpz-ot"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -1223,7 +1223,7 @@ dependencies = [
 [[package]]
 name = "mpz-ot-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "aes 0.9.3",
  "blake3",
@@ -1245,6 +1245,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "serde",
+ "subtle",
  "thiserror",
  "tokio",
  "zerocopy",
@@ -1253,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "mpz-share-conversion"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-trait",
  "mpz-common",
@@ -1269,7 +1270,7 @@ dependencies = [
 [[package]]
 name = "mpz-share-conversion-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "mpz-common",
  "mpz-core",
@@ -1283,7 +1284,7 @@ dependencies = [
 [[package]]
 name = "mpz-vm-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-trait",
  "futures",
@@ -1296,7 +1297,7 @@ dependencies = [
 [[package]]
 name = "mpz-zk"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1314,7 +1315,7 @@ dependencies = [
 [[package]]
 name = "mpz-zk-core"
 version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=eaca5f9d9f30167c9525716e8f0aa9e33d886e5e#eaca5f9d9f30167c9525716e8f0aa9e33d886e5e"
+source = "git+https://github.com/jooray/mpz2?rev=eba78e02cb237cf1501ff0d8a492ef5fc849e135#eba78e02cb237cf1501ff0d8a492ef5fc849e135"
 dependencies = [
  "blake3",
  "cfg-if",

@@ -1,5 +1,5 @@
 diff --git a/crypto/twopc/Cargo.toml b/crypto/twopc/Cargo.toml
-index 5dc801e..1fc0745 100644
+index 7e7b25b..ab4b3db 100644
 --- a/crypto/twopc/Cargo.toml
 +++ b/crypto/twopc/Cargo.toml
 @@ -35,13 +35,25 @@ sha2 = { version = "0.10", features = ["compress"] }
@@ -381,12 +381,12 @@ index 0000000..e454730
 +
 +pub use imp::*;
 diff --git a/crypto/zkbench/Cargo.toml b/crypto/zkbench/Cargo.toml
-index 7abc83d..48ba57b 100644
+index d8f7593..6fbe473 100644
 --- a/crypto/zkbench/Cargo.toml
 +++ b/crypto/zkbench/Cargo.toml
-@@ -14,7 +14,8 @@ mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c952
- mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
- mpz-hash = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e", default-features = false, features = ["sha256"] }
+@@ -14,7 +14,8 @@ mpz-ot = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0
+ mpz-zk = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+ mpz-hash = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135", default-features = false, features = ["sha256"] }
  futures = "0.3"
 -tokio = { version = "1.38", features = ["full"] }
 +tokio = { version = "1.38", features = ["sync", "macros", "io-util"] }
