@@ -310,7 +310,7 @@ the client and dropped.
 | `request_settled` | the receipt was checked | `n`, `status`, `total_ms` |
 | `request_retry`, `framing_fallback` | the library runs the request again (a refused stream, a failed open of `"2"`) | `reason` |
 | `deposit` | the deposit's outcome (released by a receipt, or the node's signed outcome in the last frame) | `msat`, `outcome`, `reason`, `signed` |
-| `warning` | `code: "deposit_outcome"`: the node's deposit outcome contradicts its signed terms (another amount; charged after a releasing receipt, after a fault of the node or the provider, or with a releasing reason). Detection only: the `deposit` event still comes | `code`, `message` |
+| `warning` | `code: "deposit_outcome"`: the node's deposit outcome contradicts its signed terms (another amount; charged after a releasing receipt, after a fault of the node or the provider, with a releasing reason, without a valid signature, or after the provider closed the idle connection; or no outcome at all for a deposit nothing released). Detection only: the `deposit` event still comes | `code`, `message` |
 
 ### Images
 
