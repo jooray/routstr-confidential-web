@@ -391,6 +391,47 @@ describe("the deposit outcome is checked against the signed terms (detection onl
     expect(after({ type: "error", status: 503, reason: "no session slot" }, { sid: "" }).warnings).toEqual([]);
     expect(after({ type: "closed", reason: "idle" }, { depositMsat: 0 }).warnings).toEqual([]);
   });
+
+  const outcome = (o: Record<string, unknown>) => {
+    const ro = { v: 1, sid: SID, http: "1.1", balance_msats: 1, time: 1, ...o };
+    const json = canonicalJson(ro);
+    return { request_outcome: ro, request_outcome_json: json, request_outcome_sig: bytesToHex(schnorr.sign(sha256(utf8ToBytes(json)), PRIV)) };
+  };
+  const evicted = { type: "closed", reason: "evicted", unused: true };
+  const settledDeposit = { deposit: { msat: 3000, outcome: "released", reason: "request_settled", signed: true } };
+
+  it("a signed charge for an unused connection closed for a newer setup raises no warning", () => {
+    const { warnings, deposit } = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) });
+    expect(deposit).toMatchObject({ outcome: "charged", reason: "evicted", signed: true });
+    expect(warnings).toEqual([]);
+    // A stalled first request on it: released in full, stated, signed.
+    const stalled = after(
+      { ...evicted, ...own({ outcome: "charged", reason: "evicted" }), ...outcome({ n: 1, outcome: "released", reason: "evicted", cost_msats: 0, reserved_msats: 9000 }) },
+      { cur: { n: 1, accepted: true, reservedMsat: 9000, released: false, first: true } },
+    );
+    expect(stalled.warnings).toEqual([]);
+    expect(stalled.events.find((e) => e.ev === "request_outcome")).toMatchObject({ n: 1, outcome: "released", signed: true });
+  });
+
+  it("an eviction charge after a settled request, on another frame, or of a used connection is a warning", () => {
+    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) }, settledDeposit).warnings.join()).toMatch(/receipt of this connection released it/);
+    expect(after({ type: "closed", reason: "idle", ...own({ outcome: "charged", reason: "evicted" }) }).warnings.join()).toMatch(/not `closed` `evicted`/);
+    expect(after({ type: "closed", reason: "evicted", ...own({ outcome: "charged", reason: "unused" }) }).warnings.join()).toMatch(/used connection/);
+  });
+
+  it("the signed request outcome is checked against the open request", () => {
+    const state = { cur: { n: 2, accepted: true, reservedMsat: 9000, released: true, first: false }, ...settledDeposit };
+    const ok = { n: 2, outcome: "charged", reason: "request_received", cost_msats: 9000, reserved_msats: 9000 };
+    expect(after({ type: "error", status: 502, reason: "x", ...outcome(ok) }, state).warnings).toEqual([]);
+    for (const [frame, re] of [
+      [{ type: "error", status: 502, reason: "x" }, /no signed outcome for request 2/],
+      [{ type: "error", status: 502, reason: "x", ...outcome({ ...ok, cost_msats: 9001 }) }, /above the announced reservation/],
+      [{ type: "error", status: 502, reason: "x", ...outcome({ ...ok, n: 3 }) }, /names request 3/],
+      [{ type: "error", status: 502, reason: "x", ...outcome(ok), request_outcome_sig: "00".repeat(64) }, /without a valid signature/],
+    ] as const) {
+      expect(after(frame as Record<string, unknown>, state).warnings.join(), JSON.stringify(frame).slice(0, 80)).toMatch(re);
+    }
+  });
 });
 
 describe("depositProblems", () => {

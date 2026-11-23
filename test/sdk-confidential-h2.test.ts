@@ -588,6 +588,7 @@ class FakeConn {
   dead?: Error;
   failConnect = false;
   failArm = false;
+  evictedUnused = false;
   private endedRes!: (e: Error) => void;
   ended = new Promise<Error>((r) => (this.endedRes = r));
   constructor(framing: "2" | "1.1" = "2") {
@@ -1061,6 +1062,25 @@ describe("http 2: the connection pool", () => {
       pool.configure(quiet, undefined);
       expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
       expect(conns[1]!.dead).toBeUndefined();
+      pool.close();
+    });
+
+    it("a spare the node closed for a newer setup (evicted unused) stops pre-warming for that node", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      await request(pool, "k", "1.1", conns);
+      await tick();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      conns[1]!.evictedUnused = true;
+      conns[1]!.close("connection closed by the node: evicted");
+      await tick();
+      expect(pool.snapshot()).toEqual([]);
+      expect(pool.isFull("https://n/")).toBe(true);
+      await request(pool, "k", "1.1", conns);
+      await tick(40);
+      await request(pool, "k2", "1.1", conns);
+      await tick(40);
+      expect(pool.snapshot()).toEqual([]);
       pool.close();
     });
 
