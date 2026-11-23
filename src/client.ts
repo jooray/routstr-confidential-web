@@ -538,7 +538,13 @@ export class Prewarmer {
     }
     // An armed connection that is still open is reported as such, also while no further one may be armed
     // (its own deposit is reserved, so the available balance can be below what a new one needs).
-    this.status = this.client.armedCount() > 0 && a.why !== "off" ? "armed" : a.ok ? "idle" : a.why;
+    const status: Prewarmer["status"] = this.client.armedCount() > 0 && a.why !== "off" ? "armed" : a.ok ? "idle" : a.why;
+    // A display follows the events, so every change of the status is one (the log lines above carry the
+    // status from before the change).
+    if (status !== this.status) {
+      this.status = status;
+      this.client.emit({ ev: "prewarm", msg: `status: ${status}`, status });
+    }
   }
 
   stop(): void {
