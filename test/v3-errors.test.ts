@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import { ConfidentialConnection } from "../src/connection.js";
+import { ConfidentialConnection, depositProblems } from "../src/connection.js";
 import { canonicalJson } from "../src/canonical.js";
 import { ConnectionDepositError, TwoPcVersionMismatchError, UpgradeRequiredError } from "../src/errors.js";
 import { chatSuffixKeys } from "../src/suffix.js";
@@ -302,5 +302,121 @@ describe("the deposit outcome is checked against the signed terms (detection onl
     expect(warnings).toHaveLength(1);
     expect(String(warnings[0].message)).toMatch(/a receipt of this connection released it/);
     c.close();
+  });
+
+  const SID = "ab".repeat(32);
+  /** A connection past `ready` (it has a sid) with no network side; `frame` is its last frame. */
+  function after(frame: Record<string, unknown>, state: Record<string, unknown> = {}) {
+    const events: Record<string, unknown>[] = [];
+    const c = conn(nodeSocket(() => []), { onEvent: (e: Record<string, unknown>) => events.push(e) }) as any;
+    c.sid = SID;
+    Object.assign(c, state);
+    c.onText(JSON.stringify(frame));
+    const warnings = events.filter((e) => e.ev === "warning").map((e) => String(e.message));
+    const deposit = c.deposit;
+    c.close();
+    return { warnings, deposit, events };
+  }
+  const own = (d: Record<string, unknown>) => signedDeposit({ sid: SID, ...d });
+
+  it("a release, and a signed charge after the client left, raise no warning", () => {
+    for (const frame of [
+      { type: "closed", reason: "upstream_closed", ...own({ outcome: "released", reason: "provider_closed" }) },
+      { type: "error", status: 502, reason: "x", fault: "node", ...own({ outcome: "released", reason: "sidecar_failure" }) },
+      { type: "closed", reason: "client_closed", ...own({ outcome: "charged", reason: "unused" }) },
+      { type: "error", status: 400, reason: "x", ...own({ outcome: "charged", reason: "unused" }) },
+    ]) {
+      const { warnings, deposit } = after(frame);
+      expect(deposit).toMatchObject({ outcome: (frame.deposit as Record<string, unknown>).outcome, signed: true });
+      expect(warnings, JSON.stringify(frame.deposit)).toEqual([]);
+    }
+  });
+
+  it("charged without a valid signature is a warning", () => {
+    const charged = { type: "closed", reason: "x", ...own({ outcome: "charged", reason: "unused" }) };
+    for (const bad of [{ deposit_sig: "00".repeat(64) }, { deposit_sig: undefined }]) {
+      const { warnings, deposit, events } = after({ ...charged, ...bad });
+      expect(deposit).toMatchObject({ outcome: "charged", signed: false });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/unsigned deposit outcome names charged without a valid signature/);
+      expect(events.find((e) => e.ev === "warning")).toMatchObject({ code: "deposit_outcome" });
+    }
+    // A signature over another connection's outcome is none for this one.
+    const other = after({ type: "closed", reason: "x", ...signedDeposit({ sid: "cd".repeat(32), outcome: "charged", reason: "unused" }) });
+    expect(other.warnings.join("\n")).toMatch(/charged without a valid signature/);
+    // An unsigned release costs nothing: recorded as unsigned, not reported.
+    const released = { type: "closed", reason: "x", ...own({ outcome: "released", reason: "not_started" }), deposit_sig: "00".repeat(64) };
+    expect(after(released).warnings).toEqual([]);
+  });
+
+  it("charged though the provider closed the idle connection is a warning", () => {
+    const charged = own({ outcome: "charged", reason: "unused" });
+    const { warnings } = after({ type: "closed", reason: "upstream_closed", ...charged });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/charged though the provider closed the idle connection \(§12\.10 row 5 releases it\)/);
+    // Not after the client's own control frames, nor with a request of ours outstanding or accepted before.
+    for (const [extra, state] of [
+      [{ reason: "upstream_closed", after_client_frames: true }, {}],
+      [{ reason: "upstream_closed" }, { cur: { n: 1 } }],
+      [{ reason: "upstream_closed" }, { requests: 1 }],
+      [{ reason: "idle" }, {}],
+    ] as const) {
+      expect(after({ type: "closed", ...extra, ...charged }, state).warnings, JSON.stringify([extra, state])).toEqual([]);
+    }
+  });
+
+  it("a last frame without an outcome for a deposit the setup reserved is a warning", () => {
+    for (const frame of [
+      { type: "closed", reason: "idle" },
+      { type: "error", status: 500, reason: "x" },
+      { type: "closed", reason: "idle", deposit: null },
+      { type: "closed", reason: "idle", deposit: { msat: 3000, outcome: "kept" } },
+      { type: "closed", reason: "idle", deposit: { msat: 3000, outcome: "released" }, deposit_json: "{" },
+    ]) {
+      const { warnings, deposit, events } = after(frame);
+      expect(deposit).toBeUndefined();
+      expect(warnings, JSON.stringify(frame)).toHaveLength(1);
+      expect(warnings[0]).toMatch(/the node's last frame carries no deposit outcome for a deposit of 3000 msat/);
+      expect(events.find((e) => e.ev === "warning")).toMatchObject({ code: "deposit_outcome" });
+    }
+  });
+
+  it("no outcome is expected once a receipt released the deposit, before ready, or without a deposit", () => {
+    const settled = after(
+      { type: "closed", reason: "idle" },
+      { deposit: { msat: 3000, outcome: "released", reason: "request_settled", signed: true } },
+    );
+    expect(settled.deposit).toMatchObject({ outcome: "released", reason: "request_settled" });
+    expect(settled.warnings).toEqual([]);
+    expect(after({ type: "error", status: 503, reason: "no session slot" }, { sid: "" }).warnings).toEqual([]);
+    expect(after({ type: "closed", reason: "idle" }, { depositMsat: 0 }).warnings).toEqual([]);
+  });
+});
+
+describe("depositProblems", () => {
+  const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+  const charged = { msat: 1000, outcome: "charged", reason: "unused" } as const;
+  const released = { msat: 1000, outcome: "released", reason: "provider_closed" } as const;
+
+  it("honest outcomes have none", () => {
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, released, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "client_closed" }, charged, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed", after_client_frames: true }, charged, true, ctx)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "done" }, undefined, false, { ...ctx, releasedByReceipt: true })).toEqual([]);
+    expect(depositProblems({ type: "error" }, undefined, false, { ...ctx, sid: "" })).toEqual([]);
+    expect(depositProblems({ type: "closed" }, undefined, false, { ...ctx, depositMsat: 0 })).toEqual([]);
+  });
+
+  it("names each deviation", () => {
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, false, ctx)).toEqual(["charged without a valid signature"]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, ctx)).toEqual([
+      "charged though the provider closed the idle connection (§12.10 row 5 releases it)",
+    ]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, { ...ctx, requestOutstanding: true })).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, charged, true, { ...ctx, requestAccepted: true })).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, undefined, false, ctx)).toEqual(["no deposit outcome for a deposit of 1000 msat"]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, releasedByReceipt: true })).toEqual([
+      "charged, though a receipt of this connection released it",
+    ]);
   });
 });
