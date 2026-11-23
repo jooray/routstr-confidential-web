@@ -19,13 +19,13 @@ import {
   validateOfferShape,
   verifyConfidentialOffer,
 } from "../src/offer.js";
-import { makeKey, sign, signedOffer, v3NodeOfferSplitPublic2 } from "./helpers.js";
+import { makeKey, sign, signedOffer, v3NodeOfferCurrent } from "./helpers.js";
 // A signed v3 offer from a scratch node on the real provider (its signing key
 // was throwaway), of the key schedule split-public-1; `prod` is the same
-// offer as a split-public-2 node signs it.
+// offer as a split-public-3 node signs it.
 import prodSp1 from "./fixtures/v3-node-offer.json";
 
-const { offer: prod, pubHex: PROD_PUBKEY } = v3NodeOfferSplitPublic2();
+const { offer: prod, pubHex: PROD_PUBKEY } = v3NodeOfferCurrent();
 const HOSTS = ["api.venice.ai"];
 
 describe("canonical JSON + BIP-340", () => {
@@ -51,7 +51,7 @@ describe("offer verification", () => {
   it("accepts a v3 node's signed offer under its pinned key", () => {
     const o = verifyConfidentialOffer(prod, { pinnedPubkeys: [PROD_PUBKEY], trustedHosts: HOSTS });
     expect(o.v).toBe(3);
-    expect(o.twopc).toBe("split-public-2");
+    expect(o.twopc).toBe("split-public-3");
     expect(o.http).toEqual(["2", "1.1"]);
     expect(o.h2).toMatchObject({ probe_path: "/api/v1/models", kinds: ["chat", "images"] });
     expect(o.connection_deposit_msat).toBeGreaterThan(0);
@@ -108,7 +108,7 @@ describe("offer verification", () => {
     expect(() => verifyConfidentialOffer(prodV2, { pinnedPubkeys: [V2_PUBKEY], trustedHosts: HOSTS })).toThrow(/node_protocol_outdated/);
   });
 
-  it("a v3 node of the key schedule split-public-1 is node_protocol_outdated, an unknown one unsupported", () => {
+  it("a v3 node of an earlier key schedule (split-public-1, split-public-2) is node_protocol_outdated, an unknown one unsupported", () => {
     const e = (() => {
       try {
         verifyConfidentialOffer(prodSp1, { pinnedPubkeys: [prodSp1.notary_pubkey], trustedHosts: HOSTS });
@@ -118,15 +118,15 @@ describe("offer verification", () => {
     })();
     expect(e).toBeInstanceOf(NodeProtocolOutdatedError);
     expect((e as NodeProtocolOutdatedError).nodeVersion).toBe(3);
-    expect((e as Error).message).toMatch(/split-public-1.*split-public-2/);
-    for (const twopc of ["split-public-1", "split-public-3", "split-proven-1"]) {
+    expect((e as Error).message).toMatch(/split-public-1.*split-public-3/);
+    for (const twopc of ["split-public-1", "split-public-2", "split-public-4", "split-proven-1"]) {
       const { offer, pubHex } = signedOffer({ twopc });
       expect(() => verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS })).toThrow(
-        twopc === "split-public-1" ? NodeProtocolOutdatedError : OfferUnsupportedVersionError,
+        twopc === "split-public-1" || twopc === "split-public-2" ? NodeProtocolOutdatedError : OfferUnsupportedVersionError,
       );
     }
-    const { offer, pubHex } = signedOffer({ twopc: "split-public-2" });
-    expect(verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS }).twopc).toBe("split-public-2");
+    const { offer, pubHex } = signedOffer({ twopc: "split-public-3" });
+    expect(verifyConfidentialOffer(offer, { pinnedPubkeys: [pubHex], trustedHosts: HOSTS }).twopc).toBe("split-public-3");
   });
 
   it("rejects an offer whose version lies outside its own min_v..max_v", () => {

@@ -1,5 +1,5 @@
 diff --git a/crypto/twopc/Cargo.toml b/crypto/twopc/Cargo.toml
-index 3026396..9596699 100644
+index 5dc801e..1fc0745 100644
 --- a/crypto/twopc/Cargo.toml
 +++ b/crypto/twopc/Cargo.toml
 @@ -35,13 +35,25 @@ sha2 = { version = "0.10", features = ["compress"] }
@@ -30,7 +30,7 @@ index 3026396..9596699 100644
  cu-crypto = { path = "../cu-crypto" }
  # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
-index d3599ab..e19f911 100644
+index 7e24236..946031a 100644
 --- a/crypto/twopc/src/lib.rs
 +++ b/crypto/twopc/src/lib.rs
 @@ -28,8 +28,8 @@
@@ -92,7 +92,7 @@ index d3599ab..e19f911 100644
  fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
      let mut out = Vec::with_capacity(16 * v.len());
      for b in v {
-@@ -1095,7 +1120,7 @@ impl Party {
+@@ -1107,7 +1132,7 @@ impl Party {
          if *TRACE {
              let c = self.counters.clone();
              let who = if self.role == Role::C { "C" } else { "N" };
@@ -101,7 +101,7 @@ index d3599ab..e19f911 100644
                  let t0 = Instant::now();
                  let mut last = (0, 0, 0);
                  for _ in 0..200 {
-@@ -1110,7 +1135,7 @@ impl Party {
+@@ -1122,7 +1147,7 @@ impl Party {
                          );
                          last = v;
                      }
@@ -110,7 +110,7 @@ index d3599ab..e19f911 100644
                  }
              });
          }
-@@ -1146,7 +1171,7 @@ impl Party {
+@@ -1158,7 +1183,7 @@ impl Party {
          #[allow(unused_mut)]
          let mut rho = random_fp_le(&mut self.rng);
  
@@ -119,7 +119,7 @@ index d3599ab..e19f911 100644
              let hg = gc::HashG::new(&hparams);
              let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
              #[cfg(test)]
-@@ -1205,7 +1230,7 @@ impl Party {
+@@ -1217,7 +1242,7 @@ impl Party {
                      && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
                      && t0.elapsed() < TABLES_MAX_WAIT
                  {
@@ -128,7 +128,7 @@ index d3599ab..e19f911 100644
                  }
              }
          };
-@@ -1385,7 +1410,7 @@ impl Party {
+@@ -1397,7 +1422,7 @@ impl Party {
  
          // Product check, openings, consistency-check material, label-check
          // pairs (CPU, blocking).
@@ -137,7 +137,7 @@ index d3599ab..e19f911 100644
              let hg = gc::HashG::new(&hparams);
              let hg = &hg;
              let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
-@@ -1424,8 +1449,7 @@ impl Party {
+@@ -1436,8 +1461,7 @@ impl Party {
                  (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
              };
              let mut msgs: Vec<Vec<u8>> = Vec::new();
@@ -147,7 +147,7 @@ index d3599ab..e19f911 100644
                  let pw = gc::powers(chi_dv, lay.n_and);
                  let mut acc = (Block::ZERO, Block::ZERO);
                  gc::dvzk_prover_acc(&lay.ands, &lam, &mac, &t_mac, &pw, &mut acc);
-@@ -1471,7 +1495,6 @@ impl Party {
+@@ -1482,7 +1506,6 @@ impl Party {
                  let mut open = from_bits(&bits);
                  open.extend_from_slice(&hd);
                  msgs.push(open);
@@ -155,7 +155,7 @@ index d3599ab..e19f911 100644
              });
              for (r, y) in rows {
                  msgs.push(r);
-@@ -1643,7 +1666,7 @@ impl Party {
+@@ -1654,7 +1677,7 @@ impl Party {
          let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
          let pair_salt = chi(&seed, b"check-salt").to_bytes();
          let rparams = Zeroizing::new(row_params(&seed, &hparams));
@@ -164,7 +164,7 @@ index d3599ab..e19f911 100644
              let nb = lay.base.len();
              let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
              let t_key = &kfix[nb..nb + lay.n_and];
-@@ -2272,7 +2295,7 @@ impl Party {
+@@ -2280,7 +2303,7 @@ impl Party {
          let (hparams, rparams) = (st.hparams.clone(), st.rparams.clone());
          let tables = std::mem::take(&mut st.tables);
          let mut l = std::mem::take(&mut st.l);

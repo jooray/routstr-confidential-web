@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
-description = "Browser (wasm32) build of the client side of the routstr confidential-mode protocol v3: the 2PC handshake (cu-2pc, split-public-2) and the proof channel (cu-prover --channel: π_NK, π_WIN, π_C3S)"
+description = "Browser (wasm32) build of the client side of the routstr confidential-mode protocol v3: the 2PC handshake (cu-2pc, split-public-3) and the proof channel (cu-prover --channel: π_NK, π_WIN, π_C3S)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

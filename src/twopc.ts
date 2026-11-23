@@ -1,5 +1,5 @@
 /**
- * The client side of the protocol v3 two-party key schedule (`split-public-2`,
+ * The client side of the protocol v3 two-party key schedule (`split-public-3`,
  * PROTOCOL-V3.md §4 in routstr-confidential), run by the wasm build of
  * `cu-2pc` and bridged to the node's `twopc` WebSocket
  * (`/v1/confidential/zk?proof=twopc`). Same events and commands as the SDK's
@@ -37,7 +37,7 @@ export interface TwoPcTiming {
 }
 
 /**
- * Bytes the client receives on the 2PC socket of `split-public-2` up to the
+ * Bytes the client receives on the 2PC socket of `split-public-3` up to the
  * joint key share (the version tag, the preprocessing and the key share with
  * the node's proof of knowledge, about 16.4 MB). Shown as the denominator of a progress bar
  * (`twopc_progress`); never used for a check.
@@ -47,7 +47,7 @@ export const TWOPC_DOWNLOAD_BYTES = 16_425_881;
 /** What a 2PC version mismatch means for the user of this page. */
 const TWOPC_MISMATCH_TEXT =
   "twopc_version_mismatch: this page and the node's sidecar run different versions of the two-party key schedule " +
-  "(this page speaks split-public-2); update the app or use another node";
+  "(this page speaks split-public-3); update the app or use another node";
 
 type Waiter = { res: (m: Record<string, unknown>) => void; rej: (e: Error) => void };
 

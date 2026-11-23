@@ -21,9 +21,9 @@ import { costMsat, modelPricing, promptLimit } from "../src/pricing.js";
 import { offerReserveMarginTokens } from "../src/offer.js";
 import { verifyConfidentialOffer } from "../src/offer.js";
 import { fromHex, hex } from "../src/bytes.js";
-import { v3NodeOfferSplitPublic2 } from "./helpers.js";
+import { v3NodeOfferCurrent } from "./helpers.js";
 
-const prod = v3NodeOfferSplitPublic2().offer;
+const prod = v3NodeOfferCurrent().offer;
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);

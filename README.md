@@ -15,7 +15,7 @@ For more depth, there is a programmer's guide, [How routstr confidential mode wo
   inference.
 - `crates/client-wasm`: the client side of protocol v3 compiled to
   `wasm32-unknown-unknown`. It runs the two-party key schedule
-  (`cu-2pc`, `split-public-2`) and the proof channel (`cu-prover --channel`:
+  (`cu-2pc`, `split-public-3`) and the proof channel (`cu-prover --channel`:
   verify π_NK, prove π_WIN and π_C3S), plus the per-proof fallback.
 - The demo app is a separate repository,
   [routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa)
@@ -26,7 +26,7 @@ For more depth, there is a programmer's guide, [How routstr confidential mode wo
 It speaks protocol v3 of
 [routstr-confidential](https://github.com/jooray/routstr-confidential)
 (`PROTOCOL-V3.md` there): a **connection** that carries **requests**, the
-two-party key schedule `split-public-2` (node-only authenticated garbling,
+two-party key schedule `split-public-3` (node-only authenticated garbling,
 16.4 MB of tables down instead of v2's 22.1 MB), and two framings towards the
 provider: `"2"` (HTTP/2, many requests on one connection and one 2PC) and
 `"1.1"` (one request per connection). It needs a v3 node: a v2 node's offer
@@ -39,8 +39,8 @@ v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`
 1. **Offer.** The page fetches `GET /v1/confidential/offer?v=3`. It verifies the
    BIP-340 signature over the signed payload, checks it against the **pinned
    node key**, and accepts only a **trusted provider host**
-   (`api.venice.ai`), `v = 3`, the key schedule `split-public-2` (a node that offers the earlier
-   `split-public-1` is `node_protocol_outdated`), the framings
+   (`api.venice.ai`), `v = 3`, the key schedule `split-public-3` (a node that offers the earlier
+   `split-public-2` or `split-public-1` is `node_protocol_outdated`), the framings
    it knows (`http`, the operator's order) and an `h2` block in range. Prices,
    fees, the connection deposit and the head templates come from the signed
    bytes only.
@@ -53,7 +53,7 @@ v3 node and sidecar on the real provider (`api.venice.ai`; `scripts/live-v3.mjs`
    a request yet). A deposit above `maxConnectionDepositMsat` (default
    100 sats) is refused before anything is sent.
 4. **2PC.** A Web Worker runs the wasm 2PC with the node over
-   `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-2`
+   `/v1/confidential/zk?proof=twopc` (version tag `routstr-2pc/split-public-3`
    first; another tag is `twopc_version_mismatch`): OT preprocessing (about
    1.1 MB up, 16.4 MB down) and the joint P-256 key share (the node proves
    knowledge of its scalar before the page opens its commitment). The proof channel's

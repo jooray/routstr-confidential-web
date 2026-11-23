@@ -238,9 +238,9 @@ async fn input_backlog_is_bounded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn twopc_version_mismatch_is_reported() {
     // A peer whose first bytes are another version tag (a v2 node sends no
-    // tag at all and starts with its own protocol bytes; a node of the
-    // previous key schedule sends `split-public-1`).
-    for tag in [&b"routstr-2pc/v2-other\n"[..], &b"routstr-2pc/split-public-1\n"[..]] {
+    // tag at all and starts with its own protocol bytes; a node of an
+    // earlier key schedule sends `split-public-2` or `split-public-1`).
+    for tag in [&b"routstr-2pc/v2-other\n"[..], &b"routstr-2pc/split-public-2\n"[..], &b"routstr-2pc/split-public-1\n"[..]] {
         let (out_tx, mut out_rx) = unbounded::<Frame>();
         let input = driver::spawn_twopc(out_tx);
         input.unbounded_send((0, tag.to_vec())).unwrap();

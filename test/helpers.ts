@@ -19,7 +19,7 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
   const { priv, pubHex } = makeKey(keyFill);
   const offer: Record<string, unknown> = {
     v: 3,
-    twopc: "split-public-2",
+    twopc: "split-public-3",
     upstream_host: "api.venice.ai",
     ws: "wss://node.example/v1/confidential/ws",
     notary_pubkey: pubHex,
@@ -43,13 +43,13 @@ export function signedOffer(overrides: Record<string, unknown> = {}, keyFill = 7
 
 /**
  * The scratch node's signed v3 offer (`fixtures/v3-node-offer.json`, which
- * names the key schedule `split-public-1`) as a node of `split-public-2`
+ * names the key schedule `split-public-1`) as a node of `split-public-3`
  * signs it: the same payload with `twopc` replaced, signed again under a test
  * key (the node's own key was throwaway).
  */
-export function v3NodeOfferSplitPublic2(keyFill = 11) {
+export function v3NodeOfferCurrent(keyFill = 11) {
   const { priv, pubHex } = makeKey(keyFill);
-  const signed = { ...JSON.parse(v3NodeOffer.sig_payload), twopc: "split-public-2", notary_pubkey: pubHex };
+  const signed = { ...JSON.parse(v3NodeOffer.sig_payload), twopc: "split-public-3", notary_pubkey: pubHex };
   const payload = canonicalJson(signed);
   return { offer: { ...signed, sig_payload: payload, sig: sign(payload, priv) } as typeof v3NodeOffer, pubHex };
 }

@@ -3,19 +3,19 @@
 `routstr-confidential-wasm32.patch` makes the `twopc` and `zkbench` crates
 build and run on `wasm32-unknown-unknown` (single-threaded, browser event
 loop) without changing their behaviour natively. It applies to
-`jooray/routstr-confidential` at 401d21f (branch `main`, protocol v3
-with the key schedule `split-public-2`; the base is recorded in
+`jooray/routstr-confidential` at bda2ed9 (branch `main`, protocol v3
+with the key schedule `split-public-3`; the base is recorded in
 `crates/vendor/UPSTREAM`), and `git apply` of it there reproduces
 `crates/vendor/twopc` byte for byte:
 
 ```bash
-cd routstr-confidential && git checkout 401d21f && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
+cd routstr-confidential && git checkout bda2ed9 && git apply -p1 ../routstr-confidential-web/patches/routstr-confidential-wasm32.patch
 cargo test --release -p twopc -p zkbench        # unchanged natively
 cargo check --target wasm32-unknown-unknown -p twopc -p zkbench   # needs the getrandom cfg below
 ```
 
-All three crates are vendored from 401d21f: `cu-crypto` is a plain copy (it
-needs no change), and `twopc` and `zkbench` are 401d21f's with this patch (the
+All three crates are vendored from bda2ed9: `cu-crypto` is a plain copy (it
+needs no change), and `twopc` and `zkbench` are bda2ed9's with this patch (the
 mpz2 pin `eaca5f9` is upstream's). There are no other differences.
 `node scripts/vendor-check.mjs <routstr-confidential checkout>` (`npm run
 check:vendor` with `CU_UPSTREAM_DIR`) checks that, byte for byte, and CI runs it

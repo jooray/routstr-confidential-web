@@ -1,4 +1,4 @@
-//! Two-party TLS 1.3 key schedule, version `split-public-2` (protocol v3,
+//! Two-party TLS 1.3 key schedule, version `split-public-3` (protocol v3,
 //! `PROTOCOL-V3.md` §4; `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`).
 //! Only N garbles (authenticated garbling with garbler-held masks and an
 //! IT-MAC consistency check), and the garbled circuit holds only the part of
@@ -160,7 +160,7 @@ pub enum Error {
     /// version of the two-party key schedule (or another protocol). The
     /// field is what was read up to the first differing byte, in hex. The
     /// message starts with the error code `twopc_version_mismatch`.
-    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-2, the peer's first bytes were 0x{0}")]
+    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-3, the peer's first bytes were 0x{0}")]
     VersionMismatch(String),
 }
 
@@ -254,7 +254,7 @@ pub struct CircuitStats {
 pub fn circuit_stats() -> CircuitStats {
     let sp = &*circuits::SPLIT;
     CircuitStats {
-        name: "split-public-2",
+        name: "split-public-3",
         and_gates: sp.circ.and_count(),
         xor_gates: sp.circ.xor_count(),
         compressions: sp.compressions,
@@ -464,7 +464,7 @@ const N_CH: usize = 6;
 /// The version tag: the first bytes each party writes on the transport,
 /// before any multiplexer frame. A peer that reads anything else fails with
 /// [`Error::VersionMismatch`].
-pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-2\n";
+pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-3\n";
 
 /// N streams the first part of the tables (stages A1–A3) once this many
 /// MAC-COT bytes from C arrived (C has N's OT bootstrap messages and is
@@ -732,6 +732,18 @@ fn pair_hash(salt: &[u8; 16], o: usize, p: bool, x: Block) -> [u8; 16] {
         .finalize()
         .into();
     h[..16].try_into().unwrap()
+}
+
+/// The hash that ends stage `s`'s report: over the tag, the stage as one
+/// byte, then the 16 bytes of each reported label, in report order.
+fn report_hasher(s: usize) -> Sha256 {
+    Sha256::new().chain_update(TAG_OUT).chain_update([s as u8])
+}
+
+/// The hash that ends the openings message: over the tag, then the 16 bytes
+/// of the MAC of each opened mask, in the order the bits are sent.
+fn open_hasher() -> Sha256 {
+    Sha256::new().chain_update(TAG_OPEN)
 }
 
 /// The row parameters of the check-row hash ([`gc::RowHash`]): one SHA-256
@@ -1465,8 +1477,7 @@ impl Party {
                 // Openings: C's input wires, the digest input wires, every
                 // output C decodes; one MAC hash.
                 let mut bits = Vec::new();
-                let mut h = Sha256::new();
-                h.update(TAG_OPEN);
+                let mut h = open_hasher();
                 #[allow(unused_variables)]
                 for (j, &w) in lay.open_in.iter().enumerate() {
                     #[cfg(test)]
@@ -1700,8 +1711,7 @@ impl Party {
 
         // Openings.
         let mut bits = unpack(&open[..open.len() - 32], n_open).into_iter();
-        let mut h = Sha256::new();
-        h.update(TAG_OPEN);
+        let mut h = open_hasher();
         let mut take = |w: usize| -> bool {
             let b = bits.next().unwrap_or(false);
             h.update((key[w] ^ sel(b, delta_b)).as_bytes());
@@ -2069,9 +2079,7 @@ impl Party {
         if st.next != s {
             return Err(Error::State("stage order"));
         }
-        let mut h = Sha256::new();
-        h.update(TAG_OUT);
-        h.update([s as u8]);
+        let mut h = report_hasher(s);
         let mut off = 1;
         let mut parsed = Vec::new();
         for &gi in &groups {
@@ -2315,9 +2323,7 @@ impl Party {
         let salt_b = st.pair_salt;
         let mut ok_pair = true;
         let mut body = vec![1u8];
-        let mut h = Sha256::new();
-        h.update(TAG_OUT);
-        h.update([s as u8]);
+        let mut h = report_hasher(s);
         let mut decoded = Vec::new();
         #[allow(unused_mut, unused_variables)]
         let mut flip_at: Option<usize> = None;

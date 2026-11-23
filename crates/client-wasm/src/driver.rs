@@ -417,7 +417,7 @@ pub fn spawn_prover_job(job: &[u8], out: Out) -> Input {
 /// and the digest of the source files (`node scripts/source-digest.mjs`).
 pub fn build_info() -> String {
     format!(
-        "client-wasm {} (protocol v3, twopc split-public-2; routstr-confidential@{}, mpz2@{}, src:{})",
+        "client-wasm {} (protocol v3, twopc split-public-3; routstr-confidential@{}, mpz2@{}, src:{})",
         env!("CARGO_PKG_VERSION"),
         env!("CU_UPSTREAM"),
         env!("CU_MPZ2"),

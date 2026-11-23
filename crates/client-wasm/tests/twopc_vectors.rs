@@ -1,4 +1,4 @@
-//! The shared vectors of the two-party key schedule `split-public-2`
+//! The shared vectors of the two-party key schedule `split-public-3`
 //! (`test/fixtures/twopc-hash-vectors.json`, a byte-identical copy of
 //! `crypto/conformance/twopc-hash-vectors.json` in routstr-confidential),
 //! recomputed by the vendored `twopc` as this build compiles it: natively
