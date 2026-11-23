@@ -400,22 +400,23 @@ describe("the deposit outcome is checked against the signed terms (detection onl
   const evicted = { type: "closed", reason: "evicted", unused: true };
   const settledDeposit = { deposit: { msat: 3000, outcome: "released", reason: "request_settled", signed: true } };
 
-  it("a signed charge for an unused connection closed for a newer setup raises no warning", () => {
-    const { warnings, deposit } = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) });
-    expect(deposit).toMatchObject({ outcome: "charged", reason: "evicted", signed: true });
+  const hoard = { evicted: { unused_at_address: 5, charge_from: 5 } };
+  const lone = { evicted: { unused_at_address: 1, charge_from: 5 } };
+
+  it("an unused connection closed for a newer setup: charged when its address hoarded, released for a lone spare, both without warning", () => {
+    const { warnings, deposit } = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...hoard }) });
+    expect(deposit).toMatchObject({ outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5, chargeFrom: 5 } });
     expect(warnings).toEqual([]);
-    // A stalled first request on it: released in full, stated, signed.
-    const stalled = after(
-      { ...evicted, ...own({ outcome: "charged", reason: "evicted" }), ...outcome({ n: 1, outcome: "released", reason: "evicted", cost_msats: 0, reserved_msats: 9000 }) },
-      { cur: { n: 1, accepted: true, reservedMsat: 9000, released: false, first: true } },
-    );
-    expect(stalled.warnings).toEqual([]);
-    expect(stalled.events.find((e) => e.ev === "request_outcome")).toMatchObject({ n: 1, outcome: "released", signed: true });
+    const spare = after({ ...evicted, ...own({ outcome: "released", reason: "evicted_released", ...lone }) });
+    expect(spare.deposit).toMatchObject({ outcome: "released", reason: "evicted_released" });
+    expect(spare.warnings).toEqual([]);
   });
 
-  it("an eviction charge after a settled request, on another frame, or of a used connection is a warning", () => {
-    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) }, settledDeposit).warnings.join()).toMatch(/receipt of this connection released it/);
-    expect(after({ type: "closed", reason: "idle", ...own({ outcome: "charged", reason: "evicted" }) }).warnings.join()).toMatch(/not `closed` `evicted`/);
+  it("an eviction charge for a lone spare, without the count, after a settled request, on another frame, or of a used connection is a warning", () => {
+    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...lone }) }).warnings.join()).toMatch(/below the 5 that charge/);
+    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) }).warnings.join()).toMatch(/without the signed count/);
+    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...hoard }) }, settledDeposit).warnings.join()).toMatch(/receipt of this connection released it/);
+    expect(after({ type: "closed", reason: "idle", ...own({ outcome: "charged", reason: "evicted", ...hoard }) }).warnings.join()).toMatch(/not `closed` `evicted`/);
     expect(after({ type: "closed", reason: "evicted", ...own({ outcome: "charged", reason: "unused" }) }).warnings.join()).toMatch(/used connection/);
   });
 
