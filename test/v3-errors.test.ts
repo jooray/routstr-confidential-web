@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import { ConfidentialConnection, depositProblems } from "../src/connection.js";
+import { ConfidentialConnection, depositProblems, missingLastFrameProblem } from "../src/connection.js";
 import { canonicalJson } from "../src/canonical.js";
 import { ConnectionDepositError, TwoPcVersionMismatchError, UpgradeRequiredError } from "../src/errors.js";
 import { chatSuffixKeys } from "../src/suffix.js";
@@ -432,6 +432,33 @@ describe("the deposit outcome is checked against the signed terms (detection onl
     ] as const) {
       expect(after(frame as Record<string, unknown>, state).warnings.join(), JSON.stringify(frame).slice(0, 80)).toMatch(re);
     }
+  });
+});
+
+describe("missingLastFrameProblem", () => {
+  const base = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false };
+  it("names what the node holds when its last frame never came", () => {
+    expect(missingLastFrameProblem(base)).toMatch(/no signed outcome for the deposit of 1000 msat/);
+    expect(missingLastFrameProblem({ ...base, releasedByReceipt: true, openAccepted: 3 })).toMatch(
+      /no signed outcome for the reservation of request 3/,
+    );
+    expect(missingLastFrameProblem({ ...base, openAccepted: 1 })).toMatch(/deposit of 1000 msat and the reservation of request 1/);
+  });
+  it("is silent when nothing is held", () => {
+    expect(missingLastFrameProblem({ ...base, releasedByReceipt: true })).toBeNull();
+    expect(missingLastFrameProblem({ ...base, depositMsat: 0 })).toBeNull();
+    expect(missingLastFrameProblem({ ...base, sid: "", openAccepted: 1 })).toBeNull();
+  });
+});
+
+describe("a threshold of 1 for the eviction charge", () => {
+  it("is a deviation: a lone unused connection is never charged for its eviction", () => {
+    const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+    const frame = { type: "closed", reason: "evicted", unused: true };
+    const out = (n: number, k: number) =>
+      ({ msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: n, charge_from: k } }) as const;
+    expect(depositProblems(frame, out(1, 1), true, ctx).join()).toMatch(/threshold of 1/);
+    expect(depositProblems(frame, out(2, 2), true, ctx)).toEqual([]);
   });
 });
 

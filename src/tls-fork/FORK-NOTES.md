@@ -88,11 +88,11 @@ padding in this library). An `http: 2` session (`connection.ts`) sends exactly o
 HTTP/2 frame per record, up to the full 2^14 bytes of content, and must know
 each record's plaintext to check the node's π_WIN windows against it.
 
-## Protocol v3 hook: `destroySecrets` (SDK and this library)
+## Protocol v3 hook: `destroySecrets`
 
-Marked `// FORK PATCH (v3, SDK and this library)` (`lib/make-tls-client.js`,
-typed in `lib/make-tls-client.d.ts`), mirrored from the SDK's fork. Not in the
-reference client's copy (`crypto/client/vendor/tls`). `destroySecrets()`
+Marked `// FORK PATCH (v3)` (`lib/make-tls-client.js`,
+typed in `lib/make-tls-client.d.ts`), mirrored from the SDK's fork; the
+reference client's copy (`crypto/client/vendor/tls`) has it too. `destroySecrets()`
 zero-fills the traffic secrets and IVs the client holds (the current `keys`
 and the handshake secrets: `clientSecret`, `serverSecret`, `masterSecret`,
 `clientIv`, `serverIv`, and `earlySecret`), drops every key reference (the
@@ -103,7 +103,7 @@ Best effort only: JavaScript cannot erase copies the runtime or the caller
 made (WebCrypto's key material, garbage-collected buffers, the hex strings
 exchanged with the wasm 2PC and prover).
 
-## Security patches (TLS-01 … TLS-19)
+## Security patches (TLS-01 … TLS-20)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -266,8 +266,22 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
 
   Left as it is: a warning-level alert under the handshake key is logged
   and ignored (RFC 8446 §6 treats it as fatal), and the compatibility
-  ChangeCipherSpec is accepted with any body and at any time. Neither is in
-  the transcript.
+  ChangeCipherSpec is accepted with any body before the handshake completes.
+  Neither is in the transcript.
+- **TLS-20, one encoding of an RSA signature; the ALPN report; a late
+  ChangeCipherSpec** (`utils/parse-certificate.js` `verifyCertificateSignature`;
+  `make-tls-client.js`). An RSA signature must have exactly the length of the
+  modulus (RFC 8017 §8.1.2). WebCrypto on OpenSSL (Node, Bun) also verifies a
+  signature whose leading zero bytes were dropped; one RSA-PSS signature in
+  256 begins with a zero byte, so for that share of a provider's handshakes
+  the node had a second accepted CertificateVerify, and with it a second
+  transcript. That stayed inside the factor of two the soundness bound
+  already allows for ECDSA (`(r, s)` and `(r, n − s)`), so it is conformance
+  with the stated "one form for RSA", not a closed attack. BoringSSL
+  (Chromium) refuses the short form by itself. `getMetadata().selectedAlpn`
+  is what the server selected, or undefined (it was the first protocol
+  offered when the server selected none; no caller relied on it). A
+  ChangeCipherSpec after the handshake is refused (RFC 8446 §5).
 
 Not done: revocation. Neither this client nor the sidecar (rustls/webpki
 with no CRLs) checks CRLs or OCSP; a revoked but unexpired provider
