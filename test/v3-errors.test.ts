@@ -306,11 +306,12 @@ describe("the deposit outcome is checked against the signed terms (detection onl
 
   const SID = "ab".repeat(32);
   /** A connection past `ready` (it has a sid) with no network side; `frame` is its last frame. */
-  function after(frame: Record<string, unknown>, state: Record<string, unknown> = {}) {
+  function after(frame: Record<string, unknown>, state: Record<string, unknown> = {}, offer?: Record<string, unknown>) {
     const events: Record<string, unknown>[] = [];
     const c = conn(nodeSocket(() => []), { onEvent: (e: Record<string, unknown>) => events.push(e) }) as any;
     c.sid = SID;
     Object.assign(c, state);
+    if (offer) c.offer = { ...c.offer, ...offer };
     c.onText(JSON.stringify(frame));
     const warnings = events.filter((e) => e.ev === "warning").map((e) => String(e.message));
     const deposit = c.deposit;
@@ -400,20 +401,42 @@ describe("the deposit outcome is checked against the signed terms (detection onl
   const evicted = { type: "closed", reason: "evicted", unused: true };
   const settledDeposit = { deposit: { msat: 3000, outcome: "released", reason: "request_settled", signed: true } };
 
-  const hoard = { evicted: { unused_at_address: 5, charge_from: 5 } };
-  const lone = { evicted: { unused_at_address: 1, charge_from: 5 } };
+  const hoard = { evicted: { unused_at_address: 5 } };
+  const lone = { evicted: { unused_at_address: 1 } };
 
-  it("an unused connection closed for a newer setup: charged when its address hoarded, released for a lone spare, both without warning", () => {
+  it("an unused connection closed for a newer setup is charged, also a lone spare, without warning", () => {
     const { warnings, deposit } = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...hoard }) });
-    expect(deposit).toMatchObject({ outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5, chargeFrom: 5 } });
+    expect(deposit).toMatchObject({ outcome: "charged", reason: "evicted", signed: true, evicted: { unusedAtAddress: 5 } });
     expect(warnings).toEqual([]);
-    const spare = after({ ...evicted, ...own({ outcome: "released", reason: "evicted_released", ...lone }) });
+    const spare = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...lone }) });
+    expect(spare.deposit).toMatchObject({ outcome: "charged", reason: "evicted", evicted: { unusedAtAddress: 1 } });
+    expect(spare.warnings).toEqual([]);
+  });
+
+  it("an older node's eviction fields raise no warning", () => {
+    const old = after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", evicted: { unused_at_address: 5, charge_from: 5 } }) });
+    expect(old.warnings).toEqual([]);
+    const spare = after({ ...evicted, ...own({ outcome: "released", reason: "evicted_released", evicted: { unused_at_address: 1, charge_from: 5 } }) });
     expect(spare.deposit).toMatchObject({ outcome: "released", reason: "evicted_released" });
     expect(spare.warnings).toEqual([]);
   });
 
-  it("an eviction charge for a lone spare, without the count, after a settled request, on another frame, or of a used connection is a warning", () => {
-    expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...lone }) }).warnings.join()).toMatch(/below the 5 that charge/);
+  it("an eviction charge before the signed minimum age, or with a request in flight, is a warning", () => {
+    const young = { tSetup: Date.now() - 5000 };
+    const w = (state: Record<string, unknown>, offer?: Record<string, unknown>) => {
+      const s = { ...state } as Record<string, unknown>;
+      return after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...lone }) }, s, offer).warnings.join();
+    };
+    expect(w(young, { evict_unused_after_s: 60 })).toMatch(/before the signed offer's evict_unused_after_s of 60 s/);
+    expect(w({ tSetup: Date.now() - 61_000 }, { evict_unused_after_s: 60 })).toBe("");
+    expect(w({ tSetup: Date.now() - 61_000 }, { evict_unused_after_s: 0 })).toMatch(/never evicted/);
+    expect(w({ framing: "2", cur: { n: 1, accepted: true, released: false, first: true } })).toMatch(/had accepted a request/);
+    expect(w({ framing: "1.1", helloSent: true, cur: { n: 1, accepted: true, released: false, first: true } })).toMatch(/had accepted a request/);
+    // Framing "1.1": a request 1 without its ClientHello goes with the connection.
+    expect(w({ framing: "1.1", helloSent: false, cur: { n: 1, accepted: true, released: false, first: true } })).not.toMatch(/had accepted a request/);
+  });
+
+  it("an eviction charge without the count, after a settled request, on another frame, or of a used connection is a warning", () => {
     expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted" }) }).warnings.join()).toMatch(/without the signed count/);
     expect(after({ ...evicted, ...own({ outcome: "charged", reason: "evicted", ...hoard }) }, settledDeposit).warnings.join()).toMatch(/receipt of this connection released it/);
     expect(after({ type: "closed", reason: "idle", ...own({ outcome: "charged", reason: "evicted", ...hoard }) }).warnings.join()).toMatch(/not `closed` `evicted`/);
@@ -451,14 +474,17 @@ describe("missingLastFrameProblem", () => {
   });
 });
 
-describe("a threshold of 1 for the eviction charge", () => {
-  it("is a deviation: a lone unused connection is never charged for its eviction", () => {
-    const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
-    const frame = { type: "closed", reason: "evicted", unused: true };
-    const out = (n: number, k: number) =>
-      ({ msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: n, charge_from: k } }) as const;
-    expect(depositProblems(frame, out(1, 1), true, ctx).join()).toMatch(/threshold of 1/);
-    expect(depositProblems(frame, out(2, 2), true, ctx)).toEqual([]);
+describe("the eviction of an unused connection", () => {
+  const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
+  const frame = { type: "closed", reason: "evicted", unused: true };
+  const out = { msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 1 } } as const;
+  it("is always charged, also for a lone spare", () => {
+    expect(depositProblems(frame, out, true, ctx)).toEqual([]);
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 60 })).toEqual([]);
+  });
+  it("is a deviation before the signed minimum age, or when the offer says never", () => {
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 59 }).join()).toMatch(/before the signed offer/);
+    expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 0, ageS: 900 }).join()).toMatch(/never evicted/);
   });
 });
 
@@ -487,5 +513,70 @@ describe("depositProblems", () => {
     expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, releasedByReceipt: true })).toEqual([
       "charged, though a receipt of this connection released it",
     ]);
+  });
+});
+
+describe("the node's last frame never came", () => {
+  class Ws {
+    static last: Ws;
+    binaryType = "arraybuffer";
+    onopen?: () => void;
+    onmessage?: (ev: { data: string }) => void;
+    onclose?: (ev: { reason?: string }) => void;
+    onerror?: () => void;
+    constructor() {
+      Ws.last = this;
+    }
+    send() {}
+    close() {}
+  }
+  it("is a warning after a socket error or a malformed frame, not after the client's own close", async () => {
+    for (const cause of ["error", "malformed", "client"] as const) {
+      const events: Record<string, unknown>[] = [];
+      const c = conn(Ws, { onEvent: (e: Record<string, unknown>) => events.push(e) }) as any;
+      void c.openSocket().catch(() => {});
+      c.sid = "ab".repeat(32);
+      c.depositMsat = 3000;
+      if (cause === "error") Ws.last.onerror?.();
+      else if (cause === "malformed") Ws.last.onmessage?.({ data: "x" });
+      else c.close();
+      Ws.last.onclose?.({});
+      const warnings = events.filter((e) => e.ev === "warning").map((e) => String(e.message)).join("\n");
+      if (cause === "client") expect(warnings).not.toMatch(/without the node's last frame/);
+      else expect(warnings, cause).toMatch(/without the node's last frame: no signed outcome for the deposit of 3000 msat/);
+    }
+  });
+});
+
+describe("SETTINGS acknowledgements", () => {
+  const settings = { type: 0x4, flags: 0, stream: 0, payload: new Uint8Array(0), off: 0 };
+  const ping = { type: 0x6, flags: 0, stream: 0, payload: new Uint8Array(8), off: 0 };
+  const spy = (c: any) => {
+    const sent: string[] = [];
+    c.sendCtl = (name: string) => {
+      sent.push(name);
+      return Promise.resolve(0);
+    };
+    return sent;
+  };
+  it("the first waits for the next request, a later one goes at once while idle", () => {
+    const c = conn(nodeSocket(() => [])) as any;
+    const sent = spy(c);
+    c.onFrame(settings);
+    expect(sent).toEqual([]);
+    c.onFrame(settings);
+    expect(sent).toEqual(["settings_ack", "settings_ack"]);
+  });
+  it("inside a request it waits for body_released; a PING is answered at once", () => {
+    const c = conn(nodeSocket(() => [])) as any;
+    const sent = spy(c);
+    c.settingsAckSent = true;
+    c.requestOpen = true;
+    c.cur = { n: 1, stream: 3, released: false, accepted: true, first: true, dataLens: [] };
+    c.onFrame(settings);
+    c.onFrame(ping);
+    expect(sent).toEqual(["ping_ack"]);
+    c.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    expect(sent).toEqual(["ping_ack", "settings_ack"]);
   });
 });
