@@ -536,7 +536,9 @@ export class Prewarmer {
       this.client.configurePrewarm(a.ok ? this.cfg : undefined);
       this.log(a.ok ? "pre-warming allowed" : `pre-warming paused: ${reason ?? a.reason}`);
     }
-    this.status = a.ok ? (this.client.armedCount() > 0 ? "armed" : "idle") : a.why;
+    // An armed connection that is still open is reported as such, also while no further one may be armed
+    // (its own deposit is reserved, so the available balance can be below what a new one needs).
+    this.status = this.client.armedCount() > 0 && a.why !== "off" ? "armed" : a.ok ? "idle" : a.why;
   }
 
   stop(): void {
