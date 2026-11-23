@@ -30,7 +30,7 @@ index 5dc801e..1fc0745 100644
  cu-crypto = { path = "../cu-crypto" }
  # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 diff --git a/crypto/twopc/src/lib.rs b/crypto/twopc/src/lib.rs
-index 7e24236..946031a 100644
+index 190e87a..bc30ea1 100644
 --- a/crypto/twopc/src/lib.rs
 +++ b/crypto/twopc/src/lib.rs
 @@ -28,8 +28,8 @@
@@ -62,7 +62,7 @@ index 7e24236..946031a 100644
  
  use futures::{AsyncRead, AsyncWrite};
  use mpz_common::{Context, Flush};
-@@ -649,6 +651,29 @@ fn os_rng() -> StdRng {
+@@ -654,6 +656,29 @@ fn os_rng() -> StdRng {
      r
  }
  
@@ -92,7 +92,7 @@ index 7e24236..946031a 100644
  fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
      let mut out = Vec::with_capacity(16 * v.len());
      for b in v {
-@@ -1107,7 +1132,7 @@ impl Party {
+@@ -1114,7 +1139,7 @@ impl Party {
          if *TRACE {
              let c = self.counters.clone();
              let who = if self.role == Role::C { "C" } else { "N" };
@@ -101,7 +101,7 @@ index 7e24236..946031a 100644
                  let t0 = Instant::now();
                  let mut last = (0, 0, 0);
                  for _ in 0..200 {
-@@ -1122,7 +1147,7 @@ impl Party {
+@@ -1129,7 +1154,7 @@ impl Party {
                          );
                          last = v;
                      }
@@ -110,25 +110,34 @@ index 7e24236..946031a 100644
                  }
              });
          }
-@@ -1158,7 +1183,7 @@ impl Party {
-         #[allow(unused_mut)]
-         let mut rho = random_fp_le(&mut self.rng);
- 
--        let garble = tokio::task::spawn_blocking(move || {
-+        let garble = rt::spawn_blocking(move || {
-             let hg = gc::HashG::new(&hparams);
-             let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
-             #[cfg(test)]
-@@ -1217,7 +1242,7 @@ impl Party {
-                     && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
-                     && t0.elapsed() < TABLES_MAX_WAIT
-                 {
+@@ -1235,7 +1260,7 @@ impl Party {
+             let mac_done = mac_done.clone();
+             async move {
+                 while counters.ch_recv(CH_COTB) < threshold && !mac_done.load(std::sync::atomic::Ordering::Relaxed) {
 -                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 +                    rt::sleep(std::time::Duration::from_millis(2)).await;
                  }
              }
          };
-@@ -1397,7 +1422,7 @@ impl Party {
+@@ -1244,7 +1269,7 @@ impl Party {
+             let counters = counters.clone();
+             async move {
+                 while counters.ch_recv(CH_COTA) + counters.ch_recv(CH_COTB) + counters.ch_recv(CH_SC) == 0 {
+-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
++                    rt::sleep(std::time::Duration::from_millis(2)).await;
+                 }
+             }
+         };
+@@ -1252,7 +1277,7 @@ impl Party {
+             let in_salt: [u8; 16] = c2n.recv_exact(16).await?.try_into().expect("16 bytes");
+             ot_started.await;
+             #[allow(unused_mut)]
+-            let (k, mut tables) = tokio::task::spawn_blocking(garble_job).await.map_err(perr("garbling task"))?;
++            let (k, mut tables) = rt::spawn_blocking(garble_job).await.map_err(perr("garbling task"))?;
+             #[cfg(test)]
+             if let Cheat::CorruptGate(s) | Cheat::CorruptControlBits(s) = cheat {
+                 let r = lay.shapes[s].ands.clone();
+@@ -1422,7 +1447,7 @@ impl Party {
  
          // Product check, openings, consistency-check material, label-check
          // pairs (CPU, blocking).
@@ -137,7 +146,7 @@ index 7e24236..946031a 100644
              let hg = gc::HashG::new(&hparams);
              let hg = &hg;
              let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
-@@ -1436,8 +1461,7 @@ impl Party {
+@@ -1461,8 +1486,7 @@ impl Party {
                  (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
              };
              let mut msgs: Vec<Vec<u8>> = Vec::new();
@@ -147,7 +156,7 @@ index 7e24236..946031a 100644
                  let pw = gc::powers(chi_dv, lay.n_and);
                  let mut acc = (Block::ZERO, Block::ZERO);
                  gc::dvzk_prover_acc(&lay.ands, &lam, &mac, &t_mac, &pw, &mut acc);
-@@ -1482,7 +1506,6 @@ impl Party {
+@@ -1507,7 +1531,6 @@ impl Party {
                  let mut open = from_bits(&bits);
                  open.extend_from_slice(&hd);
                  msgs.push(open);
@@ -155,7 +164,7 @@ index 7e24236..946031a 100644
              });
              for (r, y) in rows {
                  msgs.push(r);
-@@ -1654,7 +1677,7 @@ impl Party {
+@@ -1679,7 +1702,7 @@ impl Party {
          let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
          let pair_salt = chi(&seed, b"check-salt").to_bytes();
          let rparams = Zeroizing::new(row_params(&seed, &hparams));
@@ -164,7 +173,7 @@ index 7e24236..946031a 100644
              let nb = lay.base.len();
              let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
              let t_key = &kfix[nb..nb + lay.n_and];
-@@ -2280,7 +2303,7 @@ impl Party {
+@@ -2305,7 +2328,7 @@ impl Party {
          let (hparams, rparams) = (st.hparams.clone(), st.rparams.clone());
          let tables = std::mem::take(&mut st.tables);
          let mut l = std::mem::take(&mut st.l);
