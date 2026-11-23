@@ -313,15 +313,29 @@ export function checkRefusedReceipt(
 }
 
 /**
- * Every receipt that names `reserved_msats` must name the reservation the node
- * announced in `request_ok` (§12.4), when it announced one. Throws.
+ * A receipt of a request for which `request_ok` announced a reservation: it
+ * names exactly that reservation, and it charges at most that (PROTOCOL-V3.md
+ * §12.4, §12.10: the reservation is the most any settlement of the request
+ * costs, the session fee included). A node that announced none (a sidecar
+ * without a node) is not held to one. Throws.
  */
 export function checkAnnouncedReservation(receipt: ConfidentialReceipt, announcedMsat: number | undefined): void {
+  if (announcedMsat === undefined) return;
   const reserved = (receipt as { reserved_msats?: unknown }).reserved_msats;
-  if (announcedMsat === undefined || reserved === undefined) return;
   if (reserved !== announcedMsat) {
     throw new ReceiptVerificationError(
-      `receipt names a reservation of ${String(reserved).slice(0, 32)} msats, the node announced ${announcedMsat} msats in request_ok`,
+      reserved === undefined
+        ? `receipt names no reservation, the node announced ${announcedMsat} msats in request_ok`
+        : `receipt names a reservation of ${String(reserved).slice(0, 32)} msats, the node announced ${announcedMsat} msats in request_ok`,
+    );
+  }
+  const cost = receipt.cost_msats;
+  if (!isMsatAmount(cost)) {
+    throw new ReceiptVerificationError(`receipt cost ${String(cost).slice(0, 32)} is not a valid amount`);
+  }
+  if (cost > announcedMsat) {
+    throw new ReceiptVerificationError(
+      `node charged ${cost} msats, more than the ${announcedMsat} msats the node announced as the request's reservation`,
     );
   }
 }

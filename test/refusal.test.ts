@@ -128,7 +128,8 @@ describe("the refusal receipt", () => {
   it("every receipt names the reservation announced in request_ok", () => {
     expect(() => checkAnnouncedReservation(r(RST), 9000)).not.toThrow();
     expect(() => checkAnnouncedReservation(r(RST), undefined)).not.toThrow();
-    expect(() => checkAnnouncedReservation(r(RST, { reserved_msats: undefined }), 9000)).not.toThrow();
+    expect(() => checkAnnouncedReservation(r(RST, { reserved_msats: undefined }), undefined)).not.toThrow();
+    expect(() => checkAnnouncedReservation(r(RST, { reserved_msats: undefined }), 9000)).toThrow(/names no reservation, the node announced 9000/);
     expect(() => checkAnnouncedReservation(r(RST), 8000)).toThrow(/announced 8000/);
   });
 
@@ -253,8 +254,8 @@ describe("a refusal on a connection", () => {
     expect(second.sent.some((m) => m.type === "disclose_reset")).toBe(false);
   });
 
-  it("a receipt that charges more than the fee due, or names another reservation, is refused", async () => {
-    for (const extra of [{ cost_msats: 1 }, { reserved_msats: 9001 }]) {
+  it("a receipt that charges more than the fee due, or names another reservation or none, is refused", async () => {
+    for (const extra of [{ cost_msats: 1 }, { reserved_msats: 9001 }, { reserved_msats: undefined }]) {
       const { c, cur, record } = conn();
       record(rst(3, 7));
       vi.spyOn(c, "checkAttestation").mockResolvedValue({ json: ATT_JSON, a: {} });
@@ -263,7 +264,7 @@ describe("a refusal on a connection", () => {
       c.onText(JSON.stringify({ type: "attestation", n: 1 }));
       c.onText(JSON.stringify({ type: "zk_params", proof: "pi_win", purpose: "refusal", n: 1, record: 2, params: {} }));
       const hash = bytesToHex(sha256(utf8ToBytes(ATT_JSON)));
-      const receipt = {
+      const receipt: Record<string, unknown> = {
         v: 1,
         sid: c.sid,
         http: "2",
@@ -275,6 +276,7 @@ describe("a refusal on a connection", () => {
         attestation_hash: hash,
         ...extra,
       };
+      if (receipt.reserved_msats === undefined) delete receipt.reserved_msats;
       c.onText(JSON.stringify(receiptFrame(receipt)));
       await expect(c.settleRefusal(cur)).rejects.toBeInstanceOf(ReceiptVerificationError);
     }

@@ -2948,7 +2948,8 @@ export class ConfidentialConnection {
         `receipt is for http ${JSON.stringify(receipt.http ?? null).slice(0, 16)} request ${String(receipt.n).slice(0, 16)}, not "${this.framing}" request ${cur.n}`,
       );
     }
-    // Every receipt names the reservation the node announced (§12.4).
+    // Every receipt names the reservation the node announced (§12.4), and
+    // no settlement of the request costs more than it.
     checkAnnouncedReservation(receipt, cur.reservedMsat);
     // The connection's first settled request returns the deposit: its
     // (signed) receipt says so, once, with the offer's amount (§12.8, §12.10).
