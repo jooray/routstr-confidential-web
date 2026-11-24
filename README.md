@@ -207,6 +207,16 @@ Other caveats:
   in the background (capped by the pinned `max_tokens`) and settles on the
   usage the provider reported, and `verification` still resolves with its
   receipt. Closing it would cost the whole reservation.
+- **The provider closes before the body is released.** The node cannot read
+  what the provider sent, and a client can make a provider close at will (a
+  record with a wrong GCM tag), so that close settles nothing by itself. When
+  the provider sent an error head first, the client discloses it after the
+  close (`disclose_head`, the node waits 60 s) and the request is settled by
+  its status (a 5xx then costs the abandon fee). With nothing to disclose (a
+  TLS alert only, a GOAWAY with an error code) the request costs what an
+  abandoned one costs: the abandon fee, or the deposit on a connection that
+  settled nothing yet. Nodes before 2026-11-24 kept only the session fee
+  (`request_outcome` reason `provider_refused`); the client accepts that too.
 - The 2PC and π_WIN have **no external review** yet (see routstr-confidential).
   A cheating node learns at most log2 8 = 3 bits per connection about fresh,
   single-use values.
