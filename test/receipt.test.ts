@@ -127,6 +127,15 @@ describe("receipt verification", () => {
     expect(checkUpstreamErrorReceipt(err(400, 100), 400, 100, { abandonFeeMsat: 0 })).toBe(true);
   });
 
+  it("bounds a 5xx before body_released by the abandon fee, not the reservation", () => {
+    const err = (status: number, cost: number) =>
+      ({ sid: "s1", model: "m", usage: { error_status: status }, cost_msats: cost, reserved_msats: 9000 }) as never;
+    const announced = { abandonFeeMsat: 2000, reservationMsat: 9000, reservationAnnounced: true };
+    expect(checkUpstreamErrorReceipt(err(502, 2000), 502, 100, { ...announced, bodyReleased: false })).toBe(true);
+    expect(() => checkUpstreamErrorReceipt(err(502, 9000), 502, 100, { ...announced, bodyReleased: false })).toThrow(ReceiptVerificationError);
+    expect(checkUpstreamErrorReceipt(err(502, 9000), 502, 100, announced)).toBe(true);
+  });
+
   it("holds an image session's error receipt to its terms", () => {
     const image = { model: "z", variant: "webp", count: 2, msatPerImage: 12000 };
     const err = (status: number, extra: Record<string, unknown>) =>

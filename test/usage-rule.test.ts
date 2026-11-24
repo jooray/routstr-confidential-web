@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractUsageDisclosure, usageEventFromDisclosure, usageEventProblem } from "../src/suffix.js";
+import { extractUsageDisclosure, parseUsageEvent, usageEventFromDisclosure, usageEventProblem } from "../src/suffix.js";
 import vectors from "./fixtures/usage-event-vectors.json";
 
 /**
@@ -8,9 +8,18 @@ import vectors from "./fixtures/usage-event-vectors.json";
  * locator with usage on every chunk (Cloudflare): R starts at the last event.
  */
 describe("usage event rule", () => {
-  for (const t of vectors.vectors) {
+  // A `raw` vector is the event's text: a key repeated in any object refuses it.
+  const verdict = (t: { event?: unknown; raw?: string }): boolean => {
+    if (t.raw === undefined) return usageEventProblem(t.event) === null;
+    try {
+      return usageEventProblem(parseUsageEvent(t.raw)) === null;
+    } catch {
+      return false;
+    }
+  };
+  for (const t of vectors.vectors as { name: string; ok: boolean; event?: unknown; raw?: string }[]) {
     it(`${t.ok ? "accepts" : "refuses"}: ${t.name}`, () => {
-      expect(usageEventProblem(t.event) === null).toBe(t.ok);
+      expect(verdict(t)).toBe(t.ok);
     });
   }
 

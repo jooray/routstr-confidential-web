@@ -126,6 +126,7 @@ import {
   extractUsageDisclosure,
   exposedHeaderFields,
   IncrementalHttpResponse,
+  parseUsageEvent,
   usageEventFromDisclosure,
   usageEventProblem,
   validateChatSuffix,
@@ -2800,9 +2801,9 @@ export class ConfidentialConnection {
     let ownUsage: UpstreamUsageEvent;
     try {
       const raw = before.slice(evStart + 6, before.length - 2);
-      ownUsage = JSON.parse(new TextDecoder().decode(Uint8Array.from(raw, (c) => c.charCodeAt(0))));
-    } catch {
-      return bad("the last event before data: [DONE] is not JSON");
+      ownUsage = parseUsageEvent(new TextDecoder().decode(Uint8Array.from(raw, (c) => c.charCodeAt(0)))) as UpstreamUsageEvent;
+    } catch (e) {
+      return bad(`the last event before data: [DONE] is not JSON, or repeats a key (${(e as Error).message})`);
     }
     const notUsage = usageEventProblem(ownUsage);
     if (notUsage) bad(`the last event before data: [DONE] is not a usage event (${notUsage})`);
@@ -3254,6 +3255,7 @@ export class ConfidentialConnection {
     const usageMatch = checkUpstreamErrorReceipt(receipt, status, this.feeDue(cur), {
       reservationMsat: cur.reservedMsat,
       reservationAnnounced: cur.reservedMsat !== undefined,
+      bodyReleased: cur.released,
       abandonFeeMsat: offerAbandonFeeMsat(cur.offer),
       image: cur.image
         ? {
