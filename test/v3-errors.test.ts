@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import { ConfidentialConnection, depositProblems, missingLastFrameProblem } from "../src/connection.js";
+import { ConfidentialConnection, depositProblems, missingLastFrameProblem, refusalMarksNodeFailure } from "../src/connection.js";
 import { canonicalJson } from "../src/canonical.js";
 import { ConnectionDepositError, TwoPcVersionMismatchError, UpgradeRequiredError } from "../src/errors.js";
 import { chatSuffixKeys } from "../src/suffix.js";
@@ -234,7 +234,9 @@ describe("close() ends the waits it leaves (review finding 22)", () => {
 
 describe("the deposit outcome is checked against the signed terms (detection only)", () => {
   const signedDeposit = (d: Record<string, unknown>) => {
-    const deposit = { sid: null, msat: 3000, cost_msats: 0, balance_msats: 10, time: 1, ...d };
+    const base: Record<string, unknown> = { sid: null, msat: 3000, balance_msats: 10, time: 1, ...d };
+    // As the node signs it: the deposit when charged, nothing when released.
+    const deposit = { cost_msats: base.outcome === "charged" ? base.msat : 0, ...base };
     const json = canonicalJson(deposit);
     return { deposit, deposit_json: json, deposit_sig: bytesToHex(schnorr.sign(sha256(utf8ToBytes(json)), PRIV)) };
   };
@@ -443,6 +445,34 @@ describe("the deposit outcome is checked against the signed terms (detection onl
     expect(after({ type: "closed", reason: "evicted", ...own({ outcome: "charged", reason: "unused" }) }).warnings.join()).toMatch(/used connection/);
   });
 
+  it("a settlement without a receipt is held to what the client disclosed", () => {
+    const probe = conn(nodeSocket(() => [])) as any;
+    const offer = { ...probe.offer, session_fee_msat: 300, abandon_fee_msat: 500 };
+    probe.close();
+    const fee = 300;
+    const cur = { n: 2, accepted: true, reservedMsat: 9000, released: true, first: true, disclosed: true, offer };
+    const deposit = own({ outcome: "released", reason: "node_failure" });
+    const frame = (cost: number) => ({
+      type: "error",
+      status: 500,
+      reason: "settlement failed",
+      fault: "node",
+      ...deposit,
+      ...outcome({ n: 2, outcome: "charged", reason: "settled_without_receipt", cost_msats: cost, reserved_msats: 9000 }),
+    });
+    for (const [disclosure, ok, bad] of [
+      [{ kind: "refusal" }, fee, fee + 1],
+      [{ kind: "error_head", status: 429 }, fee, fee + 1],
+      [{ kind: "error_head", status: 502 }, 9000, 9001],
+      [{ kind: "usage", usageMsat: 1000 }, 1000 + fee, 1001 + fee],
+    ] as const) {
+      expect(after(frame(ok), { cur: { ...cur, disclosure } }).warnings, JSON.stringify(disclosure)).toEqual([]);
+      expect(after(frame(bad), { cur: { ...cur, disclosure } }).warnings.join(), JSON.stringify(disclosure)).toMatch(
+        /with reason "settled_without_receipt" \(at most/,
+      );
+    }
+  });
+
   it("the signed request outcome is checked against the open request", () => {
     const state = { cur: { n: 2, accepted: true, reservedMsat: 9000, released: true, first: false }, ...settledDeposit };
     const ok = { n: 2, outcome: "charged", reason: "request_received", cost_msats: 9000, reserved_msats: 9000 };
@@ -477,7 +507,7 @@ describe("missingLastFrameProblem", () => {
 describe("the eviction of an unused connection", () => {
   const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
   const frame = { type: "closed", reason: "evicted", unused: true };
-  const out = { msat: 1000, outcome: "charged", reason: "evicted", evicted: { unused_at_address: 1 } } as const;
+  const out = { msat: 1000, outcome: "charged", reason: "evicted", cost_msats: 1000, evicted: { unused_at_address: 1 } } as const;
   it("is always charged, also for a lone spare", () => {
     expect(depositProblems(frame, out, true, ctx)).toEqual([]);
     expect(depositProblems(frame, out, true, { ...ctx, evictAfterS: 60, ageS: 60 })).toEqual([]);
@@ -490,8 +520,8 @@ describe("the eviction of an unused connection", () => {
 
 describe("depositProblems", () => {
   const ctx = { sid: "ab".repeat(32), depositMsat: 1000, releasedByReceipt: false, requestOutstanding: false, requestAccepted: false };
-  const charged = { msat: 1000, outcome: "charged", reason: "unused" } as const;
-  const released = { msat: 1000, outcome: "released", reason: "provider_closed" } as const;
+  const charged = { msat: 1000, outcome: "charged", reason: "unused", cost_msats: 1000 } as const;
+  const released = { msat: 1000, outcome: "released", reason: "provider_closed", cost_msats: 0 } as const;
 
   it("honest outcomes have none", () => {
     expect(depositProblems({ type: "closed", reason: "upstream_closed" }, released, true, ctx)).toEqual([]);
@@ -513,6 +543,50 @@ describe("depositProblems", () => {
     expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, releasedByReceipt: true })).toEqual([
       "charged, though a receipt of this connection released it",
     ]);
+  });
+
+  it("holds the cost to the outcome: the deposit when charged, nothing when released", () => {
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...charged, cost_msats: 999 }, true, ctx).join()).toMatch(
+      /charged at a cost of 999 msat, the deposit is 1000 msat/,
+    );
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...charged, cost_msats: undefined }, true, ctx).join()).toMatch(
+      /charged at a cost of null msat/,
+    );
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, { ...released, cost_msats: 1000 }, true, ctx)).toEqual([
+      "released at a cost of 1000 msat (a released deposit costs nothing)",
+    ]);
+    expect(depositProblems({ type: "closed", reason: "upstream_closed" }, { ...released, cost_msats: undefined }, true, ctx).join()).toMatch(
+      /released at a cost of null msat/,
+    );
+  });
+
+  it("row 6: a charge after a 5xx refusal of the node's own with no request accepted after it", () => {
+    const marked = { ...ctx, refused5xx: true };
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, marked)).toEqual([
+      "charged though the node refused a request with a 5xx and accepted none after it (released by §12.10 row 6)",
+    ]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, { ...released, reason: "node_failure" }, true, marked)).toEqual([]);
+    expect(depositProblems({ type: "closed", reason: "idle" }, charged, true, { ...ctx, refused5xx: false })).toEqual([]);
+  });
+
+  it("which refusals mark row 6: a 5xx of a request that named an API key, not a Cashu token, and not wallet_busy", () => {
+    expect(refusalMarksNodeFailure({ status: 500, reason: "reservation failed" }, "sk-abc")).toBe(true);
+    expect(refusalMarksNodeFailure({ status: 503, detail: { error: { type: "wallet_busy" } } }, "sk-abc")).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 500 }, "cashuBo2F0gaJhaUgA")).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 500 }, undefined)).toBe(false);
+    expect(refusalMarksNodeFailure({ status: 402 }, "sk-abc")).toBe(false);
+  });
+
+  it("a connection tracks the row 6 mark: set by such a refusal, cleared by request_ok", () => {
+    const c = conn(nodeSocket(() => [])) as any;
+    c.cur = { n: 1, auth: "sk-abc" };
+    c.onText(JSON.stringify({ type: "request_refused", n: 1, status: 500, reason: "reservation failed" }));
+    expect(c.refused5xx).toBe(true);
+    c.onText(JSON.stringify({ type: "request_ok", n: 1 }));
+    expect(c.refused5xx).toBe(false);
+    c.onText(JSON.stringify({ type: "request_refused", n: 2, status: 503, reason: "busy", detail: { error: { type: "wallet_busy" } } }));
+    expect(c.refused5xx).toBe(false);
+    c.close();
   });
 });
 
@@ -572,11 +646,28 @@ describe("SETTINGS acknowledgements", () => {
     const sent = spy(c);
     c.settingsAckSent = true;
     c.requestOpen = true;
-    c.cur = { n: 1, stream: 3, released: false, accepted: true, first: true, dataLens: [] };
+    c.cur = { n: 1, stream: 3, released: false, releaseSent: true, accepted: true, first: true, dataLens: [] };
     c.onFrame(settings);
     c.onFrame(ping);
     expect(sent).toEqual(["ping_ack"]);
     c.onText(JSON.stringify({ type: "body_released", n: 1 }));
     expect(sent).toEqual(["ping_ack", "settings_ack"]);
+  });
+  it("a body_released for a request we have not released changes nothing", () => {
+    const c = conn(nodeSocket(() => [])) as any;
+    const sent = spy(c);
+    c.settingsAckSent = true;
+    c.requestOpen = true;
+    c.cur = { n: 1, stream: 3, released: false, releaseSent: false, accepted: true, first: true, dataLens: [] };
+    c.onFrame(settings);
+    c.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    // Still unreleased: the 5xx and request_outcome ceilings stay at the
+    // abandon fee, and the held acknowledgement stays held.
+    expect(c.cur.released).toBe(false);
+    expect(sent).toEqual([]);
+    c.cur.releaseSent = true;
+    c.onText(JSON.stringify({ type: "body_released", n: 1 }));
+    expect(c.cur.released).toBe(true);
+    expect(sent).toEqual(["settings_ack"]);
   });
 });

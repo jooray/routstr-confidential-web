@@ -277,6 +277,8 @@ export interface PoolLease<C extends ConnLike> {
 
 export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
   private entries: Entry<C>[] = [];
+  /** Connections still opening for a request that was aborted meanwhile (parked once open). */
+  private readonly openingAfterAbort = new Set<Entry<C>>();
   private waiters: (() => void)[] = [];
   private keys = new Map<string, KeyState>();
   private bad = new Map<string, number>();
@@ -418,8 +420,9 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         const wasArmed = spare.state === "armed";
         spare.state = "connecting";
         try {
-          await spare.conn.connect();
+          await this.connectUnlessAborted(spare, signal, reuse);
         } catch (error) {
+          if (this.openingAfterAbort.has(spare)) throw error;
           this.remove(spare);
           if (signal?.aborted) throw signal.reason ?? error;
           this.log(`armed sid=${spare.conn.sid.slice(0, 8)} failed when claimed (${errorText(error)})`);
@@ -463,11 +466,15 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
           if (victim) this.retire(victim, "making room for another key");
         }
         if (this.entries.length < this.opt("maxConnections")) {
-          const entry: Entry<C> = { key, node: "", conn: open(framing), state: "connecting" };
+          // The key's node (noted by the request), so that an eviction of this
+          // connection once it is parked as a spare counts for that node.
+          const node = this.keys.get(key)?.node ?? "";
+          const entry: Entry<C> = { key, node, conn: open(framing), state: "connecting" };
           this.track(entry);
           try {
-            await entry.conn.connect();
+            await this.connectUnlessAborted(entry, signal, reuse);
           } catch (error) {
+            if (this.openingAfterAbort.has(entry)) throw error;
             this.remove(entry);
             throw error;
           }
@@ -485,6 +492,45 @@ export class ConnectionPool<C extends ConnLike = ConfidentialConnection> {
         });
       });
     }
+  }
+
+  /**
+   * Open the entry's connection for a request, or give up waiting as soon as
+   * the request is aborted. The open itself goes on: closing it now could
+   * cost its deposit. Once it is open it is parked like a released lease (an
+   * idle or armed connection for the next request); if it fails, it is
+   * forgotten.
+   */
+  private connectUnlessAborted(entry: Entry<C>, signal: AbortSignal | undefined, reuse: "shared" | "none"): Promise<void> {
+    const p = entry.conn.connect();
+    if (!signal) return p;
+    return new Promise<void>((res, rej) => {
+      let gaveUp = false;
+      const onAbort = () => {
+        gaveUp = true;
+        this.openingAfterAbort.add(entry);
+        rej(signal.reason ?? new DOMException("aborted", "AbortError"));
+      };
+      p.then(
+        () => {
+          signal.removeEventListener("abort", onAbort);
+          if (!gaveUp) return res();
+          this.openingAfterAbort.delete(entry);
+          if (this.entries.includes(entry)) {
+            this.park(entry, reuse);
+            this.replenish();
+          }
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          if (!gaveUp) return rej(error);
+          this.openingAfterAbort.delete(entry);
+          this.remove(entry);
+        },
+      );
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private track(entry: Entry<C>): void {

@@ -177,6 +177,21 @@ describe("framing 2: the provider's frames during a request", () => {
     after.conn.close();
   });
 
+  it("REFUSED_STREAM before any release that cannot be proven: not processed, may run again", async () => {
+    const { conn, wire } = connection();
+    // The refusal arrives before any release goes out (none is sent here).
+    conn.updateRelease = () => {};
+    conn.onAccepted = (cur: any) => feed(conn, frame(FRAME.RST_STREAM, 0, cur.stream, new Uint8Array([0, 0, 0, 7])));
+    const h = conn.request({ model: "cheap", maxTokens: 16, body: body() });
+    const e = await h.done.catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(StreamNotProcessedError);
+    expect((e as StreamNotProcessedError).receipt).toBeUndefined();
+    expect(String((e as Error).message)).toMatch(/REFUSED_STREAM.*nothing of it was released/);
+    expect(h.bodyReleased).toBe(false);
+    expect(wire.map((m) => m.type)).not.toContain("disclose_reset");
+    conn.close();
+  });
+
   it("REFUSED_STREAM after the release that is not proven fails the request, not as one to run again", async () => {
     const { conn, wire } = connection();
     const h = conn.request({ model: "cheap", maxTokens: 16, body: body() });

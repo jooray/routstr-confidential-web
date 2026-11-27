@@ -109,6 +109,8 @@ import {
   requestOutcomeProblems,
   verifyFlatReceipt,
   verifyReceipt,
+  maxChargeMsats,
+  type Disclosure,
 } from "./receipt.js";
 import {
   countKeyUpdates,
@@ -138,6 +140,8 @@ import type { WasmHost } from "./wasm/host.js";
 import { ProofChannel } from "./zkchan.js";
 
 const TIMEOUTS = {
+  /** The control WebSocket's opening handshake. */
+  socketOpen: 30_000,
   ready: 30_000,
   /** The sidecar allows 180 s of preprocessing. */
   twoPcKeyShare: 175_000,
@@ -430,6 +434,8 @@ interface Cur {
   released: boolean;
   /** We sent a disclosure (`disclose`, `disclose_head`, `disclose_reset`) or `accept` for it. */
   disclosed?: boolean;
+  /** What we disclosed (or accepted): it bounds a settlement the node sends no receipt for. */
+  disclosure?: Disclosure;
   tReleased?: number;
   tFirstData?: number;
   tLastData: number;
@@ -549,6 +555,32 @@ export interface DepositContext {
   evictAfterS?: number;
   /** Seconds from the client's `setup` to the last frame (default: not judged). */
   ageS?: number;
+  /**
+   * The node refused a request of this connection with a 5xx of its own
+   * (`refusalMarksNodeFailure`) and accepted none after it: §12.10 row 6
+   * (default: not judged).
+   */
+  refused5xx?: boolean;
+}
+
+/**
+ * Whether a `request_refused` marks the connection for §12.10 row 6 (the
+ * deposit released when the connection ends before another request is
+ * accepted): a 5xx of the node's own reservation path. A 5xx about the
+ * credential the request named is not one (a Cashu token the node cannot
+ * redeem now, the wallet lock its redemption waited for, `wallet_busy`): the
+ * client chose that credential, so the node may charge the deposit then. The
+ * client tells them apart by what it sent: only a refusal of a request that
+ * named an API key (not a Cashu token) and no `wallet_busy` marks it.
+ */
+export function refusalMarksNodeFailure(refused: unknown, requestAuth: unknown): boolean {
+  const m = (refused ?? {}) as { status?: unknown; detail?: unknown };
+  const status = m.status;
+  if (!(typeof status === "number" && Number.isSafeInteger(status) && status >= 500 && status <= 599)) return false;
+  if (typeof requestAuth !== "string" || requestAuth.trim() === "" || /^cashu/i.test(requestAuth.trim())) return false;
+  const detail = m.detail as { error?: { type?: unknown }; type?: unknown } | undefined;
+  const type = detail && typeof detail === "object" ? (detail.error?.type ?? detail.type) : undefined;
+  return type !== "wallet_busy";
 }
 
 /**
@@ -585,7 +617,7 @@ export function missingLastFrameProblem(c: {
  */
 export function depositProblems(
   frame: { type?: unknown; reason?: unknown; fault?: unknown; after_client_frames?: unknown; unused?: unknown },
-  d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown; evicted?: unknown } | undefined,
+  d: { msat?: unknown; outcome: "released" | "charged"; reason?: unknown; cost_msats?: unknown; evicted?: unknown } | undefined,
   signed: boolean,
   c: DepositContext,
 ): string[] {
@@ -598,6 +630,15 @@ export function depositProblems(
   const problems: string[] = [];
   if (d.msat !== c.depositMsat) {
     problems.push(`a deposit of ${String(d.msat).slice(0, 32)} msat, the signed offer's is ${c.depositMsat} msat`);
+  }
+  // What the credential paid: the deposit when charged, nothing when released.
+  if (d.outcome === "charged" && (d.cost_msats !== d.msat || !Number.isSafeInteger(d.cost_msats))) {
+    problems.push(
+      `charged at a cost of ${JSON.stringify(d.cost_msats ?? null).slice(0, 32)} msat, the deposit is ${String(d.msat).slice(0, 32)} msat`,
+    );
+  }
+  if (d.outcome === "released" && d.cost_msats !== 0) {
+    problems.push(`released at a cost of ${JSON.stringify(d.cost_msats ?? null).slice(0, 32)} msat (a released deposit costs nothing)`);
   }
   if (d.outcome === "charged") {
     if (!signed) problems.push("charged without a valid signature");
@@ -613,6 +654,11 @@ export function depositProblems(
       !c.requestAccepted
     ) {
       problems.push("charged though the provider closed the idle connection (§12.10 row 5 releases it)");
+    }
+    // Row 6: the node refused a request with a 5xx of its own and accepted
+    // none after it.
+    if (c.refused5xx === true) {
+      problems.push("charged though the node refused a request with a 5xx and accepted none after it (released by §12.10 row 6)");
     }
     if (typeof d.reason === "string" && DEPOSIT_RELEASED_REASONS.has(d.reason)) {
       problems.push(`charged with reason ${JSON.stringify(d.reason.slice(0, 64))}, which releases it`);
@@ -736,6 +782,8 @@ export class ConfidentialConnection {
   private closedReason?: string;
   /** What the control channel showed of the requests, in order (the request flow reads its frames later). */
   private seenOk?: { n: number; reservedMsats?: number };
+  /** The node refused a request with a 5xx of its own and accepted none after it (§12.10 row 6). */
+  private refused5xx = false;
   private seenReceiptN?: number;
   /** The node's last frame (`closed` or `error`) arrived. */
   private sawLastFrame = false;
@@ -1068,8 +1116,15 @@ export class ConfidentialConnection {
     const ws = new this.WS(`${this.wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=${CONFIDENTIAL_VERSION}`);
     this.ws = ws;
     ws.binaryType = "arraybuffer";
+    // A socket that neither opens nor fails (a silent network path) must not
+    // hold the connection, and with it the request or the pool slot, forever.
+    const openTimer = setTimeout(() => {
+      if (!this.wsOpen) this.fail(new ConfidentialTimeoutError("timeout opening the control websocket"));
+    }, this.timeouts.socketOpen);
+    void this.ended.then(() => clearTimeout(openTimer));
     const opened = new Promise<void>((res) => {
       ws.onopen = () => {
+        clearTimeout(openTimer);
         this.wsOpen = true;
         for (const b of this.outbox) ws.send(b);
         this.outbox.length = 0;
@@ -1166,7 +1221,9 @@ export class ConfidentialConnection {
         this.kick();
         return;
       case "body_released":
-        if (this.cur && m.n === this.cur.n) {
+        // Only for what we released: an early one would mark an unreleased
+        // request as one that may have reached the provider.
+        if (this.cur && m.n === this.cur.n && this.cur.releaseSent) {
           this.cur.released = true;
           this.cur.tReleased = Date.now();
           this.flushHeldAcks();
@@ -1192,7 +1249,14 @@ export class ConfidentialConnection {
         this.inbox.push(key, m);
         return;
       }
+      case "request_refused":
+        // A 5xx of the node's own marks the connection for §12.10 row 6.
+        if (refusalMarksNodeFailure(m, this.cur?.auth)) this.refused5xx = true;
+        this.inbox.push(m.type, m);
+        return;
       case "request_ok":
+        // An accepted request clears the mark: its deposit follows that request.
+        this.refused5xx = false;
         this.seenOk = {
           n: Number(m.n),
           reservedMsats: Number.isSafeInteger(m.reserved_msats) && m.reserved_msats >= 0 ? m.reserved_msats : undefined,
@@ -1283,6 +1347,7 @@ export class ConfidentialConnection {
           reservedMsats: cur.reservedMsat ?? ok?.reservedMsats,
           bodyReleased: cur.released,
           disclosed: cur.disclosed === true,
+          disclosure: cur.disclosure,
         }
       : undefined;
     let o: any;
@@ -1355,6 +1420,7 @@ export class ConfidentialConnection {
       helloSent: this.helloSent,
       evictAfterS: offerEvictUnusedAfterS(this.offer),
       ageS: this.tSetup ? (Date.now() - this.tSetup) / 1000 : undefined,
+      refused5xx: this.refused5xx,
     };
     let d: any;
     let json = "";
@@ -2075,6 +2141,33 @@ export class ConfidentialConnection {
 
   /** Release as many of the request's records as the provider's windows allow (never before `request_ok`). */
   /** The provider's GOAWAY excludes `cur`'s stream (RFC 9113 §6.8: it was not and will not be processed). */
+  /**
+   * Framing "2": wait until the request's body is released, or until it ends
+   * earlier (an error head, a reset, a GOAWAY below its stream, the provider's
+   * close). A refusal the provider sent before any response head is proven
+   * (§5.4, `disclose_reset`) and settled like a 429; the request may run
+   * again. A close with nothing to disclose fails at once (§12.10: the node
+   * then waits only for a refusal's disclosure and abandons the request).
+   */
+  private async awaitRelease(cur: Cur): Promise<void> {
+    const errored = () => (cur.status ?? 0) >= 400;
+    const beyond = () => this.goawayBeyond(cur);
+    await this.until(
+      () => cur.released || errored() || cur.reset !== undefined || beyond() || this.tlsEnded,
+      `body_released for request ${cur.n}`,
+      this.timeouts.released,
+    );
+    // Every record received before the close is parsed before deciding.
+    if (this.tlsEnded && !cur.released) await this.drained();
+    await this.settleRefusal(cur);
+    if (this.tlsEnded && !cur.released && !errored() && cur.reset === undefined && !beyond()) {
+      if (this.failure) throw this.failure;
+      throw new SessionRejectedError(
+        `the provider closed the connection before request ${cur.n} was complete, with no answer to disclose (an abandoned request)`,
+      );
+    }
+  }
+
   private goawayBeyond(cur: Cur): boolean {
     return this.goawayLast !== undefined && cur.stream > this.goawayLast;
   }
@@ -2324,12 +2417,7 @@ export class ConfidentialConnection {
     cur.tOpened = Date.now();
     cur.recvAtSend = this.recvCount();
     cur.streamCredit = this.initialWindow;
-    // An earlier request's records are no longer needed.
-    for (const abs of this.serverRecords.keys()) {
-      if (abs < cur.recvAtSend) this.serverRecords.delete(abs);
-      else break;
-    }
-    this.plain.clear();
+    this.dropBeforeRequest(cur);
     if (this.requests === 0 && !this.probeAnswered) {
       // §5.4: the provider may still answer the node's probe; its frames must
       // lie before the first request's interval, or they may land in a tail.
@@ -2372,10 +2460,7 @@ export class ConfidentialConnection {
     // Released (in steps, as the provider's window opens) or refused early.
     const errored = () => (cur.status ?? 0) >= 400;
     const beyond = () => this.goawayBeyond(cur);
-    await this.until(() => cur.released || errored() || cur.reset !== undefined || beyond(), `body_released for request ${n}`, this.timeouts.released);
-    // A refusal the provider sent before any response head is proven (§5.4,
-    // `disclose_reset`) and settled like a 429; the request may run again.
-    await this.settleRefusal(cur);
+    await this.awaitRelease(cur);
     if (beyond() && !cur.releaseSent) {
       // Nothing of the request was released: it may run again on a new
       // connection. Only a GOAWAY(NO_ERROR) says the provider did not process
@@ -2401,7 +2486,23 @@ export class ConfidentialConnection {
     await this.settleRefusal(cur);
     // An error head the provider sent before it reset the stream (RFC 9113
     // §8.1: a server that answers before the request is complete resets it
-    // with NO_ERROR) is still disclosed and settled by its status (finding 18).
+    // with NO_ERROR) is still disclosed and settled by its status.
+    // RFC 9113 §8.7: a refused stream, or one above a graceful GOAWAY's last
+    // stream, was not processed. A refusal that could not be proven:
+    const graceful = this.goawayGracefulLast !== undefined && stream > this.goawayGracefulLast && cur.status === undefined;
+    if (!errored() && (cur.reset === 7 || graceful)) {
+      const what =
+        cur.reset === 7
+          ? `the provider refused stream ${stream} (REFUSED_STREAM): request ${n} was not processed`
+          : `the provider is going away (GOAWAY, last stream ${this.goawayGracefulLast}): request ${n} on stream ${stream} was not processed`;
+      // Nothing of the request went out: it may run again elsewhere.
+      if (!cur.releaseSent) throw new StreamNotProcessedError(`${what}; nothing of it was released`);
+      // Released and not proven (§9.4): the node charges the request's
+      // reservation (§12.10), so it fails here and is not run again.
+      throw new ResponseVerificationError(
+        `${what}, but the refusal was not proven: its body was released, so the node may charge its reservation`,
+      );
+    }
     if (cur.reset !== undefined && !errored()) {
       throw new ResponseVerificationError(`the provider reset stream ${stream} (code ${cur.reset})`);
     }
@@ -2642,6 +2743,7 @@ export class ConfidentialConnection {
     }
     let receipt: ConfidentialReceipt;
     if (status >= 200 && status < 300 && cur.image) {
+      this.noteDisclosure(cur, { kind: "images", imagesMsat: this.imagesMsat(cur) ?? 0 });
       this.sendText({ type: "accept", n: 1 });
       ({ receipt } = await this.takeReceipt(cur, att.json));
       this.checkFlatReceipt(cur, receipt);
@@ -2652,6 +2754,7 @@ export class ConfidentialConnection {
       const ownUsage = usageEventFromDisclosure(r);
       if (!ownUsage) throw new ResponseVerificationError("could not parse our own usage event");
       cur.ownUsage = ownUsage;
+      this.noteDisclosure(cur, this.usageDisclosureOf(cur, ownUsage));
       await this.disclose11(cur, "disclose", r, 0);
       const got = await this.takeReceipt(cur, att.json);
       receipt = got.receipt;
@@ -2665,6 +2768,7 @@ export class ConfidentialConnection {
         throw new ResponseVerificationError("an interim head precedes the error head: it cannot be disclosed");
       }
       const r = raw.slice(0, headEnd + 4);
+      this.noteDisclosure(cur, { kind: "error_head", status, imagesMsat: this.imagesMsat(cur) });
       await this.disclose11(cur, "disclose_head", r, raw.length - r.length);
       ({ receipt } = await this.takeReceipt(cur, att.json));
       this.checkErrorReceipt(cur, receipt, status);
@@ -2835,6 +2939,7 @@ export class ConfidentialConnection {
       await this.drained();
       if (this.failure) throw this.failure;
       const d = this.usageDisclosure(cur);
+      this.noteDisclosure(cur, this.usageDisclosureOf(cur, d.ownUsage));
       const epoch = serverTailEpoch(this.serverPost, d.tailLens.length);
       const msg: Record<string, unknown> = {
         type: "disclose",
@@ -2903,6 +3008,7 @@ export class ConfidentialConnection {
       await this.drained();
       if (this.failure) throw this.failure;
       const serverRecords = this.recvCount();
+      this.noteDisclosure(cur, { kind: "images", imagesMsat: this.imagesMsat(cur) ?? 0 });
       this.sendOrdered({ type: "accept", n: cur.n, server_records: serverRecords });
       const next = await this.wait(["accept_retry", "attestation"], this.timeouts.attestation);
       if (next.key === "accept_retry") {
@@ -2947,6 +3053,7 @@ export class ConfidentialConnection {
         epochStart = i + 1;
       }
     }
+    this.noteDisclosure(cur, { kind: "error_head", status: cur.status ?? 0, imagesMsat: this.imagesMsat(cur) });
     const msg: Record<string, unknown> = { type: "disclose_head", n: cur.n, record: rec.abs, r: hex(head.raw) };
     if (keyUpdates > 0) {
       msg.key_updates = keyUpdates;
@@ -2970,6 +3077,31 @@ export class ConfidentialConnection {
     const { receipt } = await this.takeReceipt(cur, att.json);
     this.checkErrorReceipt(cur, receipt, status);
     return { receipt, attestation: att.a };
+  }
+
+  /**
+   * An earlier request's records are no longer needed once `cur` starts,
+   * except the record of a GOAWAY that refused `cur`'s stream while it was
+   * opening (§5.4.1: one that reached the node shortly before `request_ok`
+   * refuses it, and R starts no later than its record).
+   */
+  private dropBeforeRequest(cur: Cur): void {
+    const keepFrom = this.refusalRecord(cur) ?? cur.recvAtSend;
+    for (const abs of this.serverRecords.keys()) {
+      if (abs < keepFrom) this.serverRecords.delete(abs);
+      else break;
+    }
+    for (const abs of [...this.plain.keys()]) if (abs < keepFrom) this.plain.delete(abs);
+  }
+
+  /** The first record of R for `cur`'s refusal seen so far (at most its request's start), while held. */
+  private refusalRecord(cur: Cur): number | undefined {
+    if (!cur.refusal) return undefined;
+    try {
+      return Math.min(cur.recvAtSend, this.reader.recordAt(cur.refusal.end - 1).abs);
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -3037,12 +3169,21 @@ export class ConfidentialConnection {
       this.event({ ev: "refusal_not_disclosable", n: cur.n, why: d });
       return;
     }
-    // Our own records must be proven first (one π_WIN at a time).
-    await this.until(
-      () => this.unproven.size === 0 && cur.proofs.some((p) => p.proof === "pi_win"),
-      "our records to be proven",
-      this.timeouts.proof,
-    );
+    // Our own records must be proven first (one π_WIN at a time). If they are
+    // not, nothing is disclosed: the caller's checks decide, as for a refusal
+    // that cannot be disclosed.
+    try {
+      await this.until(
+        () => this.unproven.size === 0 && cur.proofs.some((p) => p.proof === "pi_win"),
+        "our records to be proven",
+        this.timeouts.proof,
+      );
+    } catch (e) {
+      if (!(e instanceof ConfidentialTimeoutError)) throw e;
+      this.event({ ev: "refusal_not_disclosable", n: cur.n, why: "our records were not proven" });
+      return;
+    }
+    this.noteDisclosure(cur, { kind: "refusal" });
     const msg: Record<string, unknown> = { type: "disclose_reset", n: cur.n, record: d.record, r: hex(d.raw) };
     if (d.keyUpdates > 0) {
       msg.key_updates = d.keyUpdates;
@@ -3187,6 +3328,23 @@ export class ConfidentialConnection {
       if (abs < upto) this.serverRecords.delete(abs);
       else break;
     }
+  }
+
+  /** What we are about to disclose (or accept) for `cur`: a settlement without a receipt is held to it (§12.10). */
+  private noteDisclosure(cur: Cur, d: Disclosure | undefined): void {
+    cur.disclosure = d;
+  }
+
+  /** An image request's `msat_per_image × count` (undefined for chat). */
+  private imagesMsat(cur: Cur): number | undefined {
+    return cur.image ? cur.image.variant.msat_per_image * cur.image.count : undefined;
+  }
+
+  /** Our own usage priced at the frozen rates, no fee (undefined: the offer prices no such model). */
+  private usageDisclosureOf(cur: Cur, ownUsage: UpstreamUsageEvent): Disclosure | undefined {
+    const entry = cur.offer.price_list[cur.model];
+    if (!entry || !ownUsage.usage) return undefined;
+    return { kind: "usage", usageMsat: maxChargeMsats(entry, ownUsage.usage as Parameters<typeof maxChargeMsats>[1]) };
   }
 
   /** The session fee still due on this connection for `cur` (§8.3: once, at the first settlement). */

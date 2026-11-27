@@ -10,7 +10,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { ConfidentialConnection } from "../src/connection.js";
-import { ReceiptVerificationError, StreamNotProcessedError } from "../src/errors.js";
+import { ConfidentialTimeoutError, ReceiptVerificationError, SessionRejectedError, StreamNotProcessedError } from "../src/errors.js";
 import { FLAG, FRAME, frame, refusalProblem } from "../src/h2.js";
 import { verifyConfidentialOffer } from "../src/offer.js";
 import { checkAnnouncedReservation, checkRefusedReceipt } from "../src/receipt.js";
@@ -238,6 +238,24 @@ describe("a refusal on a connection", () => {
     expect(other.cur.refusal).toBeUndefined();
   });
 
+  it("a GOAWAY that came while the request was opening keeps its record: R starts there", () => {
+    // §5.4.1: it reached the node shortly before `request_ok`, so it refuses
+    // the request; the request's start (`recvAtSend`) is fixed after it.
+    const { c, cur, record } = conn();
+    cur.releaseSent = false;
+    record(goaway(1, 0)); // record 2
+    cur.recvAtSend = 3;
+    c.dropBeforeRequest(cur);
+    expect(c.plain.has(2) && c.serverRecords.has(2)).toBe(true);
+    expect(c.refusalDisclosure(cur).record).toBe(2);
+    // Without a refusal the earlier records go.
+    const other = conn();
+    other.record(wu(0));
+    other.cur.recvAtSend = 3;
+    other.c.dropBeforeRequest(other.cur);
+    expect(other.c.plain.has(2) || other.c.serverRecords.has(2)).toBe(false);
+  });
+
   it("nothing is disclosed after a response head, or past a frame that is not allowed", async () => {
     const { c, cur, sent, record } = conn();
     record(frame(FRAME.HEADERS, FLAG.END_HEADERS, 3, Uint8Array.from([0x88])));
@@ -280,5 +298,68 @@ describe("a refusal on a connection", () => {
       c.onText(JSON.stringify(receiptFrame(receipt)));
       await expect(c.settleRefusal(cur)).rejects.toBeInstanceOf(ReceiptVerificationError);
     }
+  });
+});
+
+describe("the wait for a request's release", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("a refusal whose own records are not proven in time is not disclosed: the caller's checks decide", async () => {
+    const { c, cur, sent, record } = conn();
+    c.timeouts.proof = 30;
+    c.unproven.add(7);
+    record(rst(3, 7));
+    await expect(c.settleRefusal(cur)).resolves.toBeUndefined();
+    expect(sent.some((m) => m.type === "disclose_reset")).toBe(false);
+  });
+
+  it("the provider's close with nothing to disclose ends it at once, as an abandoned request", async () => {
+    const { c, cur } = conn();
+    c.timeouts.released = 60_000;
+    const t0 = Date.now();
+    const p = c.awaitRelease(cur);
+    c.tlsEnded = true;
+    c.kick();
+    const error = await p.catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SessionRejectedError);
+    expect(String((error as Error).message)).toMatch(/abandoned request/);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("an error head received before the provider's close is still settled by its status", async () => {
+    const { c, cur } = conn();
+    cur.status = 429;
+    c.tlsEnded = true;
+    await expect(c.awaitRelease(cur)).resolves.toBeUndefined();
+  });
+});
+
+describe("the control socket", () => {
+  it("that never opens fails the connection at the deadline", async () => {
+    class SilentSocket {
+      binaryType = "";
+      onopen?: () => void;
+      onclose?: () => void;
+      onerror?: () => void;
+      onmessage?: () => void;
+      closed = false;
+      constructor(readonly url: string) {}
+      send() {}
+      close() {
+        this.closed = true;
+      }
+    }
+    const c = new ConfidentialConnection({
+      baseUrl: "https://node.example",
+      offer: offer(),
+      framing: "2",
+      auth: "sk-x",
+      host: NO_HOST,
+      webSocketImpl: SilentSocket as never,
+      timeouts: { socketOpen: 30 },
+    });
+    const error = await c.arm(false).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConfidentialTimeoutError);
+    expect(c.phase).toBe("closed");
   });
 });

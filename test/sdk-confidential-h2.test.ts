@@ -1084,6 +1084,61 @@ describe("http 2: the connection pool", () => {
       pool.close();
     });
 
+    it("a connection opened for a request, kept armed after a refusal and then evicted unused, stops pre-warming for its node", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
+      const conns: FakeConn[] = [];
+      const open = (f: "2" | "1.1") => (conns.push(new FakeConn(f)), conns[conns.length - 1]!);
+      const traffic = pool.noteRequest("k", { baseUrl: "https://n", framing: "1.1", depositMsat: 1000, prewarmable: true }, open);
+      const refused = await pool.acquire("k", "1.1", open);
+      refused.release();
+      traffic.done();
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["armed"]);
+      conns[0]!.evictedUnused = true;
+      conns[0]!.close("connection closed by the node: evicted");
+      await tick();
+      expect(pool.isFull("https://n")).toBe(true);
+      pool.close();
+    });
+
+    it("an aborted request stops waiting for its connection to open; the open goes on and the connection is kept", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet);
+      const conns: FakeConn[] = [];
+      const open = (f: "2" | "1.1") => (conns.push(new FakeConn(f)), conns[conns.length - 1]!);
+      const traffic = pool.noteRequest("k", { baseUrl: "https://n", framing: "2", depositMsat: 1000, prewarmable: true }, open);
+      const ac = new AbortController();
+      const reason = new Error("stopped by the user");
+      const p = pool.acquire("k", "2", open, ac.signal);
+      ac.abort(reason);
+      const t0 = Date.now();
+      await expect(p).rejects.toBe(reason);
+      expect(Date.now() - t0).toBeLessThan(5);
+      traffic.done();
+      expect(conns[0]!.dead).toBeUndefined();
+      await tick();
+      // Open now, and idle: the next request takes it without a second 2PC.
+      expect(pool.snapshot().map((s) => s.state)).toEqual(["idle"]);
+      const next = await pool.acquire("k", "2", open);
+      expect(next.conn).toBe(conns[0]);
+      expect(conns).toHaveLength(1);
+      pool.close();
+    });
+
+    it("an aborted request whose connection then fails to open leaves nothing behind", async () => {
+      const pool = new ConnectionPool<FakeConn>(quiet);
+      const open = (f: "2" | "1.1") => {
+        const c = new FakeConn(f);
+        c.failConnect = true;
+        return c;
+      };
+      const ac = new AbortController();
+      const p = pool.acquire("k", "2", open, ac.signal);
+      ac.abort();
+      await expect(p).rejects.toBeDefined();
+      await tick();
+      expect(pool.snapshot()).toEqual([]);
+      pool.close();
+    });
+
     it("a spare that aged out is not replaced until the key has a request again", async () => {
       const pool = new ConnectionPool<FakeConn>(quiet, prewarm);
       const conns: FakeConn[] = [];
